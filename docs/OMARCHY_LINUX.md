@@ -196,7 +196,7 @@ curl -s http://127.0.0.1:3066/health
 ```
 
 浏览器自动化（Playwright）也验证过：登录页能加载、ALTCHA 完成、提交后进入概览页，
-且能够读取账号列表（8 个账号、74 个模型由旧数据迁移而来）。
+且能够读取账号列表（8 个账号；迁移后首次加载 74 个模型，插件目录刷新后为 80 个）。
 
 ## 7. 调用 OpenAI 兼容 API
 
@@ -407,7 +407,7 @@ docker compose restart
 1. 停止新容器；
 2. 从旧容器复制 `/data` 到临时目录；
 3. 在新副本上删除旧的 `panelAdmin` 会话键，让新 `.env` 重新播种管理员；
-4. 启动新容器，确认 8 个账号、插件、74 个模型被加载；
+4. 启动新容器，确认 8 个账号、插件和模型目录被加载（首次 74 个，刷新后 80 个）；
 5. 用新管理员登录并调用真实模型。
 
 迁移成功的关键是 `account.key` 与 `agent2api.db` 必须成对复制；插件目录也要一起复制，
@@ -495,7 +495,41 @@ docker compose restart
 curl -s -H "Authorization: Bearer $A2A_KEY" http://127.0.0.1:3066/v1/models | jq '.meta.count'
 ```
 
-## 13. 安全边界
+## 13. 本次验收记录（2026-11-01）
+
+| 项目 | 命令/方法 | 结果 |
+| --- | --- | --- |
+| 源码构建 | `docker build --network host -t agent2api-fork:local .` | 成功，镜像 `sha256:c3ca44d6…` |
+| 容器启动 | `docker compose up -d --force-recreate` | `Up (healthy)`，`127.0.0.1:3066->3065/tcp`，容器用户 `1000:1000` |
+| 健康检查 | `curl /health` | `{"status":"ok"}` |
+| 模型目录 | `GET /v1/models` + Bearer Key | HTTP 200，80 个模型，29 家插件提供商 |
+| 真实对话 | `POST /v1/chat/completions`，`glm-5.3` | HTTP 200，`content="pong"`，usage 50+14 |
+| 无 Key 拒绝 | 同上不带 Authorization | HTTP 401 `model_api_key_required` |
+| 错误 Key 拒绝 | 同上带 `sk-invalid` | HTTP 401 `invalid_api_key` |
+| 面板登录 | Playwright 打开 `http://127.0.0.1:3066/` | 登录成功，概览页加载，账号列表可读 |
+| 首次注册 | 独立空数据实例 `127.0.0.1:3068` | `/api/panel/setup` 创建 admin 成功；无 Key 对话 HTTP 401 |
+| 手动刷新 | `POST /api/accounts/refresh`（AutoClaw） | HTTP 200，`updatedAt` 从 `1793468514203` 推进到 `1793469244074` |
+| 批量维护 | `POST /api/accounts/refresh-expiring` | HTTP 200，`refreshed=2, skipped=6, failed=0` |
+| 重启持久化 | `docker compose restart` 后再次查模型/对话 | 80 个模型仍在；真实对话 HTTP 200 |
+| 备份 | `scripts/omarchy-agent2api.sh backup` | 生成 7.3MB tar，包含 `data/agent2api.db` 与 `data/account.key`；服务自动恢复 |
+| 恢复演练 | 备份解到临时目录并以独立容器启动 | `/health` ok，80 个模型、8 个账号，管理员可登录 |
+| 后端测试 | `cargo test -p agent2api-server -- --test-threads=1` | **281 passed; 0 failed; 1 ignored**（忽略项是已迁到外部插件的 CodeArts 日池分类测试） |
+
+> 测试运行方式（使用构建阶段镜像，不把测试依赖装进运行镜像）：
+
+```bash
+docker build --network host --target builder -t agent2api-fork-builder .
+docker run --rm \
+  -v "$PWD/desktop-tauri/src-tauri:/build/src-tauri" \
+  -v a2a-test-target:/build/target \
+  -w /build/src-tauri \
+  agent2api-fork-builder \
+  cargo test -p agent2api-server -- --test-threads=1
+```
+
+`1 ignored` 是显式标注的插件迁移遗留测试，不是失败；除它之外全部通过。
+
+## 14. 安全边界
 
 - 默认 `127.0.0.1` 绑定；不要为了远程访问直接改成 `0.0.0.0` 而不加认证/防火墙。
 - 面板管理员和网关 Key 分离：面板登录不等于模型调用授权。
