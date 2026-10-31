@@ -41,6 +41,8 @@
 
 | # | Title (short) | Category | Deploy/API? | Verdict |
 |---:|---|---|---|---|
+
+> 字段说明：`Verdict` 同时给出当前状态与处置；`Provider request` / `Feature` 是产品需求，不适用缺陷复现；标 `Yes`/`Indirect` 的 bug 依据 issue 文本或 beta.6 代码检查，只有 #407 在本分支做了运行时回归。没有账号/log 的 provider 问题一律不断言已修。
 | [122](https://github.com/aimod-cc/Agent2API/issues/122) | “No ads in issues” admin notice | Meta | No | Ignore; not a product issue. |
 | [153](https://github.com/aimod-cc/Agent2API/issues/153) | WPS Lingxi provider request | Provider request | No | Feature request; external provider work, not deployment. |
 | [164](https://github.com/aimod-cc/Agent2API/issues/164) | TRAE international provider request | Provider request | No | Request; Trae is now plugin-delegated (`missing_plugin.rs`). |
