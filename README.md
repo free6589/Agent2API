@@ -83,6 +83,8 @@ cd C:\agent2api-pkg; .\install-service.ps1
 docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/data aimodcc/agent2api:latest
 ```
 
+For a source build on Arch/Omarchy (including the Docker-bridge GitHub workaround, loopback-only binding and migration/backup notes), see [`docs/OMARCHY_LINUX.md`](./docs/OMARCHY_LINUX.md). This guide is fork-specific and records what was actually verified on the test machine; it does not claim that the native Tauri desktop was built.
+
 Whichever form you pick, open the panel afterwards (`http://127.0.0.1:3065/`; use the host IP for the server and Docker forms), register the admin account, then create a key on the "Gateway Keys" page. Connectivity check: `curl http://127.0.0.1:3065/health`
 
 **Mobile**: open `http://<gateway IP>:3065/m` in a browser (you can "Add to Home Screen" for a full-screen PWA). For a standalone icon, install `Agent2API-<version>.apk` (Android) or `Agent2API-<version>.ipa` (iOS, unsigned — re-sign it yourself) from the Release. Details: [Install & deploy → Mobile](./docs/install.en.md#mobile).
