@@ -189,6 +189,7 @@ fn stateful_quota_bookkeeping_ignores_non_quota_classes() {
 }
 
 #[test]
+#[ignore = "CodeArts 在 beta.6 已迁到外部插件；日池分类与重置时刻应在插件测试中验证"]
 fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
     use crate::server::errors::GatewayError;
 
