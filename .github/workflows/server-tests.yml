@@ -3,7 +3,7 @@ name: server-tests
 # 跑后端单元测试。
 #
 # ── 为什么需要这道闸 ──────────────────────────────────────────
-# 本仓库有 594 个测试属性（507 个 `#[test]` + 87 个 `#[tokio::test]`），但此前没有任何工作流执行 `cargo test`：
+# 本 crate 有约 285 个测试属性（`#[test]` + `#[tokio::test]`），但此前没有任何工作流执行 `cargo test`：
 # `build.yml` 与 `docker.yml` 只在打 tag / 手动触发时构建安装包，
 # `warm-cache.yml` 只预热依赖缓存，`frontend-artifacts.yml` 只校验前端产物同源。
 # 也就是说：**测试写了，但从头到尾没人跑** —— 合进 beta 的改动要等装到用户机器上
@@ -11,7 +11,7 @@ name: server-tests
 #
 # ── 判据：只测后端 crate，不碰桌面壳 ──────────────────────────
 # 判据只有一条：`cargo test -p agent2api-server` 必须通过。
-# 全仓 594 个测试（507 个 `#[test]` + 87 个 `#[tokio::test]`）全在这一个 crate 里（桌面壳 `src/` 下是 0 个），
+# 后端测试全部在这一个 crate 里（桌面壳 `src/` 下没有测试），
 # 所以「只测 server」不是偷懒的折中，而是**已经覆盖了全部现有测试**。
 # 为什么不顺手把壳也编一遍：壳是 Tauri，在 Linux 上要 webkit2gtk / gtk3 一整套
 # 系统库（`server/Cargo.toml` 自己写着拆分就是为了「headless 一个都不用」，

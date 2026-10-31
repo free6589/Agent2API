@@ -35,7 +35,7 @@
 | [#301](https://github.com/aimod-cc/Agent2API/issues/301) | 账号级 `baseUrl` 覆盖无 UI/API | `custom/forward.rs` 优先 `base_url_override`，但 `PATCH /api/accounts/{id}` 白名单不含 `baseUrl` | 仍存在（代码检查） | 用户改提供商 baseUrl 后，旧账号覆盖仍打旧地址；自定义提供商场景 | 记录为 P1；本次未改，需同时补 UI 与 API 契约 |
 | [#260](https://github.com/aimod-cc/Agent2API/pull/260) | 折过的 413 与 Loomy 中文长度墙漏网 | beta.6 `loomy::classify_error` 无 `内容太长` 分支；`PAYLOAD_SIZE_REJECTION_STATUSES` 只有 413 | 逻辑仍缺；PR 与 beta 冲突 | 大请求会重复发送/错误分类，影响任意 Linux 部署的 API 稳定性 | 记录为可移植补丁；本次未合并，保留 PR 证据 |
 | [#305](https://github.com/aimod-cc/Agent2API/pull/305) | SenseNova 预置 base URL 错误 | beta.6 仍为 `https://api.sensenova.cn/compatible-mode/v1`，PR 改为 `https://token.sensenova.cn/v1` | PR 干净可应用 | 仅影响选择 SenseNova 预置的用户 | **已应用**（1 行） |
-| [#311](https://github.com/aimod-cc/Agent2API/pull/311) | 后端 594 个测试没有 CI 执行 | `.github/workflows/` 无 server-tests；本地测试目标还因两处陈旧初始化无法编译 | PR 干净可应用；本分支先修复测试编译 | 防止未来的选路/凭据/错误码回归 | **已应用**；另修 `RequestQuery` 与 `send_with_retry` 的测试调用 |
+| [#311](https://github.com/aimod-cc/Agent2API/pull/311) | 后端测试（当前约 285 个）没有 CI 执行 | `.github/workflows/` 无 server-tests；本地测试目标还因两处陈旧初始化无法编译 | PR 干净可应用；本分支先修复测试编译 | 防止未来的选路/凭据/错误码回归 | **已应用**；另修 `RequestQuery` 与 `send_with_retry` 的测试调用 |
 
 ## 全部 49 个 open issue
 
