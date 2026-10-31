@@ -982,11 +982,34 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             else {
                 return management_error(400, format!("未知的提供商：{provider}"));
             };
+            let before = crate::server::core::credential_maintenance::credential_stamp(
+                state.store(),
+                &id,
+            );
             return match adapter.refresh_access_token(state.store(), &id).await {
-                Ok(_) => ok_json(json!({
-                    "refreshedId": id,
-                    "list": state.store().list_visible_accounts(),
-                })),
+                Ok(_) => {
+                    let after = crate::server::core::credential_maintenance::credential_stamp(
+                        state.store(),
+                        &id,
+                    );
+                    if !crate::server::core::credential_maintenance::credentials_advanced(
+                        before.as_ref(),
+                        after.as_ref(),
+                    ) {
+                        logging::log(
+                            "[Accounts]",
+                            &format!("❌ 账号 {id} 刷新返回成功但凭证未变化（空刷）"),
+                        );
+                        return management_error(
+                            409,
+                            "适配器返回成功但账号凭证未变化（空刷），请重新登录该账号",
+                        );
+                    }
+                    ok_json(json!({
+                        "refreshedId": id,
+                        "list": state.store().list_visible_accounts(),
+                    }))
+                }
                 Err(error) => {
                     logging::log("[Accounts]", &format!("❌ {}", error.message));
                     management_error(i32::from(error.http_status().as_u16()), error.message)
@@ -1150,11 +1173,30 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             ),
         );
     };
+    let before =
+        crate::server::core::credential_maintenance::credential_stamp(state.store(), &id);
     match adapter.refresh_access_token(state.store(), &id).await {
-        Ok(_) => ok_json(json!({
-            "refreshedId": id,
-            "list": state.store().list_visible_accounts(),
-        })),
+        Ok(_) => {
+            let after =
+                crate::server::core::credential_maintenance::credential_stamp(state.store(), &id);
+            if !crate::server::core::credential_maintenance::credentials_advanced(
+                before.as_ref(),
+                after.as_ref(),
+            ) {
+                logging::log(
+                    "[Accounts]",
+                    &format!("❌ 账号 {id} 刷新返回成功但凭证未变化（空刷）"),
+                );
+                return management_error(
+                    409,
+                    "适配器返回成功但账号凭证未变化（空刷），请重新登录该账号",
+                );
+            }
+            ok_json(json!({
+                "refreshedId": id,
+                "list": state.store().list_visible_accounts(),
+            }))
+        }
         Err(error) => {
             logging::log("[Accounts]", &format!("❌ {}", error.message));
             management_error(i32::from(error.http_status().as_u16()), error.message)
@@ -1169,11 +1211,30 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
 /// 窗口）、按来源回写。这里是唯一调用点，差异全在各家适配器里。
 async fn refresh_provider_account(state: &ServerState, id: &str, kind: ProviderKind) -> Response {
     let adapter = adapter_for(kind);
+    let before =
+        crate::server::core::credential_maintenance::credential_stamp(state.store(), id);
     match adapter.refresh_access_token(state.store(), id).await {
-        Ok(_) => ok_json(json!({
-            "refreshedId": id,
-            "list": state.store().list_visible_accounts(),
-        })),
+        Ok(_) => {
+            let after =
+                crate::server::core::credential_maintenance::credential_stamp(state.store(), id);
+            if !crate::server::core::credential_maintenance::credentials_advanced(
+                before.as_ref(),
+                after.as_ref(),
+            ) {
+                logging::log(
+                    "[Accounts]",
+                    &format!("❌ 账号 {id} 刷新返回成功但凭证未变化（空刷）"),
+                );
+                return management_error(
+                    409,
+                    "适配器返回成功但账号凭证未变化（空刷），请重新登录该账号",
+                );
+            }
+            ok_json(json!({
+                "refreshedId": id,
+                "list": state.store().list_visible_accounts(),
+            }))
+        }
         Err(error) => {
             logging::log("[Accounts]", &format!("❌ {}", error.message));
             management_error(i32::from(error.http_status().as_u16()), error.message)

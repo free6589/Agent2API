@@ -50,6 +50,39 @@ pub const STATUS_SKIPPED: &str = "skipped";
 /// 尝试刷新但失败（结果里带可读的 `message`）
 pub const STATUS_FAILED: &str = "failed";
 
+/// 取某个账号当前可见记录的快照（用于刷新前后对比）。
+///
+/// 只读 `list_accounts` 的公开形态，不碰任何凭证字段；返回 `None` 表示账号
+/// 在快照之间被删了 —— 调用方按「无法判断」处理，不应因此把刷新判失败。
+pub fn credential_stamp(store: &AccountStore, id: &str) -> Option<Value> {
+    store
+        .list_accounts()
+        .get("accounts")
+        .and_then(Value::as_array)
+        .and_then(|accounts| {
+            accounts
+                .iter()
+                .find(|account| account.get("id").and_then(Value::as_str) == Some(id))
+                .cloned()
+        })
+}
+
+/// 刷新前后的账号记录是否真的发生了凭证变化。
+///
+/// 适配器的 `Ok(())` 只代表「它没报错」，不代表凭证被写回：插件空刷、上游
+/// 返回成功但字段未推进时，旧实现会把日志和接口都记成成功（issue #407）。
+/// 这里以账号记录上的时间戳/过期时间为通用判据；任一字段变化即视为推进。
+/// 快照缺失（账号在刷新期间被删）时返回 `true`，避免把并发删除误报成空刷。
+pub fn credentials_advanced(before: Option<&Value>, after: Option<&Value>) -> bool {
+    let (Some(before), Some(after)) = (before, after) else {
+        return true;
+    };
+    const FIELDS: &[&str] = &["updatedAt", "expiresAt", "tokenExpiresAt"];
+    FIELDS
+        .iter()
+        .any(|field| before.get(*field) != after.get(*field))
+}
+
 /// 周期维护的**默认**间隔说明：10 分钟。
 ///
 /// 为什么默认是 10 分钟（而不是更密）：三家的临期窗口是 2~5 分钟，10 分钟的间隔
@@ -175,16 +208,34 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
         // 逐个 await（不并发）：刷新是低频维护动作、单个账号要打一次上游，
         // 串行既避开风控也保证日志顺序稳定；失败被 match 收敛成一条结果，
         // 不会中断循环（见模块头的失败隔离）。
+        let before = credential_stamp(store, &id);
         slots[index] = Some(match adapter.refresh_access_token(store, &id).await {
             Ok(_) => {
-                // 成功也打一条：用户在日志页能看到「网关自动刷新了谁的凭证」，
-                // 否则「token 怎么自己变新了」是个无法追溯的问题
-                logging::log("[Accounts]", &format!("✅ 已自动刷新账号 {id} 的凭证"));
-                json!({
-                    "id": id,
-                    "provider": provider,
-                    "status": STATUS_REFRESHED,
-                })
+                let after = credential_stamp(store, &id);
+                if !credentials_advanced(before.as_ref(), after.as_ref()) {
+                    // 适配器返回 Ok 但账号记录没有任何推进：这正是 #407 的
+                    // 「空刷」。不能记成功，否则日志全绿而凭证已悄悄失效。
+                    let message = "适配器返回成功但账号凭证未变化（空刷）".to_string();
+                    logging::log(
+                        "[Accounts]",
+                        &format!("❌ 账号 {id} 凭证自动刷新无效: {message}"),
+                    );
+                    json!({
+                        "id": id,
+                        "provider": provider,
+                        "status": STATUS_FAILED,
+                        "message": message,
+                    })
+                } else {
+                    // 成功也打一条：用户在日志页能看到「网关自动刷新了谁的凭证」，
+                    // 否则「token 怎么自己变新了」是个无法追溯的问题
+                    logging::log("[Accounts]", &format!("✅ 已自动刷新账号 {id} 的凭证"));
+                    json!({
+                        "id": id,
+                        "provider": provider,
+                        "status": STATUS_REFRESHED,
+                    })
+                }
             }
             Err(error) => {
                 logging::log(
@@ -271,5 +322,40 @@ pub fn note_manual_run() {
         interval,
     ) {
         logging::verbose("[Accounts]", &format!("凭证维护排期顺延失败：{error}"));
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn credentials_advanced_detects_updated_at_change() {
+        let before = json!({"id":"a","updatedAt":100,"expiresAt":200});
+        let after = json!({"id":"a","updatedAt":101,"expiresAt":200});
+        assert!(credentials_advanced(Some(&before), Some(&after)));
+    }
+
+    #[test]
+    fn credentials_advanced_detects_expiry_change() {
+        let before = json!({"id":"a","updatedAt":100,"expiresAt":200});
+        let after = json!({"id":"a","updatedAt":100,"expiresAt":300});
+        assert!(credentials_advanced(Some(&before), Some(&after)));
+    }
+
+    #[test]
+    fn credentials_advanced_rejects_noop() {
+        let before = json!({"id":"a","updatedAt":100,"expiresAt":200});
+        let after = json!({"id":"a","updatedAt":100,"expiresAt":200});
+        assert!(!credentials_advanced(Some(&before), Some(&after)));
+    }
+
+    #[test]
+    fn credentials_advanced_ignores_missing_snapshot() {
+        let after = json!({"id":"a","updatedAt":100,"expiresAt":200});
+        assert!(credentials_advanced(None, Some(&after)));
+        assert!(credentials_advanced(Some(&after), None));
     }
 }
