@@ -186,6 +186,25 @@ pub fn account_features() -> serde_json::Map<String, serde_json::Value> {
     map
 }
 
+/// 某一家在**握手**时申报的静态登录方式（`ProviderInfo.login_methods`）。
+///
+/// ── 为什么需要它 ────────────────────────────────────────────
+/// 动态登录方式走 `auth.methods`，但插件可以只在握手时申报一份静态清单
+/// （`ProviderInfo.login_methods`，SDK 的 `with_login`）而不实现 `auth.methods`。
+/// 这样的插件在 `/api/session/login/methods` 上如实回 501，界面于是只剩
+/// 「手动凭证 JSON」这一条兜底 —— 用户得自己猜键名，网页账号因此加不进来。
+///
+/// 把静态清单随 `/api/session` 的 provider 摘要一起下发，界面就能按插件
+/// 真正申报过的字段渲染旧版表单；动态通道仍然优先，静态只是 501 之后的兜底。
+/// 返回 `None` = 这一家没申报（内置家或旧插件）。
+pub fn login_methods_of(provider: &str) -> Option<serde_json::Value> {
+    let info = provider_info(provider)?;
+    if info.login_methods.is_empty() {
+        return None;
+    }
+    serde_json::to_value(&info.login_methods).ok()
+}
+
 /// 某一家申报的账号行参数（没申报 = `None`）。
 pub fn account_features_of(provider: &str) -> Option<proto::AccountFeatures> {
     provider_info(provider)?.account_features

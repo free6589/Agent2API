@@ -156,3 +156,11 @@
 | #311 | 新增 `.github/workflows/server-tests.yml`，在 main/beta 的 push/PR 跑 `cargo test -p agent2api-server` | 工作流文件检查；本地用同一命令跑测试（结果见 `OMARCHY_LINUX.md` / 最终报告）。 |
 
 > 说明：本分支还修复了 beta.6 中两个**测试目标无法编译**的陈旧初始化（`RequestQuery` 缺字段、`send_with_retry` 参数变更）。不修这两处，CI 工作流会一启动就编译失败；这是 #311 能真正生效的前提。
+
+## 网页账号相关缺陷（本分支已修）
+
+| 位置 | 缺陷 | 处理 |
+| --- | --- | --- |
+| `plugin_host` / `/api/session` | 插件静态申报的 `login_methods` 没有进 provider 摘要，界面只能去问动态 `auth.methods`；网页插件没实现该动作 → 501，添加账号页直接报「该提供商尚未申报动态登录方式」，DeepSeek 网页无法添加 | 新增 `login_methods_of()`，摘要带 `loginMethods`；界面识别 501/未申报文案后回退到静态表单 |
+| `add-account-configs.ts` | DeepSeek 网页没有静态表单（只有插件申报，界面不认） | 补 `DEEPSEEK_WEB` / `QWEN_WEB` 两张表单（令牌 + 可选 Cookie + 备注名） |
+| `core/usage_query.rs` | 上游把「账号被临时限制」放在余额响应 `raw.accountAccess`，核心只读积分 → 界面显示「可用 300 积分」，实际请求全失败；且 60 秒轮询会持续打受限账号，可能把临时限制拖成永久停用 | 识别 `state != ACTIVE` + `restrictedUntil`，记 `provider_restricted` 失败并挂起自动查询到恢复时刻 |

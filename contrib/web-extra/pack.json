@@ -1,0 +1,24 @@
+{
+  "id": "agent2api-web-extra",
+  "name": "网页提供商（扩展）",
+  "description": "通义千问网页版账号：用本人 chat.qwen.ai 登录态转发，支持思考与正文分流。",
+  "license": "AGPL-3.0",
+  "version": "1.0.0",
+  "protocol": 1,
+  "provider_category": "web",
+  "providers": [
+    {
+      "id": "qwen-web",
+      "label": "通义千问 网页",
+      "order": 2,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "x86_64-pc-windows-msvc": "bin/agent2api-web-providers.exe",
+    "x86_64-unknown-linux-gnu": "bin/agent2api-web-providers",
+    "aarch64-unknown-linux-gnu": "bin/agent2api-web-providers",
+    "x86_64-apple-darwin": "bin/agent2api-web-providers",
+    "aarch64-apple-darwin": "bin/agent2api-web-providers"
+  }
+}

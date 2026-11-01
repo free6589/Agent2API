@@ -953,6 +953,64 @@ const CHATGLM: ProviderConfig = {
 }
 
 /**
+ * DeepSeek 网页（`chat.deepseek.com`）：外部网页提供商插件里的一家。
+ *
+ * ── 为什么它需要一张内置表单 ─────────────────────────────────
+ * 插件只在握手时申报了 `login_methods`（token + cookie），没有实现动态
+ * `auth.methods`；网关对未申报动态登录方式的家回 501，动态表单那条路走不通。
+ * 这张静态表单是**插件契约的直译**：字段名与插件 `normalize_account` 读取的
+ * 键一致（`accessToken` / `cookie`），提交仍走 `POST /api/accounts`，由插件的
+ * 归一器校验令牌并落库。没有这张表单时，界面只能落到「手动凭证 JSON」，
+ * 用户得自己猜键名 —— 那是这条缺陷的原始表现。
+ *
+ * ── 网页令牌不是收费 API Key ────────────────────────────────
+ * `userToken` 是 `chat.deepseek.com` 的网页登录态；`sk-` 开头的收费 Key
+ * 会被插件明确拒绝。网页触发人机验证时只能在官方网页重新登录后更新 Cookie，
+ * 本网关不绕过验证。
+ */
+const DEEPSEEK_WEB: ProviderConfig = {
+  provider: 'deepseek-web',
+  label: t('DeepSeek 网页'),
+  // 插件没有「导入本机客户端登录态」这条来源（网页令牌只能粘贴）
+  desktop: false,
+  manualTitle: t('粘贴网页登录凭据'),
+  // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行
+  manualNoteHtml: t('在浏览器打开 <code>chat.deepseek.com</code> 并登录，从开发者工具取两项：<br>① <b>userToken</b>：Application → Local Storage → <code>chat.deepseek.com</code> → <code>userToken</code>，复制其中的 <code>value</code>（<b>不是</b> <code>sk-</code> 开头的收费 API Key）；<br>② <b>Cookie</b>：Network 里任选一个 <code>chat.deepseek.com</code> 请求，复制完整的 <code>Cookie</code> 请求头（建议填写，缺了部分接口会要求人机验证）。<br>网页出现人机验证时，只能在官方网页手动重新登录后更新 Cookie；本网关不绕过验证。'),
+  fields: [
+    // 字段名不包 t()：与插件 `normalize_account` 读取的键逐字一致
+    { key: 'accessToken', label: t('网页访问令牌'), rows: 3, placeholder: t('userToken.value（不是 sk- 开头的收费 API Key）') },
+    { key: 'cookie', label: t('网页 Cookie'), rows: 3, placeholder: t('官方网页正常登录后的完整 Cookie（建议填写）'), optional: true },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空用「DeepSeek」+ 令牌尾号') },
+  ],
+}
+
+/**
+ * 通义千问 网页（`chat.qwen.ai`）：扩展网页提供商插件（`agent2api-web-extra`）。
+ *
+ * ── 与 DeepSeek 网页同一处境的第二家 ────────────────────────
+ * 插件在握手时申报了 token 登录方式，但没有实现动态 `auth.methods`；没有这张
+ * 静态表单时界面只能退到「手动凭证 JSON」。字段名与插件 `normalize_account`
+ * 的读取键一致（`accessToken` / `cookie`），提交走 `POST /api/accounts`。
+ *
+ * ── Cookie 是可选的 ────────────────────────────────────────
+ * 插件默认用 `token=<JWT>` 组 Cookie；只有用户在网页端另有一整段 Cookie
+ * （例如带 `ctoken` 等辅助字段）时才需要填。
+ */
+const QWEN_WEB: ProviderConfig = {
+  provider: 'qwen-web',
+  label: t('通义千问 网页'),
+  desktop: false,
+  manualTitle: t('粘贴网页访问令牌'),
+  // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行
+  manualNoteHtml: t('在浏览器打开 <code>chat.qwen.ai</code> 并登录，按 F12 打开开发者工具 → Application → Local Storage → <code>chat.qwen.ai</code>，复制 <code>token</code> 的值（<code>eyJ</code> 开头的 JWT，<b>不是</b> API Key）。<br>Cookie 一般不用填：网关会用 <code>token=&lt;JWT&gt;</code> 自动拼。若你的浏览器里还有一段完整 Cookie（例如带 <code>ctoken</code>），可以一并粘进来。'),
+  fields: [
+    { key: 'accessToken', label: t('网页访问令牌'), rows: 3, placeholder: t('localStorage 里的 token（eyJ 开头）') },
+    { key: 'cookie', label: t('网页 Cookie'), rows: 3, placeholder: t('可选：完整 Cookie；留空则自动用 token=<JWT>'), optional: true },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空用上游账号名或令牌尾号') },
+  ],
+}
+
+/**
  * ModelScope（魔搭）的两个站点：一家一个 provider，粘贴 `ms-` 令牌。
  *
  * ── 一枚令牌两用（这是本家最省事的地方）──────────────────────
@@ -1140,6 +1198,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
 // 智谱清言（chatglm.cn）：访客模式 / 粘贴令牌 / 导入本机登录态，排在末尾
   // （与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   CHATGLM,
+  // DeepSeek 网页 / 通义千问网页：插件家的静态表单（动态 auth.methods 未实现）
+  DEEPSEEK_WEB,
+  QWEN_WEB,
   MODELSCOPE,
   MODELSCOPE_INTL,
   // AtomCode（AtomGit / GitCode）：浏览器登录 + 粘贴令牌对，排在末尾

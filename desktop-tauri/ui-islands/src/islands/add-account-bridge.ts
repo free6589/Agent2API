@@ -255,7 +255,11 @@ export function isMethodsUnavailable(error: unknown, depth = 0): boolean {
     if (record.code === 'not_implemented' || record.code === 'auth_methods_unavailable') return true
     if (record.error && record.error !== error && isMethodsUnavailable(record.error, depth + 1)) return true
   }
-  return /\b501\b|auth\.methods[^\n]*(?:not implemented|no method|未实现|不支持)/i.test(errorText(error))
+  // 文案兜底：桥接层（Tauri `api_request` / web_shim）把 HTTP 错误压成纯字符串，
+  // 状态码在这一跳丢失；后端 501 的原话是「该提供商尚未申报动态登录方式，请使用
+  // 既有登录入口」。只认这一句，避免把真正的 500/502 也当成「没有动态方式」而
+  // 掩盖故障（那会让界面去渲染一份并不存在的旧表单）。
+  return /\b501\b|auth\.methods[^\n]*(?:not implemented|no method|未实现|不支持)|尚未申报动态登录方式|请使用既有登录入口/i.test(errorText(error))
 }
 
 export function runtimeProviderOf(provider: string): RuntimeProviderRecord | undefined {
