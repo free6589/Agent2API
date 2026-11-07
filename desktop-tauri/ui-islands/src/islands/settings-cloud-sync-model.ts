@@ -8,21 +8,25 @@ export type SyncStatus = {
   lastKeyFingerprint?: string
   lastError?: string
   lastErrorSource?: string
+  retryAt?: number
+  lastUploadAt?: number
 }
 
 export type CloudSyncView = {
   provider: string
-  webdav: { baseUrl: string; username: string; hasPassword: boolean }
+  webdav: { baseUrl: string; username: string; hasPassword: boolean; userAgent: string }
   s3: {
     region: string
     bucket: string
     accessKeyId: string
     endpoint: string
     hasSecretKey: boolean
+    userAgent: string
   }
   hasSyncPassword: boolean
   enabled: boolean
   autoSync: boolean
+  autoSyncIntervalMinutes: number
   remoteRoot: string
   profile: string
   status: SyncStatus
@@ -54,14 +58,17 @@ export type Form = {
   webdavBaseUrl: string
   webdavUsername: string
   webdavPassword: string
+  webdavUserAgent: string
   s3Region: string
   s3Bucket: string
   s3AccessKeyId: string
   s3SecretAccessKey: string
   s3Endpoint: string
+  s3UserAgent: string
   syncPassword: string
   enabled: boolean
   autoSync: boolean
+  autoSyncIntervalMinutes: number
   remoteRoot: string
   profile: string
 }
@@ -146,9 +153,10 @@ export function formatDateText(raw?: string): string {
 export function emptyForm(): Form {
   return {
     provider: PROVIDER_WEBDAV,
-    webdavBaseUrl: '', webdavUsername: '', webdavPassword: '',
-    s3Region: '', s3Bucket: '', s3AccessKeyId: '', s3SecretAccessKey: '', s3Endpoint: '',
-    syncPassword: '', enabled: false, autoSync: false, remoteRoot: 'agent2api-sync', profile: 'default',
+    webdavBaseUrl: '', webdavUsername: '', webdavPassword: '', webdavUserAgent: '',
+    s3Region: '', s3Bucket: '', s3AccessKeyId: '', s3SecretAccessKey: '', s3Endpoint: '', s3UserAgent: '',
+    syncPassword: '', enabled: false, autoSync: false, autoSyncIntervalMinutes: 5,
+    remoteRoot: 'agent2api-sync', profile: 'default',
   }
 }
 
@@ -159,14 +167,17 @@ export function formFromView(view: CloudSyncView): Form {
     webdavUsername: view.webdav.username,
     // 密码不回显：留空 = 沿用后端已保存的那份。
     webdavPassword: '',
+    webdavUserAgent: view.webdav.userAgent,
     s3Region: view.s3.region,
     s3Bucket: view.s3.bucket,
     s3AccessKeyId: view.s3.accessKeyId,
     s3Endpoint: view.s3.endpoint,
     s3SecretAccessKey: '',
+    s3UserAgent: view.s3.userAgent,
     syncPassword: '',
     enabled: view.enabled,
     autoSync: view.autoSync,
+    autoSyncIntervalMinutes: view.autoSyncIntervalMinutes || 5,
     remoteRoot: view.remoteRoot,
     profile: view.profile,
   }
@@ -178,14 +189,17 @@ export function payloadOf(form: Form): Record<string, unknown> {
     webdavBaseUrl: form.webdavBaseUrl,
     webdavUsername: form.webdavUsername,
     webdavPassword: form.webdavPassword,
+    webdavUserAgent: form.webdavUserAgent,
     s3Region: form.s3Region,
     s3Bucket: form.s3Bucket,
     s3AccessKeyId: form.s3AccessKeyId,
     s3SecretAccessKey: form.s3SecretAccessKey,
     s3Endpoint: form.s3Endpoint,
+    s3UserAgent: form.s3UserAgent,
     syncPassword: form.syncPassword,
     enabled: form.enabled,
     autoSync: form.autoSync,
+    autoSyncIntervalMinutes: form.autoSyncIntervalMinutes,
     remoteRoot: form.remoteRoot,
     profile: form.profile,
   }

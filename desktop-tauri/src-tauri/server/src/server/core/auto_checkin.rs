@@ -95,8 +95,8 @@ pub fn default_time() -> String {
 ///     ⚠️ 窗口是**每天 19:00 开启**（官方公告：19:00 起可领，23:00 至次日 09:00
 ///     可用），所以它的生效时刻在 `times::PROVIDER_TIMES` 里钉的是 19:01 ——
 ///     跟其它家一起在 00:01 去签只会拿到「窗口没开」。
-///     ⚠️ 领取要阿里云人机验证令牌（由界面 WebView 铸造）：headless 部署拿不到
-///     令牌时这一家回中性未领取（不落账、次日再试），不是失败。
+///     ⚠️ 领取验证按需交给已连接的管理界面；无可用界面或验证未完成返回
+///     `captcha`，不记已领取，也不归入等待活动的自动重试。
 ///
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分
 /// 查询但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
@@ -269,12 +269,8 @@ pub fn providers_added_after(version: i64) -> Vec<String> {
 /// 不在标签里堆字。Qoder 拆家（2026-10）后注册名就是「Qoder 中国版 /
 /// 国际版」，不再需要这里的覆盖。其余几家不需要后缀：小浣熊没有版本区分，
 /// AutoClaw 两地的签到链路都存在且同形 —— 展示名已带「国内版 / 国际版」。
-pub fn provider_label(id: &str) -> &str {
-    crate::server::core::providers::PROVIDERS
-        .iter()
-        .find(|meta| meta.id == id)
-        .map(|meta| meta.label)
-        .unwrap_or(id)
+pub fn provider_label(id: &str) -> String {
+    crate::server::core::providers::label_of(id)
 }
 
 /// 归一化配置里的提供商清单：只认 CHECKIN_PROVIDERS 里的 id（去重、保持顺序），

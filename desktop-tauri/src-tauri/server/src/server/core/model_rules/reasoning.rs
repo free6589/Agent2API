@@ -45,14 +45,10 @@
 //!            high|max→xhigh、模型不支持的档位退回该模型默认档）。「这一家收
 //!            哪个档位」在 Qoder 是模型级知识，翻译留在那边一份。
 //!   workbuddy（插件家）
-//!            写 `reasoning_effort`（由**插件**回答 `reasoning.patch`，值不做归并；
-//!            目录里那条模型声明了 supportedEfforts 而绑定值不在其中时跳过并说明）。
-//!            旧注释把它列在「不接」里，理由是「没有证据表明上游认识档位字段」——
-//!            现在有证据了：上游按 `reasoning_effort` 收发档位，`/v3/config` 每条
-//!            模型都带 `reasoning.defaultEffort` / `supportedEfforts`。适配器与
-//!            「客户端没给档位就补模型默认档」的归一都在插件
-//!            （`agent2api-providers` 的 `providers/workbuddy/reasoning.rs`，
-//!            依据与 issue 见那里）。
+//!            从当前地区目录读取 supportedEfforts；绑定值不支持时取不高于请求的
+//!            最高支持档，无更低档则取最低档。reasoning.effort 无可选表时是固定档。
+//!            未声明能力时不注入；恢复宿主目录缓存后再定档。出站归一与默认档补齐
+//!            都在插件，最终档位随 chat 计划回传给请求日志。
 //!   raccoon / autoclaw / cline
 //!            **不接**：三家都不注入档位字段（autoclaw 会改写 `model` 与 system
 //!            提示前缀，但那两处与档位无关，见它的 `adapter` / `prompt`），项目里
@@ -61,34 +57,27 @@
 //!            「不接」，接一家要有一家的证据。
 //! ```
 //!
-//! ── 哪些情况**故意不注入**（每一类都有具体理由）───────────────
+//! ── 覆盖边界与不注入的情况 ────────────────────────────────────
 //!   1. **`off` / `none`（关闭思考）**：本项目没有安全的表达方式 ——
 //!      Qoder 的 `enable_thinking = false` 会让 Qwen3.8 系列行为异常
 //!      （思考混进正文，或需要推理时直接断连，见 `qoder::protocol` 模块头），
 //!      CatPaw 根本没有「关」这一档。这两档一律不注入（判据
 //!      [`is_thinking_off`]），宁可不生效也不发一个会弄坏请求的字段。
-//!   2. **表外的自定义等级**（界面提供「自定义输入」）：各家的能力范围不同，
-//!      无法判断上游收不收；给 CatPaw 发一个错的档位是当场 400 —— 而这条请求
-//!      在本功能之前是能用的。所以**只有** [`effort_rank`] 认得的正向档位会
-//!      被翻译，表外值照旧保存、照旧显示，只是不参与转发。
-//!   3. **客户端请求体里已经指定了思考档位**：那是用户的明确意图，绑定是
-//!      「没指定时的默认」，不覆盖它。判定由各家适配器做（它只认自己那个
-//!      resolver 读的键，不另抄一份键名）。这与 OmniProxy 的
-//!      `reasoning_override` 的**覆盖**语义有意不同：本项目在绑定之前就已经有
-//!      「客户端字段直达上游」的链路（CatPaw 的 `resolve_effort`、Qoder 的
-//!      `resolve_thinking` 都从请求体里读），覆盖会把客户端显式传的值换成一条
-//!      与本次请求无关的配置 —— 而用户给某一次请求指定档位，恰恰比映射上的
-//!      默认值更具体。
+//!   2. **表外的自定义等级**：只有适配器确认上游声明了该值才注入；否则跳过。
+//!      通用正向档位的归一由各提供商负责，不能拿通用候选表当作上游能力表。
+//!   3. **客户端请求体里已经指定了思考档位**：映射绑定是强制覆盖，优先于客户端。
+//!      宿主先用移除客户端思考参数的副本询问适配器，兼容仍会让位于客户端的旧插件；
+//!      只有适配器确认支持并返回字段与取值后，才清理发送体中的冲突参数并写入绑定。
+//!      未绑定、上游不支持或插件调用失败时，客户端参数保持原样。
 //!   4. **本名直发**（该家原生承载请求名，`wire_target_for_provider` 的 ①）：
 //!      名字不是任何映射给的，此时**只认「名字不变的那条按家映射」**（target
 //!      与即将发出的名字相同）。于是：
 //!        - 用户为「catpaw 的 kimi-k3」建的 `kimi-k3 → kimi-k3（catpaw）`
 //!          这条**同名映射**上的等级**生效**（那是界面能表达「这个名字在这家
 //!          用这个等级」的唯一入口）；
-//!        - 而 `foo → bar（catpaw）` 这条映射在 `foo` 被 catpaw 原生承载时
-//!          **并不生效**（原生路由优先，发出去的是 `foo`），它的等级也就不会
-//!          被用到这次请求上 —— 否则就是一个没生效的映射去影响另一个模型，
-//!          与「等级必须跟着那条映射走」自相矛盾。
+//!        - `foo → bar（catpaw）` 与原始 ID `foo` 共用对外名字；同一提供商内
+//!          只能启用其中一条。启用映射会关闭 `foo` 的默认绑定，此时发送 `bar`
+//!          并使用映射等级；启用默认绑定则发送 `foo` 并使用默认绑定的等级。
 //!      判据（名字是否一致）与理由写在 `catalog::wire_target_for_provider` 里。
 //!   5. 这家翻译不了（见上表）：适配器返回 `Skip`，不注入、保持原有行为，
 //!      并在详细日志里说明原因。
@@ -98,11 +87,8 @@
 //!
 //! ── 下游等级的读取（`read_client_level`）────────────────────
 //! 它服务的是**请求日志显示**（下游模型名旁的 `(等级)`），不是转发决策 ——
-//! 转发时「客户端指定了什么」永远由各家适配器自己的 resolver 读（上面的
-//! 第 3 条），本函数只是把两家取值链的并集做成一个展示侧读取器。它**绝不能**
-//! 被拿来判断「客户端有没有指定」去做转发分支：两家的链有细节差异
-//! （CatPaw 的空串会让上游 400、Qoder 的取值链到第一个存在的键为止），
-//! 用并集做判断迟早与某家的真实行为分叉。
+//! 未覆盖时，客户端参数由各家适配器自己的 resolver 读取。本函数只负责展示，
+//! 不参与覆盖判断；适配器确认支持后才提交绑定。
 
 use serde_json::Value;
 
@@ -183,6 +169,30 @@ pub fn effort_rank(level: &str) -> Option<usize> {
     EFFORT_LEVELS
         .iter()
         .position(|known| trimmed.eq_ignore_ascii_case(known))
+}
+
+/// 仅清理请求级思考控制；消息里的思考内容、工具参数与输出格式必须保留。
+/// 适配器确认支持绑定之前，只能对用于翻译的副本调用。
+pub fn clear_reasoning_controls(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "reasoning_effort", "reasoningEffort", "effort", "reasoning", "thinking",
+        "enable_thinking", "thinking_budget", "chat_mode",
+    ] {
+        object.remove(key);
+    }
+    let empty_output_config = object
+        .get_mut("output_config")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|config| {
+            config.remove("effort");
+            config.is_empty()
+        });
+    if empty_output_config {
+        object.remove("output_config");
+    }
 }
 
 /// 从**下游请求体**里读客户端显式指定的思考等级（请求日志「下游等级」的展示

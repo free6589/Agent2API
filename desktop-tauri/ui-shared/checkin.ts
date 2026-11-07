@@ -1,9 +1,28 @@
+import type { CampaignEntry } from './checkin-campaign-types'
+
+export type DailyCheckinStatus = 'claimed' | 'done' | 'confirming' | 'inactive' | 'ineligible' | 'captcha' | 'failed'
+
+export type DailyCheckinState = {
+  at: number
+  completed: boolean
+  completedCount: number
+  totalCount: number
+  sourcesComplete: boolean
+  kind?: 'plans' | 'rolling'
+  until?: number | null
+  status?: DailyCheckinStatus
+  message?: string
+  retryAt?: number | null
+  queryOnly?: boolean
+}
+
 export type CheckinAccount = {
   id: string
   name: string
   available: boolean
   checkinAt: number | null
   checkedInToday: boolean
+  dailyCheckin?: DailyCheckinState | null
   edition: string | null
   streakDays: number
 }
@@ -17,6 +36,7 @@ export type ProviderGroup = {
   description?: string | null
   modes?: string[] | null
   uiHooks?: string[] | null
+  manualPlans?: boolean
 }
 
 export type OutOfScope = { label: string; reason: string; count: number }
@@ -241,7 +261,10 @@ export type RecordRow = {
   date?: string
   accountId?: string
   accountName?: string
+  /** 展示名（后端按 provider id 换过） */
   provider?: string
+  /** 提供商 id（筛选器的取值，历史记录里被移除的提供商也靠它还原） */
+  providerId?: string
   source?: string
   outcome?: string
   reason?: string
@@ -260,6 +283,7 @@ export type CheckinCenter = {
   extras: {
     onboarding: OnboardingEntry[]
     plans: PlanEntry[]
+    campaigns?: CampaignEntry[]
     growth: GrowthEntry[]
   }
   auto: AutoState

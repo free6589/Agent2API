@@ -91,15 +91,25 @@ pub const MAX_INSTALLER_BYTES: u64 = 600 * 1024 * 1024;
 pub struct UpdateError {
     pub message: String,
     pub status_code: i32,
+    pub rate_limits: Vec<super::rate_limit::RateLimit>,
 }
 
 impl UpdateError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), status_code: 502 }
+        Self { message: message.into(), status_code: 502, rate_limits: Vec::new() }
     }
 
     pub fn with_status(status_code: i32, message: impl Into<String>) -> Self {
-        Self { message: message.into(), status_code }
+        Self { message: message.into(), status_code, rate_limits: Vec::new() }
+    }
+
+    pub fn rate_limited(rate_limits: Vec<super::rate_limit::RateLimit>) -> Self {
+        Self { message: super::rate_limit::message(&rate_limits), status_code: 429, rate_limits }
+    }
+
+    pub fn retry_at(&self) -> i64 {
+        self.rate_limits.iter().filter(|limit| limit.retry_at > crate::server::logging::now_ms())
+            .map(|limit| limit.retry_at).min().unwrap_or(0)
     }
 
     /// 转成统一的网关错误。更新路由的失败 body 走 OpenAI 风格
@@ -351,6 +361,9 @@ pub fn installer_suffix() -> &'static str {
 /// 安装器由它决定）。取值与 [`installer_suffix`] 一致，Linux 上跟着
 /// [`running_as_appimage`] 走 —— 界面据此说「交给系统安装器」还是「替换文件」。
 pub fn installer_kind() -> &'static str {
+    if !desktop_shell() {
+        return "server";
+    }
     if cfg!(target_os = "macos") {
         "dmg"
     } else if cfg!(target_os = "windows") {
@@ -383,6 +396,28 @@ fn desktop_shell_suffixes() -> &'static [&'static str] {
         }
     } else {
         &[]
+    }
+}
+
+/// 本平台要找的安装包后缀（小写、带点，按优先级排）。
+///
+/// 与 [`pick_installer`] 的候选表**同源**（那条直接调它）：界面在「有新版本但
+/// 没有可下载的包」时要照着同一份后缀说明原因，各写一份迟早漂移成
+/// 「说找不到 .deb、其实找的是 .AppImage」。
+///
+/// Linux 上按运行期形态分叉：桌面壳给 deb / AppImage，容器 / headless 给**空表**
+/// —— 那时升级走 [`server_bundle_name`] 那份服务端包，与安装包后缀无关。
+pub fn installer_suffixes() -> Vec<String> {
+    if !desktop_shell() {
+        return Vec::new();
+    }
+    if cfg!(target_os = "linux") {
+        desktop_shell_suffixes()
+            .iter()
+            .map(|suffix| format!(".{}", suffix.to_lowercase()))
+            .collect()
+    } else {
+        vec![format!(".{}", installer_suffix())]
     }
 }
 
@@ -502,19 +537,16 @@ fn pick_preferred<'a>(candidates: &[&'a Value]) -> Option<&'a Value> {
 /// 不拦的话容器面板上会出现一个「下载并安装」按钮，点了只会得到
 /// 「软件更新在网页端不可用」。
 pub fn pick_installer(assets: Option<&Value>) -> Option<Value> {
-    if cfg!(target_os = "linux") && !desktop_shell() {
+    // 容器 / headless 是空表（见 [`installer_suffixes`]）：升级走服务端包，
+    // 面板上不该出现「下载并安装」按钮，点了只会得到「软件更新在网页端不可用」
+    let suffixes = installer_suffixes();
+    if suffixes.is_empty() {
         return None;
     }
     let list = assets.and_then(Value::as_array)?;
     // 候选后缀按优先级排：Windows / macOS 各一个，Linux 桌面壳是
     // [deb, AppImage]（见 [`desktop_shell_suffixes`]）—— 第一个能挑到资产的
     // 后缀胜出，因此 deb 优先、AppImage 兜底。
-    let suffixes: Vec<String> = if cfg!(target_os = "linux") {
-        desktop_shell_suffixes().iter().map(|s| format!(".{}", s.to_lowercase())).collect()
-    } else {
-        // 带点的后缀拼一次放循环外（循环里每次 format 会白分配）
-        vec![format!(".{}", installer_suffix())]
-    };
     for suffix in &suffixes {
         let candidates: Vec<&Value> = list
             .iter()
@@ -539,9 +571,12 @@ pub fn pick_installer(assets: Option<&Value>) -> Option<Value> {
 /// CI 打包（.github/workflows/build.yml 的 linux-server job）、这里挑选资产、
 /// 面板下载后按 `safe_file_name` 落到下载目录，三处逐字一致；改名要一起改。
 ///
-/// 非 Linux 目标返回 None：桌面端（Windows / macOS）的更新走安装包，
-/// 不存在「容器内替换」这条路径。
+/// 本机服务端包名；Windows 的 zip 仅供手动升级，Linux 的 tar.gz 也用于自动更新。
+/// 桌面端仍使用独立的平台安装器，不取这份载荷。
 pub fn server_bundle_name() -> Option<String> {
+    if cfg!(target_os = "windows") && std::env::consts::ARCH == "x86_64" {
+        return Some("agent2api-server-windows-amd64.zip".to_string());
+    }
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -552,6 +587,26 @@ pub fn server_bundle_name() -> Option<String> {
         _ => return None,
     };
     Some(format!("agent2api-server-linux-{arch}.tar.gz"))
+}
+
+/// Release 资产里出现过的后缀（小写、带点、去重，按首次出现排序）。
+///
+/// 界面在「有新版本但没有可下载的包」时用它说清「这一版只有 .dmg / .deb」——
+/// 与 [`installer_suffixes`] 配对：一边是「本机要什么」，一边是「发布页上有什么」。
+/// 取的是**过滤前**的清单：即使某个文件因更新源的访问方式被丢掉，也要说得出它存在过。
+pub fn asset_suffixes(assets: &[Value]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for item in assets {
+        let name = asset_name(item).to_lowercase();
+        // 只认最后一个点之后的片段：`.tar.gz` 归到 `.gz`（容器内更新包按完整
+        // 文件名认，见 [`server_bundle_name`]，不看这条）
+        let Some(index) = name.rfind('.') else { continue };
+        let suffix = &name[index..];
+        if suffix.len() > 1 && !seen.iter().any(|known| known == suffix) {
+            seen.push(suffix.to_string());
+        }
+    }
+    seen
 }
 
 /// 按**精确资产名**在 Release 资产里取 `{name, size, url}`。

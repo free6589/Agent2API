@@ -39,17 +39,21 @@ use super::{registry, GatewayCallbacks, Host};
 pub struct StoreCallbacks {
     store: AccountStore,
     // 只由网关安装清单赋予，不接受插件回调参数中的 provider/owner 作为范围。
-    allowed_providers: std::collections::HashSet<String>,
+    allowed_providers: std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 impl StoreCallbacks {
     /// 未绑定插件包的回调默认没有账号/设置权限；真实宿主由 for_providers 授权。
     pub fn new(store: AccountStore) -> Self {
-        Self { store, allowed_providers: std::collections::HashSet::new() }
+        Self { store, allowed_providers: std::sync::RwLock::new(std::collections::HashSet::new()) }
     }
 
-    fn for_providers(store: AccountStore, providers: Vec<String>) -> Self {
-        Self { store, allowed_providers: providers.into_iter().collect() }
+    pub(super) fn for_providers(store: AccountStore, providers: Vec<String>) -> Self {
+        Self { store, allowed_providers: std::sync::RwLock::new(providers.into_iter().collect()) }
+    }
+
+    pub(super) fn authorize_providers(&self, providers: Vec<String>) {
+        *self.allowed_providers.write().unwrap_or_else(|error| error.into_inner()) = providers.into_iter().collect();
     }
 
     fn check_provider(&self, provider: &str) -> Result<(), proto::WireError> {
@@ -90,7 +94,7 @@ impl GatewayCallbacks for StoreCallbacks {
     }
 
     fn provider_allowed(&self, provider: &str) -> bool {
-        self.allowed_providers.contains(provider)
+        self.allowed_providers.read().is_ok_and(|providers| providers.contains(provider))
     }
 
     fn store_get(
@@ -104,12 +108,11 @@ impl GatewayCallbacks for StoreCallbacks {
             self.check_provider(&provider)?;
             // 空 id = 已授权 provider 的队首账号；不向默认 WorkBuddy 回落。
             let id = if account.is_empty() {
-                self.store
-                    .accounts_for_provider(&provider)
-                    .first()
-                    .and_then(|item| item.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
+                let store = self.store.clone();
+                let provider = provider.clone();
+                crate::server::core::blocking::run(move || {
+                    store.route_account_ids_for_provider(&provider).into_iter().next()
+                }).await.map_err(|error| proto::WireError::with_code(error.message, proto::WireError::INTERNAL))?
             } else {
                 Some(account)
             };
@@ -120,7 +123,10 @@ impl GatewayCallbacks for StoreCallbacks {
                 ));
             };
             self.check_account(&id, Some(&provider))?;
-            let Some(record) = self.store.plugin_account(&id) else {
+            let store = self.store.clone();
+            let record = crate::server::core::blocking::run(move || store.plugin_account(&id)).await
+                .map_err(|error| proto::WireError::with_code(error.message, proto::WireError::INTERNAL))?;
+            let Some(record) = record else {
                 return Err(proto::WireError::with_code(
                     "账号不存在",
                     proto::WireError::NOT_FOUND,
@@ -144,18 +150,13 @@ impl GatewayCallbacks for StoreCallbacks {
     > {
         Box::pin(async move {
             self.check_provider(&provider)?;
-            let list: Vec<serde_json::Value> = self
-                .store
-                .accounts_for_provider(&provider)
-                .into_iter()
-                .filter_map(|item| {
-                    item.get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|id| self.check_account(id, Some(&provider)).is_ok())
-                        .and_then(|id| self.store.plugin_account(id))
-                        .filter(|record| record.get("provider").and_then(serde_json::Value::as_str) == Some(provider.as_str()))
-                })
-                .collect();
+            let store = self.store.clone();
+            let list = crate::server::core::blocking::run(move || {
+                store.route_account_ids_for_provider(&provider).into_iter()
+                    .filter_map(|id| store.plugin_account(&id))
+                    .filter(|record| record.get("provider").and_then(serde_json::Value::as_str) == Some(provider.as_str()))
+                    .collect::<Vec<_>>()
+            }).await.map_err(|error| proto::WireError::with_code(error.message, proto::WireError::INTERNAL))?;
             Ok(serde_json::Value::Array(list))
         })
     }
@@ -169,8 +170,15 @@ impl GatewayCallbacks for StoreCallbacks {
         Box<dyn std::future::Future<Output = Result<serde_json::Value, proto::WireError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.check_account(&account, None)?;
-            match self.store.plugin_update_secret(&account, &expect, &secret) {
+            let provider = self.check_account(&account, None)?;
+            let store = self.store.clone();
+            let updated = crate::server::core::blocking::run(move || {
+                if store.account_provider_of(&account).as_deref() != Some(provider.as_str()) {
+                    return Err("账号归属已变化".to_string());
+                }
+                store.plugin_update_secret(&account, &expect, &secret)
+            }).await.map_err(|error| proto::WireError::with_code(error.message, proto::WireError::INTERNAL))?;
+            match updated {
                 Ok(true) => Ok(serde_json::json!({ "updated": true })),
                 // 「期望值已变」不是错误：说明另一个刷新先落盘了，
                 // 插件应当重新读一遍再决定，而不是重试写。
@@ -193,14 +201,20 @@ impl GatewayCallbacks for StoreCallbacks {
             let provider = self.check_account(&account, None)?;
             let view = if public.is_object() {
                 Some(public)
-            } else if let Some(adapter) = registry::lookup(&provider) {
+            } else if let Some(adapter) = registry::callback_adapter(&provider) {
                 adapter.plugin_account_view(&secret).await.ok()
             } else {
                 None
             };
             // account_view 可能等待 RPC；写之前复核归属，不能借等待窗口切到包外账号。
             self.check_account(&account, Some(&provider))?;
-            self.store.plugin_update_account(&account, &expect, &secret, view.as_ref())
+            let store = self.store.clone();
+            crate::server::core::blocking::run(move || {
+                if store.account_provider_of(&account).as_deref() != Some(provider.as_str()) {
+                    return Err("账号归属已变化".to_string());
+                }
+                store.plugin_update_account(&account, &expect, &secret, view.as_ref())
+            }).await.map_err(|error| proto::WireError::with_code(error.message, proto::WireError::INTERNAL))?
                 .map(|updated| serde_json::json!({ "updated": updated }))
                 .map_err(|message| proto::WireError::with_code(message, proto::WireError::INTERNAL))
         })
@@ -214,16 +228,17 @@ impl GatewayCallbacks for StoreCallbacks {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), proto::WireError>> + Send + '_>>
     {
         Box::pin(async move {
-            self.check_account(&account, None)?;
-            self.store.mark_rate_limited(
-                &account,
-                &model,
-                429,
-                None,
-                reset_at.map(|value| value as f64),
-                "插件上报限额",
-            );
-            Ok(())
+            let provider = self.check_account(&account, None)?;
+            let store = self.store.clone();
+            crate::server::core::blocking::run(move || {
+                if store.account_provider_of(&account).as_deref() != Some(provider.as_str()) {
+                    return Err("账号归属已变化".to_string());
+                }
+                store.mark_rate_limited(&account, &model, 429, None,
+                    reset_at.map(|value| value as f64), "插件上报限额");
+                Ok(())
+            }).await.map_err(|error| proto::WireError::with_code(error.message, proto::WireError::INTERNAL))?
+                .map_err(|message| proto::WireError::with_code(message, super::CALLBACK_FORBIDDEN))
         })
     }
 
@@ -367,10 +382,13 @@ pub async fn start(store: AccountStore) -> Option<Arc<Host>> {
         }
         super::schedules::wake();
     }
-    first
+    if let Err(error) = super::script::start(store).await {
+        logging::log("[Plugin]", &format!("脚本插件启动失败：{error}"));
+    }
+    first.or_else(super::script::host)
 }
 
-async fn start_pack(
+pub(super) async fn start_pack(
     store: AccountStore,
     pack: &install::InstalledPack,
     owners: &std::collections::BTreeMap<String, String>,
@@ -436,7 +454,13 @@ async fn start_pack(
     super::runtime::install_pack(&pack.id, super::ownership::category(&dir), host.clone());
     match host.ensure().await {
         Ok(providers) => {
+            let enabled_ids: Vec<String> = providers.iter().map(|info| info.id.0.clone())
+                .filter(|id| !crate::server::core::providers::availability::is_suspended(id)
+                    && owners.get(id).map(String::as_str) == Some(pack.id.as_str())
+                    && pack.providers.get(id).copied().unwrap_or(true)).collect();
+            super::runtime::set_providers(&pack.id, enabled_ids);
             let mut loaded = Vec::new();
+            let mut adapters = Vec::new();
             let mut restored = Vec::new();
             for info in providers {
                 let id = info.id.0.clone();
@@ -462,9 +486,11 @@ async fn start_pack(
                 }
                 let mut adapter = RpcAdapter::new(id.clone(), kind, host.clone(), info);
                 adapter.load_image_capability().await;
-                registry::install(id.clone(), Arc::new(adapter));
+                adapters.push((id.clone(), Arc::new(adapter)));
                 loaded.push(id);
             }
+            if !host.ready() { return None; }
+            registry::stage_all(adapters);
             let count = loaded.len();
             super::runtime::set_providers(&pack.id, loaded);
             logging::log(
@@ -486,24 +512,30 @@ async fn start_pack(
     }
 }
 
-/// 重启装配：关掉当前宿主 → 清空适配器注册表 → 按注册表重新装配。
-///
-/// ── 什么时候调 ──────────────────────────────────────────────
-/// 安装 / 升级 / 卸载 / 启停插件包之后（`api::plugins`）。用户点完按钮
-/// 就该生效，不必重启整个网关 —— 那是插件架构对「装个插件要重开应用」的
-/// 直接反驳。
-///
-/// ── 顺序为什么是「先关再清再装」───────────────────────────────
-///   · 先 `shutdown()`：子进程还在跑时换二进制，Windows 上会因文件占用失败；
-///   · 再 `registry::clear()`：旧的 `RpcAdapter` 持有旧宿主的 `Arc`，不清掉
-///     它们会继续把请求发给一个已关闭的进程（表现为「装了新包还是 503」）；
-///   · 最后 `start()`：它读注册表、spawn、握手、重建适配器。
-///
-/// 关闭失败不阻断：拿不到宿主就是「本来就没在跑」，照样往下走。
+/// 只重载空闲的插件包；正在使用旧执行体的请求不能被管理操作回收。
 pub async fn reload(store: AccountStore) -> Option<Arc<Host>> {
-    super::shutdown_all().await;
-    registry::clear();
-    start(store).await
+    let _mutation = super::operations::mutation_guard().await;
+    let registry = PackRegistry::load();
+    let mut ids = super::runtime::loaded_ids();
+    ids.extend(registry.packs.iter().map(|pack| pack.id.clone()));
+    ids.sort();
+    ids.dedup();
+    for id in ids {
+        if id == super::script::HOST_ID { continue; }
+        let scope = super::switching::ChangeScope::between(&registry, &registry, &id, None);
+        let Some(switch) = scope.begin() else {
+            logging::log("[Plugin]", &format!("插件包「{id}」仍有任务，未执行重载"));
+            continue;
+        };
+        if let Err(error) = scope.stop().await {
+            logging::log("[Plugin]", &error);
+            continue;
+        }
+        switch.clear_adapters();
+        if let Err(error) = scope.start(&store).await { logging::log("[Plugin]", &error); }
+        drop(switch);
+    }
+    super::runtime::current()
 }
 
 /// 网关监听端口（`ServerState::bootstrap` 时写入一次）。
@@ -521,7 +553,7 @@ pub fn set_loopback_port(port: u16) {
 }
 
 /// 取网关监听端口（未写入时为 `0`，插件据此走「拿不到回调地址」分支）。
-fn loopback_port() -> u16 {
+pub(super) fn loopback_port() -> u16 {
     LOOPBACK_PORT.get().copied().unwrap_or(0)
 }
 

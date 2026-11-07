@@ -176,6 +176,10 @@ async fn add_plugin_account(
         agent2api_provider_protocol::NormalizeSource::Manual { payload: manual_payload }
     };
 
+    let imported_file = matches!(&source,
+        agent2api_provider_protocol::NormalizeSource::FileText { .. }
+            | agent2api_provider_protocol::NormalizeSource::FileBase64 { .. }
+    );
     let input = agent2api_provider_protocol::NormalizeInput {
         provider: provider.to_string(),
         source,
@@ -208,12 +212,22 @@ async fn add_plugin_account(
         account_source,
         proxy_config.as_ref(),
     ) {
-        Ok((record, proxy_saved)) => ok_json(json!({
-            "account": record,
-            "created": true,
-            "proxySaved": proxy_saved,
-            "list": state.store().list_visible_accounts(),
-        })),
+        Ok((record, proxy_saved)) => {
+            let imported_id = record.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let mut result = json!({
+                "account": record,
+                "created": true,
+                "proxySaved": proxy_saved,
+            });
+            if imported_file && !imported_id.is_empty() {
+                super::account_import_setup::complete(state, &[imported_id.clone()], &mut result).await;
+                if let Some(account) = state.store().plugin_account(&imported_id) {
+                    result["account"] = account.get("public").cloned().unwrap_or(Value::Null);
+                }
+            }
+            result["list"] = state.store().list_visible_accounts();
+            ok_json(result)
+        }
         Err(message) => {
             logging::log("[Accounts]", &format!("❌ {message}"));
             management_error(500, &message)
@@ -449,6 +463,24 @@ pub async fn dispatch(
                 return super::zcode_claim::claim_plan(&state, &id, body).await;
             }
         }
+        if let Some(id) = rest.strip_suffix("/campaigns/redeem") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::campaign_rewards::redeem(&state, &id, body).await;
+            }
+        }
+        if let Some(id) = rest.strip_suffix("/officeace-subscription/activate") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::officeace_subscription::activate(&state, &id).await;
+            }
+        }
+        if let Some(id) = rest.strip_suffix("/campaigns/claim") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::campaign_rewards::claim(&state, &id, body).await;
+            }
+        }
         // 新手任务一键领取（执行体按账号的提供商分派：Loomy 任务表 / 小浣熊
         // 首次登录奖励，见 `api::onboarding`；幂等，重复点不会重复加分）。
         if let Some(id) = rest.strip_suffix("/onboarding/claim") {
@@ -486,6 +518,18 @@ pub async fn dispatch(
     // `?refresh=1` 强制实查上游（手点「查询任务」）；不带则吃结算记忆（一次性
     // 福利领完就不再问上游，见 `api::onboarding` 的模块说明）。
     if method == Method::GET {
+        if let Some(id) = rest.strip_suffix("/officeace-subscription") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::officeace_subscription::preview(&state, &id).await;
+            }
+        }
+        if let Some(id) = rest.strip_suffix("/campaigns") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::campaign_rewards::preview(&state, &id).await;
+            }
+        }
         if let Some(id) = rest.strip_suffix("/onboarding") {
             let id = decode_segment(id);
             if !id.is_empty() {
@@ -575,7 +619,7 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         .and_then(Value::as_str)
         .map(str::to_string);
     let import_name = name.as_deref();
-    if let Some(response) = super::accounts_export::import_account_file(state, provider, &payload, import_name) {
+    if let Some(response) = super::accounts_export::import_account_file(state, provider, &payload, import_name).await {
         return response;
     }
     if crate::server::core::providers::availability::is_suspended(provider) {
@@ -882,7 +926,11 @@ pub async fn import_accounts(state: &ServerState, body: &Bytes) -> Response {
         None => payload,
     };
     match crate::server::core::account_transfer::import_accounts(state.store(), &payload) {
-        Ok(result) => ok_json(result),
+        Ok(mut result) => {
+            let ids = super::account_import_setup::imported_ids(&result);
+            super::account_import_setup::complete(state, &ids, &mut result).await;
+            ok_json(result)
+        }
         Err(error) => store_error(error),
     }
 }
@@ -982,7 +1030,13 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             else {
                 return management_error(400, format!("未知的提供商：{provider}"));
             };
-            return match adapter.refresh_access_token(state.store(), &id).await {
+            return match crate::server::core::maintenance::refresh_single(
+                state.store(),
+                adapter.as_ref(),
+                &id,
+            )
+            .await
+            {
                 Ok(_) => ok_json(json!({
                     "refreshedId": id,
                     "list": state.store().list_visible_accounts(),
@@ -1150,7 +1204,13 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             ),
         );
     };
-    match adapter.refresh_access_token(state.store(), &id).await {
+    match crate::server::core::maintenance::refresh_single(
+        state.store(),
+        adapter.as_ref(),
+        &id,
+    )
+    .await
+    {
         Ok(_) => ok_json(json!({
             "refreshedId": id,
             "list": state.store().list_visible_accounts(),
@@ -1169,7 +1229,9 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
 /// 窗口）、按来源回写。这里是唯一调用点，差异全在各家适配器里。
 async fn refresh_provider_account(state: &ServerState, id: &str, kind: ProviderKind) -> Response {
     let adapter = adapter_for(kind);
-    match adapter.refresh_access_token(state.store(), id).await {
+    match crate::server::core::maintenance::refresh_single(state.store(), adapter, id)
+        .await
+    {
         Ok(_) => ok_json(json!({
             "refreshedId": id,
             "list": state.store().list_visible_accounts(),
@@ -1191,12 +1253,13 @@ async fn refresh_provider_account(state: &ServerState, id: &str, kind: ProviderK
 /// 为什么这条判断不能留在壳侧、为什么失败不给非 2xx，
 /// 见 `core::credential_maintenance` 的模块头与本文件那条 400 的说明。
 pub async fn refresh_expiring_accounts(state: &ServerState) -> Response {
-    let report =
-        crate::server::core::credential_maintenance::refresh_expiring_report(state.store()).await;
-    // 这一轮已经真刷过一遍了：把定时维护的排期顺延一个间隔（口径与其它手动
-    // 入口一致）—— 否则「刚点完维护、到点或重启后又立刻再刷一遍」。
-    crate::server::core::credential_maintenance::note_manual_run();
-    ok_json(report)
+    match crate::server::core::maintenance::execute(
+        state.store(),
+        crate::server::core::maintenance::Request::full(crate::server::core::maintenance::CREDENTIAL, true),
+    ).await {
+        Ok(detail) => ok_json(crate::server::core::maintenance::types::report(&detail)),
+        Err(error) => management_error(400, error),
+    }
 }
 
 // ─── GET /api/accounts/usage 与 POST /api/accounts/checkin ──
@@ -1353,11 +1416,15 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             Err(error) => return store_error(error),
         }
     }
-    // 自定义账号的凭证（`apiKey` / `noAuth`）：与上面两段同一处境 —— 只有自定义
-    // 家认这两个键，所以不进通用 `apply_patch`。**账号 id 由 HTTP 路径给定，
-    // 改凭证不改 id**（id 是身份：限额冷却、请求日志、导出文件都按它关联），
-    // 于是这里不需要「同 key 合并」那条添加侧的逻辑。
-    if patch.get("apiKey").is_some() || patch.get("noAuth").is_some() {
+    // 自定义账号的凭证（`apiKey` / `noAuth`）**与上游地址覆盖项（`baseUrl`）**：
+    // 与上面两段同一处境 —— 只有自定义家认这几个键，所以不进通用 `apply_patch`。
+    // **账号 id 由 HTTP 路径给定，改凭证不改 id**（id 是身份：限额冷却、请求日志、
+    // 导出文件都按它关联），于是这里不需要「同 key 合并」那条添加侧的逻辑。
+    //
+    // `baseUrl` 是账号上的**覆盖项**（缺省时转发回落到提供商的地址）：界面用它
+    // 表达「改回跟随提供商」（传 null），也是 issue #455 里那份看不见、改不掉的
+    // 旧地址的清理入口。
+    if patch.get("apiKey").is_some() || patch.get("noAuth").is_some() || patch.get("baseUrl").is_some() {
         // `custom_account_provider` 一次回答两件事：账号在不在、属不属于自定义家
         // （判据是记录里的 `provider` 前缀，不要求提供商本身还在配置里，
         // 见那个函数的说明）—— 与 balanceToken / zcodePlan 的两次查询同口径
@@ -1374,7 +1441,7 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
                 })
                 .unwrap_or(false);
             return if known {
-                management_error(400, "只有自定义提供商的账号有 API Key / 无需鉴权这两项")
+                management_error(400, "只有自定义提供商的账号有 API Key / 无需鉴权 / 上游地址这几项")
             } else {
                 store_error(AccountStoreError::new("账号不存在", 404))
             };
@@ -1388,9 +1455,20 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
                 scoped.insert(key.to_string(), value.clone());
             }
         }
-        match state.store().update_custom_credentials(&id, &Value::Object(scoped)) {
-            Ok(changes) => balance_changes.extend(changes),
-            Err(error) => return store_error(error),
+        if !scoped.is_empty() {
+            match state.store().update_custom_credentials(&id, &Value::Object(scoped)) {
+                Ok(changes) => balance_changes.extend(changes),
+                Err(error) => return store_error(error),
+            }
+        }
+        // 地址覆盖项单独一条路径：`null` / 空串 = 清除（跟随提供商），字符串 =
+        // 校验后写入。与凭证互不影响，失败也不该把已改好的凭证一起报成失败 ——
+        // 但两者都在同一次保存里，按「先凭证后地址」的顺序各自报错即可
+        if let Some(value) = patch.get("baseUrl") {
+            match state.store().update_custom_base_url(&id, value) {
+                Ok(changes) => balance_changes.extend(changes),
+                Err(error) => return store_error(error),
+            }
         }
     }
     // 自定义账号的**余额查询配置**（`balanceQuery`）：与上面 apiKey 那一段同一

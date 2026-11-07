@@ -31,9 +31,12 @@
  */
 
 import * as React from 'react'
+import { accountImportNotice } from '../../../ui-shared/account-import-result'
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
+  IMAGE_COMPRESS_ENABLED_KEY,
+  IMAGE_COMPRESS_FIELDS,
   NO_RETRY_CODES_KEY,
   PROMPT_MODES,
   QUEUE_FIELDS,
@@ -84,11 +87,13 @@ export type BusyScope =
   | 'codes'
   | 'timeouts'
   | 'queue'
+  | 'imageCompress'
   | 'captchaPool'
   | 'routing'
   | 'debug'
   | 'sanitize'
   | 'developerRoleCompat'
+  | 'reasoningCollapse'
   | 'clineHeaders'
   | 'zcodeVersion'
   | 'cors'
@@ -157,6 +162,20 @@ export type DebugState = {
 
 /** 开发者角色兼容开关 */
 export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
+
+/** 第三方模型回答完自动折叠过程开关 */
+export type ReasoningCollapseState = { status: LoadStatus; on: boolean }
+
+/**
+ * 会话图片压缩：一个开关 + 三项参数。`values` 为 null（loading / unavailable）
+ * 时三个输入框保持禁用；`enabled` 在读到之前按关显示（与 developerRoleCompat
+ * 同款降级口径）。
+ */
+export type ImageCompressState = {
+  status: LoadStatus
+  enabled: boolean
+  values: Record<string, number> | null
+}
 
 /** Cline 伪装头：三份表（默认 / 覆盖 / 生效）都来自后端，界面据此渲染与判断改动 */
 export type ClineHeadersState = {
@@ -284,12 +303,15 @@ export type SettingsSnapshot = {
   retryCodes: number[] | null
   timeouts: NumericState
   queue: NumericState
+  /** 会话图片压缩：开关 + 三项参数（长边 / 质量 / 阈值） */
+  imageCompress: ImageCompressState
   captchaPool: NumericState
   /** 账号路由：策略 + 会话粘性（「路由」分类） */
   routing: RoutingState
   debug: DebugState
   sanitize: SanitizeState
   developerRoleCompat: DeveloperRoleCompatState
+  reasoningCollapse: ReasoningCollapseState
   clineHeaders: ClineHeadersState
   zcodeVersion: ZcodeVersionState
   cors: CorsState
@@ -422,11 +444,13 @@ const INITIAL: SettingsSnapshot = {
   retryCodes: null,
   timeouts: { status: 'loading', values: null },
   queue: { status: 'loading', values: null },
+  imageCompress: { status: 'loading', enabled: true, values: null },
   captchaPool: { status: 'loading', values: null },
   routing: { status: 'loading', strategy: 'order', sticky: 'auto', failoverBackoff: true, sink: true, breakerEnabled: false },
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: INITIAL_SANITIZE,
   developerRoleCompat: { status: 'loading', on: false },
+  reasoningCollapse: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
   zcodeVersion: { status: 'loading', version: '', envOverride: '' },
   cors: { status: 'loading', on: false },
@@ -858,8 +882,12 @@ export async function importAccounts(): Promise<void> {
       added, updated, suffix, note: providerNote,
     })
 
+    const notice = accountImportNotice(result)
+    const message = failed || notice?.warning
+      ? t('导入完成：{summary}', { summary })
+      : t('✅ 导入完成：{summary}', { summary })
+    toast(notice ? `${message}\n${t(notice.text)}` : message, failed ? 'err' : notice?.warning ? 'warn' : 'ok')
     if (failed) {
-      toast(t('导入完成：{summary}', { summary }), 'err')
       // 失败明细只列前 3 条，与账号页批量操作的展示密度保持一致；
       // 定义警告（customProvider 标记）没有账号语义，展示时注明归属
       const detail = errors.slice(0, 3)
@@ -872,8 +900,6 @@ export async function importAccounts(): Promise<void> {
         })
         .join(t('；'))
       publish({ ioFailure: { failed, detail, more: errors.length > 3 } })
-    } else {
-      toast(t('✅ 导入完成：{summary}', { summary }))
     }
 
     // 账号被改动（新增/更新）后让主界面立刻反映：账号列表、导航计数等；
@@ -1355,7 +1381,7 @@ async function commitRetention(field: RetentionField, value: number, shrinking: 
  * 直接换号」名单）由各自的代码实现，在数据到达 / 不可用时被回调一次。
  */
 type NumericPanel = {
-  scope: 'retry' | 'timeouts' | 'queue' | 'captchaPool'
+  scope: 'retry' | 'timeouts' | 'queue' | 'imageCompress' | 'captchaPool'
   fields: NumberField[]
   consoleLabel: string
   /** 取数 / 写回：桥不在时给 undefined（各调用点按「读不到」处理） */
@@ -1437,6 +1463,64 @@ export async function loadQueue(): Promise<void> {
 
 export async function saveQueueField(field: NumberField, raw: string): Promise<void> {
   await saveNumericField(queuePanel, field, raw)
+}
+
+/* ─── 会话图片压缩（开关 + 三项参数）────────────── */
+
+/** 从响应里读开关（非对象 / 字段不是字面 true 都算关，与后端「只认字面 true」一致） */
+function imageCompressEnabledFlag(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false
+  return (data as Record<string, unknown>)[IMAGE_COMPRESS_ENABLED_KEY] === true
+}
+
+/**
+ * 图片压缩面板：三项数字复用数字面板的取数 / 写入 / 回滚流程；开关另走一条
+ * 只改一个布尔值的保存路径（与 developerRoleCompat 同款）。两者共用同一条
+ * `/api/image-compress` 端点，响应里同时带开关与三项参数。
+ */
+const imageCompressPanel: NumericPanel = {
+  scope: 'imageCompress',
+  fields: IMAGE_COMPRESS_FIELDS,
+  consoleLabel: '读取会话图片压缩设置',
+  get: () => shared().workbuddyDesktop?.getImageCompress(),
+  save: patch => shared().workbuddyDesktop?.saveImageCompress(patch),
+  read: () => ({ status: snapshot.imageCompress.status, values: snapshot.imageCompress.values }),
+  write: state => publish({
+    imageCompress: { ...snapshot.imageCompress, status: state.status, values: state.values },
+  }),
+  // 同一份响应里还带开关；数字面板不认布尔值，这里顺手回写
+  syncExtras: data => {
+    publish({ imageCompress: { ...snapshot.imageCompress, enabled: imageCompressEnabledFlag(data) } })
+  },
+}
+
+export function renderImageCompress(data?: unknown): void {
+  renderNumericPanel(imageCompressPanel, data)
+}
+
+export async function loadImageCompress(): Promise<void> {
+  await loadNumericPanel(imageCompressPanel)
+}
+
+export async function saveImageCompressField(field: NumberField, raw: string): Promise<void> {
+  await saveNumericField(imageCompressPanel, field, raw)
+}
+
+/** 开关的保存路径（只改一个布尔值；失败回滚到后端真实值） */
+export async function saveImageCompressEnabled(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('imageCompress')
+  publish({ imageCompress: { ...snapshot.imageCompress, enabled: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveImageCompress({ [IMAGE_COMPRESS_ENABLED_KEY]: next })
+    renderImageCompress(saved)
+    toast(next ? t('✅ 会话图片压缩已开启') : t('已关闭会话图片压缩'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadImageCompress() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
 }
 
 /* ─── 验证码令牌池 ─────────────────────────── */
@@ -1665,46 +1749,64 @@ export async function saveTimeoutField(field: NumberField, raw: string): Promise
 
 /* ─── 调试模式 / 指纹脱敏 ── */
 
+let debugRevision = 0
+
 export function renderDebug(data?: unknown): void {
   if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ debug: { status: 'unavailable', on: false, count: null, limit: null } })
+  const record = data && typeof data === 'object' && !Array.isArray(data)
+    ? data as Record<string, unknown> : null
+  if (!record || typeof record.debugMode !== 'boolean') {
+    publish({ debug: { ...snapshot.debug, status: 'unavailable' } })
     return
   }
-  const record = data as Record<string, unknown>
   const count = Number(record.count)
   const limit = Number(record.limit)
   publish({
     debug: {
       status: 'ready',
-      on: record.debugMode === true,
+      on: record.debugMode,
       count: Number.isInteger(count) ? count : null,
       limit: Number.isInteger(limit) ? limit : null,
     },
   })
 }
 
-async function loadDebug(): Promise<void> {
+async function readDebug(): Promise<void> {
+  const revision = ++debugRevision
   try {
-    renderDebug(await shared().workbuddyDesktop?.getDebug())
+    const data = await shared().workbuddyDesktop?.getDebug()
+    if (revision === debugRevision) renderDebug(data ?? null)
   } catch (error) {
+    if (revision !== debugRevision) return
     console.warn('读取调试模式设置失败:', errorMessage(error))
     renderDebug(null)
   }
 }
 
+export async function loadDebug(): Promise<void> {
+  if (busyScope !== 'debug') await readDebug()
+}
+
 export async function saveDebug(next: boolean): Promise<void> {
-  // 忙碌中早退：受控开关的 checked 来自快照，不写快照即等于「还原这一下拨动」
-  if (busyScope) { repaint(); return }
+  if (busyScope || snapshot.debug.status !== 'ready') { repaint(); return }
+  // 保存开始后，先前的读取结果不能覆盖新状态。
+  const previous = snapshot.debug
+  debugRevision += 1
   beginBusy('debug')
-  publish({ debug: { ...snapshot.debug, on: next } })
+  publish({ debug: { ...previous, on: next } })
   try {
-    const saved = await shared().workbuddyDesktop?.saveDebug(next)
-    renderDebug(saved)
+    const bridge = shared().workbuddyDesktop
+    if (!bridge?.saveDebug) throw new Error(t('主进程桥不可用'))
+    const saved = await bridge.saveDebug(next)
+    renderDebug(saved ?? null)
+    if (snapshot.debug.status !== 'ready' || snapshot.debug.on !== next) {
+      throw new Error(t('未能读取调试模式设置，请稍后重试'))
+    }
     toast(next ? t('✅ 调试模式已开启') : t('✅ 调试模式已关闭'))
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadDebug() // 回滚到后端的真实值
+    publish({ debug: previous })
+    await readDebug()
   } finally {
     endBusy()
   }
@@ -1788,6 +1890,43 @@ export async function saveDeveloperRoleCompat(next: boolean): Promise<void> {
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
     await loadDeveloperRoleCompat() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/* ─── 第三方模型回答完自动折叠过程（给 Responses 助手消息补阶段标记）── */
+
+export function renderReasoningCollapse(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ reasoningCollapse: { status: 'unavailable', on: false } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({ reasoningCollapse: { status: 'ready', on: record.thirdPartyReasoningCollapse === true } })
+}
+
+async function loadReasoningCollapse(): Promise<void> {
+  try {
+    renderReasoningCollapse(await shared().workbuddyDesktop?.getReasoningCollapse())
+  } catch (error) {
+    console.warn('读取第三方模型回答完自动折叠过程设置失败:', errorMessage(error))
+    renderReasoningCollapse(null)
+  }
+}
+
+export async function saveReasoningCollapse(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('reasoningCollapse')
+  publish({ reasoningCollapse: { status: 'ready', on: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveReasoningCollapse(next)
+    renderReasoningCollapse(saved)
+    toast(next ? t('✅ 第三方模型回答完自动折叠过程已开启') : t('已关闭第三方模型回答完自动折叠过程'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadReasoningCollapse() // 回滚到后端的真实值
   } finally {
     endBusy()
   }
@@ -2631,8 +2770,9 @@ export async function panelLogout(): Promise<boolean> {
  * 设置页数据入口（app.js 切入该页时调用，upgrade-panel 迁移完成后也调）。
  * 九个取数并行，各自失败各自降级 —— 一个接口挂了不该把整页拖成空白。
  */
-export async function load(): Promise<void> {
-  restoreCategory()
+export async function load({ checkUpdate = false }: { checkUpdate?: boolean } = {}): Promise<void> {
+  if (checkUpdate) showCategory('about')
+  else restoreCategory()
   renderUnits()
   publish({ panelLogin: readPanelLogin() })
   window.dispatchEvent(new Event('wb:settings-load'))
@@ -2643,10 +2783,12 @@ export async function load(): Promise<void> {
     loadRetry(),
     loadTimeouts(),
     loadQueue(),
+    loadImageCompress(),
     loadCaptchaPool(),
     loadDebug(),
     loadSanitize(),
     loadDeveloperRoleCompat(),
+    loadReasoningCollapse(),
     loadClineHeaders(),
     loadZcodeVersion(),
     loadCors(),
@@ -2656,8 +2798,8 @@ export async function load(): Promise<void> {
     loadAccount(),
     loadModelsDev(),
     reconnectDbRestore(),
-    // 软件更新面板是另一个岛（update-panel.tsx），切进设置页时让它自己刷新一次
-    shared().wbUpdatePanel?.load?.(),
+    // 托盘只检查版本，不能恢复下载任务后顺带启动已完成的安装包。
+    checkUpdate ? shared().wbUpdatePanel?.check?.() : shared().wbUpdatePanel?.load?.(),
     // 「版本信息」也是独立岛（system-info-pane.tsx）：同样在切进设置页时重拉 ——
     // 版本 / 运行时长 / 在途请求这些读数会随时间变，缓存一份旧的没有意义
     shared().wbSystemInfoPane?.load?.(),
@@ -2686,6 +2828,11 @@ export async function refreshQueue(): Promise<void> {
   toast(t('排队等待设置已刷新'))
 }
 
+export async function refreshImageCompress(): Promise<void> {
+  await loadImageCompress()
+  toast(t('会话图片压缩设置已刷新'))
+}
+
 export async function refreshCaptchaPool(): Promise<void> {
   await loadCaptchaPool()
   toast(t('验证码令牌池设置已刷新'))
@@ -2709,6 +2856,11 @@ export async function refreshSanitize(): Promise<void> {
 export async function refreshDeveloperRoleCompat(): Promise<void> {
   await loadDeveloperRoleCompat()
   toast(t('开发者角色兼容设置已刷新'))
+}
+
+export async function refreshReasoningCollapse(): Promise<void> {
+  await loadReasoningCollapse()
+  toast(t('第三方模型回答完自动折叠过程设置已刷新'))
 }
 
 export async function refreshCors(): Promise<void> {

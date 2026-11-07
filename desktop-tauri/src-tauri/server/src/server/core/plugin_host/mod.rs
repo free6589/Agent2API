@@ -6,12 +6,9 @@
 //! [`crate::server::core::providers::adapter::ProviderAdapter`]；这个模块
 //! 提供 [`RpcAdapter`]（那个 trait 的远程实现）与 [`Host`]（进程生命周期）。
 //!
-//! ── 进程模型：每个插件包一个宿主 ──────────────────────────────
-//! 与 magpie 同款：一个包 = 一个进程 = 若干家 provider。理由：
-//!   - 21 份 tokio 运行时与连接池的代价在桌面端很明显（每份至少几 MB 常驻）；
-//!   - 跨 provider 的共享状态（HTTP 客户端、模型缓存）只存一份；
-//!   - 崩溃恢复的粒度足够 —— 一个 provider 的 panic 带走的是同包其它家，
-//!     但**不会**带走网关（那是插件架构的主要收益）。
+//! ── 进程模型 ──────────────────────────────────────────────
+//! 原生插件按包启动；Magpie / OpenCode 脚本插件共享按需下载的 Bun 宿主。
+//! 同宿主共享运行时和连接池，单个宿主退出不影响网关与其它宿主。
 //!
 //! ── 崩溃恢复 ────────────────────────────────────────────────
 //! 子进程死了 → 所有在途调用立刻失败（不是挂起）→ 网关按「上游不可用」
@@ -30,6 +27,8 @@
 //!   - 写端只串行化帧写入，不持进程生命周期锁等待 IO；
 //!   - 已开始的帧独立写完，避免调用方取消破坏共享管道的 JSON 边界。
 
+pub(crate) mod account_egress;
+mod activity;
 mod bootstrap;
 mod callbacks;
 pub mod catalog;
@@ -37,6 +36,7 @@ mod compatibility;
 mod errors;
 mod gemini_signatures;
 mod install;
+mod leased_stream;
 mod lifecycle;
 mod logs;
 mod management;
@@ -49,10 +49,12 @@ mod pack_view;
 mod process;
 mod registry;
 mod rpc;
-mod rpc_cache;
+pub(crate) mod rpc_cache;
 pub mod schedules;
+pub mod script;
 pub mod settings;
 mod stream;
+mod switching;
 pub mod update;
 
 #[cfg(test)]
@@ -67,7 +69,7 @@ pub use install::{
     install_zip, list_packs, resolve_ui_file, set_pack_enabled, set_provider_enabled, uninstall,
     InstalledPack, PackProviderSummary, PackRegistry, PackSummary, PackUiSummary,
 };
-pub use registry::{install as install_provider, installed_ids, lookup, remove, clear};
+pub use registry::{install as install_provider, installed_ids, lookup, lookup_ready, remove, clear};
 pub use registry::{serves as serves_provider};
 pub use rpc::{HostOptions, RpcAdapter};
 pub(crate) use rpc_cache::meta as model_catalog_meta;
@@ -99,7 +101,7 @@ pub fn provider_label(id: &str) -> Option<String> {
             return Some(found.label.clone());
         }
     }
-    None
+    script::registered_label(id)
 }
 
 /// 插件目录的展示路径（界面显示「装到哪儿了」用）。
@@ -117,6 +119,7 @@ pub fn clear_providers() {
     rpc_cache::clear_all();
 }
 
+pub(crate) use leased_stream::hold_adapter;
 pub(crate) use stream::RpcStream;
 
 use std::collections::HashMap;
@@ -196,6 +199,14 @@ pub fn checkin_of(provider: &str) -> Option<proto::CheckinInfo> {
     provider_info(provider)?.checkin
 }
 
+/// 领取能力未归入新手福利或套餐时，作为独立的手动活动福利展示。
+pub fn has_campaign_rewards(provider: &str) -> bool {
+    provider_info(provider).is_some_and(|info| {
+        info.capabilities.claims
+            && info.checkin.is_some_and(|checkin| !checkin.onboarding && !checkin.plans)
+    })
+}
+
 /// 全部申报的签到能力（`provider id → 申报`）。
 ///
 /// 只收申报过的家 —— 旧插件不申报时不在表里，调用方走内置兜底
@@ -246,6 +257,7 @@ pub struct HostStatus {
 pub struct Host {
     /// 启动参数。
     options: HostOptions,
+    activity: Arc<activity::Activity>,
     /// 当前代进程的写端；退出状态由 ProcessRun 独立持有。
     inner: Mutex<Option<Inner>>,
     /// 状态转换与调用登记共用此锁；不得跨 await 持有。
@@ -258,7 +270,7 @@ pub struct Host {
     /// 这个表只在「读循环派发」与「发回调」两处短暂访问，临界区里没有
     /// await。用 tokio 的 Mutex 会让读循环多一次 await 点（而读循环的
     /// 原则是「不 await」）。
-    pending: StdMutex<HashMap<i64, oneshot::Sender<Result<serde_json::Value, proto::WireError>>>>,
+    pending: StdMutex<HashMap<i64, PendingCall>>,
     /// 下一个回调 id。
     next_id: AtomicI64,
     /// 在途的流式调用（`abort` 与额度归还都按它找）。
@@ -294,6 +306,11 @@ struct Inner {
     run: Arc<process::ProcessRun>,
 }
 
+struct PendingCall {
+    tx: oneshot::Sender<Result<serde_json::Value, proto::WireError>>,
+    _lease: Option<Arc<activity::UsageLease>>,
+}
+
 /// 一条在途流的状态。
 ///
 /// ── 为什么用无界通道而不是有界 ──────────────────────────────
@@ -304,6 +321,8 @@ struct Inner {
 struct StreamState {
     /// 把 head / chunk / 收尾事件投给消费者。
     tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    _lease: Arc<activity::UsageLease>,
+    closed: bool,
 }
 
 /// 读循环投给流消费者的事件。
@@ -343,6 +362,7 @@ impl Host {
     pub fn new(options: HostOptions, callbacks: Arc<dyn GatewayCallbacks>) -> Self {
         Self {
             options,
+            activity: Arc::new(activity::Activity::default()),
             inner: Mutex::new(None),
             lifecycle: StdMutex::new(()),
             generation: AtomicU64::new(0),
@@ -403,17 +423,17 @@ impl Host {
         let streamed = {
             let guard = self.streams.lock();
             match guard {
-                Ok(guard) => guard.get(&frame.id).map(|state| state.tx.clone()),
+                Ok(mut guard) => guard.remove(&frame.id),
                 Err(_) => None,
             }
         };
-        if let Some(tx) = streamed {
-            let _ = tx.send(StreamEvent::Done(outcome));
+        if let Some(stream) = streamed {
+            let _ = stream.tx.send(StreamEvent::Done(outcome));
             return;
         }
         let waiter = self.pending.lock().ok().and_then(|mut map| map.remove(&frame.id));
-        if let Some(tx) = waiter {
-            let _ = tx.send(outcome);
+        if let Some(call) = waiter {
+            let _ = call.tx.send(outcome);
         }
     }
 
@@ -456,7 +476,7 @@ impl Host {
             Ok(guard) => guard,
             Err(_) => return,
         };
-        if let Some(state) = guard.get(&frame.id) {
+        if let Some(state) = guard.get(&frame.id).filter(|state| !state.closed) {
             // 插件重复发 head 是协议违规，消费者侧按「只认第一条」处理
             let _ = state.tx.send(StreamEvent::Head(proto::StreamHead { status, headers, upstream }));
         }
@@ -478,7 +498,7 @@ impl Host {
             Ok(guard) => guard,
             Err(_) => return,
         };
-        if let Some(state) = guard.get(&frame.id) {
+        if let Some(state) = guard.get(&frame.id).filter(|state| !state.closed) {
             // 发送失败 = 消费者已经不在了（客户端断开）。不在这里 abort：
             // 消费者 drop 时 `RpcStream` 的 Drop 会发 abort，那条路统一。
             let _ = state.tx.send(StreamEvent::Chunk(bytes));
@@ -519,6 +539,13 @@ impl Host {
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, proto::WireError> {
+        let lease = if matches!(method, proto::methods::gateway::INIT | proto::methods::gateway::SHUTDOWN | proto::methods::gateway::ABORT) {
+            None
+        } else {
+            Some(self.activity.acquire().ok_or_else(|| proto::WireError::with_code(
+                "插件正在切换或已关闭", "plugin_updating",
+            ))?)
+        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let run = {
@@ -528,7 +555,7 @@ impl Host {
                 && (!run.is_expected_exit() || method == proto::methods::gateway::SHUTDOWN))
                 .ok_or_else(|| proto::WireError::with_code("插件进程不可用", proto::WireError::INTERNAL))?;
             self.pending.lock().map_err(|_| proto::WireError::with_code("回调表被污染", proto::WireError::INTERNAL))?
-                .insert(id, tx);
+                .insert(id, PendingCall { tx, _lease: lease });
             run
         };
         let frame = proto::Frame {
@@ -565,8 +592,9 @@ impl Host {
                 proto::WireError::INTERNAL,
             )),
             Err(_) => {
+                // 超时只结束网关等待；插件未回终态前保留租约，不把未知执行结果当空闲。
                 if let Ok(mut map) = self.pending.lock() {
-                    map.remove(&id);
+                    if map.get(&id).is_some_and(|call| call._lease.is_none()) { map.remove(&id); }
                 }
                 Err(proto::WireError::with_code(
                     format!("插件调用超时（{method}）"),
@@ -606,6 +634,7 @@ impl Host {
         method: &str,
         params: serde_json::Value,
     ) -> Result<StreamCall, String> {
+        let lease = self.activity.acquire().ok_or_else(|| "插件正在切换或已关闭".to_string())?;
         self.ensure().await?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -616,17 +645,28 @@ impl Host {
                 && !run.failed.load(Ordering::Acquire) && !run.is_expected_exit())
                 .ok_or_else(|| "插件进程不可用".to_string())?;
             self.streams.lock().map_err(|_| "流式表被污染".to_string())?
-                .insert(id, StreamState { tx: event_tx });
+                .insert(id, StreamState { tx: event_tx, _lease: lease, closed: false });
             run
         };
 
+        let (written, write_result) = oneshot::channel();
+        let mut opening = activity::OpeningStream {
+            host: self.clone(), id: Some(id), written: Some(write_result),
+        };
         let frame = proto::Frame {
             id,
             method: Some(method.to_string()),
             params: Some(params),
             ..Default::default()
         };
-        if let Err(e) = self.write_for_run(frame, run).await {
+        let host = self.clone();
+        let write = crate::spawn_task(async move {
+            let result = host.write_for_run(frame, run).await;
+            let _ = written.send(result.is_ok());
+            result
+        }).await.map_err(|error| std::io::Error::other(format!("插件写入任务中断：{error}")))
+            .and_then(|result| result);
+        if let Err(e) = write {
             if let Ok(mut guard) = self.streams.lock() {
                 guard.remove(&id);
             }
@@ -638,30 +678,28 @@ impl Host {
             }
             return Err(format!("写插件失败: {e}"));
         }
+        opening.id = None;
         Ok(StreamCall { id, events: event_rx })
     }
 
-    /// 收掉一条流式调用的登记（消费者结束时调）。
-    ///
-    /// 只清登记、不发 abort：正常收尾时插件已经在收尾了，多发一个 abort 会
-    /// 让「刚好在最后一帧之后到达」的取消被当成客户端断开。
-    ///
-    /// 不碰 `pending`：流式调用从不往那里登记（见 [`Self::settle`]）。
-    pub fn close_stream(&self, id: i64) {
+    /// 消费端结束不代表插件已完成；登记与租约由终态应答或进程退出释放。
+    pub fn close_stream(&self, id: i64) -> bool {
         if let Ok(mut guard) = self.streams.lock() {
-            guard.remove(&id);
+            if let Some(stream) = guard.get_mut(&id) {
+                stream.closed = true;
+                return true;
+            }
         }
+        false
     }
 
     /// 取消一条在途的流式调用。
     pub async fn abort(&self, id: i64) {
-        let frame = proto::Frame {
-            id: self.next_id.fetch_add(1, Ordering::Relaxed),
-            method: Some(proto::methods::gateway::ABORT.to_string()),
-            params: Some(serde_json::json!({ "id": id })),
-            ..Default::default()
-        };
-        let _ = self.write(frame).await;
+        let _ = self.call_coded(
+            proto::methods::gateway::ABORT,
+            serde_json::json!({ "id": id }),
+            Duration::from_secs(10),
+        ).await;
     }
 
     /// 归还背压额度。

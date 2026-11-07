@@ -39,12 +39,31 @@
 //!   AGENT2API_SELF_UPDATE       置 `1` 允许面板在容器内原地更新（Dockerfile 默认设好；
 //!                               换文件后进程退出、由容器 restart 策略拉起）
 //!   AGENT2API_VERBOSE           置 `1` 打开 debug 级日志（与桌面一致）
+//!   AGENT2API_IMAGE_CACHE_MB    生成图片的内存下载缓存上限（MiB，默认 128，
+//!                               范围 8~4096；非法/越界回落默认）。写坏只回落、
+//!                               不报错，与其它配置项同一口径
+//!   AGENT2API_IMAGE_COMPRESS_CACHE_MB  会话图片压缩结果的内存缓存上限
+//!                               （MiB，默认 128，范围 8~4096，口径同上）
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use agent2api_server::server::{config, logging, start, ServerState};
+
+// ── 全局内存分配器（仅 Linux）──────────────────────────────────
+// 长稳、多账号并发转发的部署形态（Docker 容器 / Linux 服务端）改用 jemalloc，
+// 抑制 glibc malloc 的碎片与 RSS 缓慢增长（Issue #420）。为什么只在 Linux、
+// 为什么是 jemalloc、为什么不做成 feature，见 server/Cargo.toml 对应条目的
+// 注释 —— 这里只放"生效"那一行。
+//
+// 位置要求：全局分配器在整个进程里只能有一个，所以它只出现在本 headless
+// 入口，不写进 `agent2api_server` 库 —— 桌面端链接的是那个库，库一旦也定义，
+// 两边就会撞成「duplicate global allocator」。放在这里，桌面端进程里没有任何
+// 定义，回落到 Rust 默认分配器，行为逐字不变。
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// 解析后的启动参数。前台与服务形态共用同一份，避免两边口径漂移。
 struct Launch {
@@ -62,6 +81,13 @@ struct Running {
 }
 
 fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("--systemd-updater") {
+        return ExitCode::from(agent2api_server::server::core::update::systemd::run_helper() as u8);
+    }
+    if std::env::args().nth(1).as_deref() == Some("--windows-updater") {
+        let id = std::env::args().nth(2).unwrap_or_default();
+        return ExitCode::from(agent2api_server::server::core::update::windows_service::run_helper(&id) as u8);
+    }
     // Windows 服务形态判定放在**参数解析之前**：服务进程没有控制台，
     // 配置写错（端口非法之类）时 eprintln 会全部丢掉，而「配置错导致起不来」
     // 恰恰是最需要看日志的情形。所以先把文件通道打开，再做任何可能报错的事。
@@ -174,6 +200,7 @@ fn start_gateway(launch: &Launch) -> Result<Running, String> {
     }));
 
     let shutdown_tx = start(&state).map_err(|conflict| format!("网关启动失败：{}", conflict.message))?;
+    agent2api_server::server::core::update::systemd::notify_ready();
 
     logging::log(
         "[Server]",
@@ -240,6 +267,7 @@ fn apply_security_gates() {
 
 /// 收尾：通知 HTTP 服务停机，给在途请求留出跑完的时间。
 fn finish(shutdown_tx: tokio::sync::oneshot::Sender<()>) {
+    agent2api_server::server::core::assistant_coding::client::request_shutdown();
     let _ = shutdown_tx.send(());
     // `start` 内部会等 graceful shutdown 收尾，这里只补一小段余量
     std::thread::sleep(std::time::Duration::from_millis(300));

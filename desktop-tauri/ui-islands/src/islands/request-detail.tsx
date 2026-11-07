@@ -1,6 +1,10 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { requestApiKeyLabel, requestClientLabel } from '../../../ui-shared/model-api-key'
+import { ClientIdentificationDetail } from '../../../ui-shared/client-identification-detail'
+import { VisionRequestDetail, visionDetail } from '../../../ui-shared/request-vision-detail'
+import type { ClientEvidence } from '../../../ui-shared/client-identification'
+import { clientIdentificationApi } from './settings-client-identification'
 import {
   Badge, BadgeDot, Button, Dialog, DialogBody, DialogContent, DialogFooter,
   DialogHeader, DialogTitle, SegmentedControl, StatusDot, Table, TableBody,
@@ -9,7 +13,7 @@ import {
 import { t } from '../i18n'
 import { HtmlContent } from '@ui'
 import {
-  PreviewPane, RawPane, RequestEmpty as Empty, hasDebugTraffic,
+  PreviewPane, RawPane, RequestDebugSwitch, RequestEmpty as Empty, hasDebugTraffic,
   type RawState, type DebugState, type DebugTraffic,
 } from './request-raw-panes'
 import { RouteReplayFacts } from './routing-replay'
@@ -132,6 +136,8 @@ type RequestRow = {
   /** 模型测试发起的请求（后端 `is_test` 透传到列表行；老行没有这个键） */
   isTest?: boolean
   client?: string
+  clientLabel?: string
+  clientEvidence?: ClientEvidence
   apiKeyId?: string
   apiKeyName?: string
   apiKeySource?: string
@@ -518,8 +524,9 @@ export function RequestDetailPane({ row }: { row: RequestRow | null }) {
         </Field>
         <Field label={t('重试次数')}>{String(Number(row.attempts) || 1)}</Field>
         <Field label='API Key'>{requestApiKeyLabel(row, t)}</Field>
-        <Field label={t('来源客户端')}>{requestClientLabel(row, t)}</Field>
+        <Field label={t('来源客户端')}><ClientIdentificationDetail entry={row} api={clientIdentificationApi} t={t} /></Field>
         <Field label={t('模型')}><ModelCell row={row} /></Field>
+        {visionDetail(row.route) ? <Field label={t('图片兼容')}><VisionRequestDetail route={row.route} t={t} /></Field> : null}
         <Field label={t('提供商')}>
           {providerName(row) || '—'}
           {account ? <span className='text-[11.5px] text-muted-foreground'>{t('（账号：{account}）', { account })}</span> : null}
@@ -631,8 +638,8 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
     } catch (error) {
       if (isStale()) return
       setDebug('gone')
-      // 调试模式没开是最常见的原因（后端 404 的文案已说明），底栏 hint 提一句
-      setHint(t('在设置 → 通用里开启「调试模式」后，新发生的请求才会保存报文'))
+      // 开关只影响之后的新请求，当前记录缺失的正文无法补录。
+      setHint(t('开启调试模式后仅记录新请求，历史对话无法补录；关闭不会删除已有记录。'))
       console.warn('读取调试报文失败（原始报文标签隐藏）:', errorMessage(error))
     }
   }
@@ -640,8 +647,8 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
   // 打开即并行拉两个数据源（旧实现的 open() 同样是打头就发两条）
   React.useEffect(() => {
     aliveRef.current = true
-    void loadRaw()
-    void loadDebug()
+    if (id) { void loadRaw(); void loadDebug() }
+    else { setRaw('gone'); setDebug('gone') }
     return () => { aliveRef.current = false }
     // 只在挂载时拉一次：本岛是「打开时建、关闭即卸」，id 不会中途变
   }, [])
@@ -718,8 +725,11 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
           <DialogTitle>{t('请求详情')}</DialogTitle>
         </DialogHeader>
         <DialogBody ref={bodyRef} className='gap-3'>
-          <SegmentedControl options={tabOptions} value={active} onValueChange={switchTab}
-            aria-label={t('详情内容')} className='self-start' />
+          <div className='flex flex-wrap items-center gap-2'>
+            <SegmentedControl options={tabOptions} value={active} onValueChange={switchTab}
+              aria-label={t('详情内容')} className='self-start' />
+            <RequestDebugSwitch />
+          </div>
           {/* 四个 pane 常驻（用 hidden 切显示，不卸载）：切换标签时 pane 的 DOM 与展开态
               原样保留，滚动位置由上面的 layout effect 还原。pane 不标 role="tabpanel" ——
               分段控件是 radiogroup 语义（不是 tablist），孤立的 tabpanel 是残缺结构 */}
@@ -782,7 +792,7 @@ function closeDetail() {
  */
 function openDetail(id: unknown, row?: unknown) {
   const key = String(id ?? '').trim()
-  if (!key) return
+  if (!key && !isPlainObject(row)) return
   unmountDetail() // 重复打开先拆掉上一份（旧实现同样是 close() 打头）
   const token = ++seq
   host = document.createElement('div')

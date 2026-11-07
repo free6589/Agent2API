@@ -86,6 +86,14 @@ pub struct RequestEntry {
     pub total_tokens: i64,
     #[serde(rename = "cacheReadTokens", default)]
     pub cache_read_tokens: i64,
+    /// 上游按请求上报的**积分消耗**（例如 WorkBuddy 的 `usage.credit`）。
+    ///
+    /// 与 token 四列的差别：这是**计费读数**而不是整数计数，可以为小数
+    /// （实测 WorkBuddy 在 0.03～0.31 之间），所以存储成可空的 REAL。
+    /// `None` = 这一家没上报（旧行、不提供该读数的提供商，或失败的请求），
+    /// 与「上报了 0」是两件事 —— 前端对前者显示「—」，对后者显示「0」。
+    #[serde(rename = "credit", default)]
+    pub credit: Option<f64>,
     /// 实际承载本次请求的 provider id（架构文档 §3.6）。
     ///
     /// ── 为什么是 `String` + 空串而不是 `Option<String>` ─────────
@@ -244,18 +252,7 @@ pub struct RequestEntry {
     /// `row.get(n)` 的序号。
     #[serde(rename = "isTest", default)]
     pub is_test: bool,
-    /// **请求来源客户端**（由入口从下游 `User-Agent` 识别的类型，schema v12
-    /// 加的列；旧行 `default` 读成空串 = 没有记录）。
-    ///
-    /// 取值是 `core::client::classify` 的输出：`Codex` / `ZCode` /
-    /// `Claude Code` / `deepseek-harness` / `GitHub Copilot` / `CherryStudio` /
-    /// `other`，无 UA 时为空串。存的是**归类结果**而不是原始 UA：UA 带版本号，
-    /// 逐条存会把明细撑大且没法直接读；「是哪家客户端」这一维只需要归类。
-    ///
-    /// 取值本身就是展示值（产品名不翻译），前端只把 `other` 显示成「其它」、
-    /// 空串显示成占位符。请求日志的「客户端」列读它。
-    ///
-    /// 与 `phase` 同一位置纪律：新加的列排在结构体末尾。
+    /// 请求发生时的统计分类与识别依据；旧行没有依据，不重新猜测来源。
     #[serde(flatten)]
     pub source: RequestSource,
 }
@@ -296,6 +293,10 @@ pub struct AttemptDetail {
     pub account: String,
     #[serde(rename = "accountId", default)]
     pub account_id: String,
+    #[serde(rename = "candidateId", default)]
+    pub candidate_id: String,
+    #[serde(rename = "memberId", default)]
+    pub member_id: String,
     #[serde(default)]
     pub model: String,
     #[serde(default)]
@@ -387,6 +388,7 @@ impl RequestEntry {
         copy.completion_tokens = 0;
         copy.total_tokens = 0;
         copy.cache_read_tokens = 0;
+        copy.credit = None;
         copy
     }
 }
@@ -415,6 +417,9 @@ pub struct NewRequestEntry {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    /// 上游按请求上报的积分消耗（可空：`None` = 没上报，不是 0；见
+    /// `RequestEntry::credit`）
+    pub credit: Option<f64>,
     /// 实际承载本次请求的 provider id（Agent2API 改造 W2b-T3 新增填入，
     /// W4 接上持久化：见 `normalize` 末尾的透传）。
     ///
@@ -463,6 +468,7 @@ impl NewRequestEntry {
             completion_tokens: 0,
             total_tokens: 0,
             cache_read_tokens: 0,
+            credit: None,
             provider: None,
             client_model: String::new(),
             upstream_model: String::new(),
@@ -489,10 +495,7 @@ impl NewRequestEntry {
     ///
     /// 时间补全与数值夹取都集中在这里，于是 `record` 只处理「已合法」的数据。
     ///
-    /// **失败请求的 token 一律清零**（契约要求）：上游返回错误时 usage 通常是
-    /// 缺失的；万一某条错误响应带了半截 usage，清掉比记成「失败的请求也消耗了
-    /// token」更符合报表语义 —— 那些 token 不会被计费，留在趋势图里会让
-    /// 「失败暴增」看起来像「用量暴增」。
+    /// 普通失败沿用清零口径；辅助识图保留已报告的消耗，因为识读不完整不代表上游未计费。
     pub(super) fn normalize(self) -> RequestEntry {
         let ts = self.ts.unwrap_or_else(super::clock::now_ms);
         // 「失败」= 非 2xx **或**带了错误摘要（与 `RequestEntry::is_success` 同一
@@ -500,7 +503,19 @@ impl NewRequestEntry {
         // 错误帧只能靠 `error` 表达。空串摘要按没有错误算（下面 filter 同口径）。
         let failed = !(200..300).contains(&self.status)
             || self.error.as_deref().is_some_and(|text| !text.is_empty());
-        let token = |value: i64| if failed { 0 } else { value.max(0) };
+        // 辅助识图即使被截断或拒答也可能已计费，只保留其实际报告的读数。
+        let measured_vision = self.route.pointer("/visionCompatibility/mode").and_then(Value::as_str) == Some("assist_call");
+        let discard_usage = failed && !measured_vision;
+        let token = |value: i64| if discard_usage { 0 } else { value.max(0) };
+        // 积分与 token 同一「失败清零」口径：失败的请求在日志里不展示用量
+        // （`usageCell` 对失败行给「-」），留着半截积分读数会让这一列与
+        // 「失败请求不记录用量」的既有说明自相矛盾。非有限值 / 负数只可能
+        // 来自手改的库或上游溢出，按「没上报」处理而不是记成 0。
+        let credit = if discard_usage {
+            None
+        } else {
+            self.credit.filter(|value| value.is_finite() && *value >= 0.0)
+        };
         // provider 从入参透传到记账条目（W2b 留的丢弃点在此接上）。
         // `None`（转发链没走到选路就失败）与空串（上游返回了空 id）都归一成
         // **空串**：两者在报表语义上都是「未知承载者」，多一种表示只会让
@@ -529,6 +544,7 @@ impl NewRequestEntry {
             completion_tokens: token(self.completion_tokens),
             total_tokens: token(self.total_tokens),
             cache_read_tokens: token(self.cache_read_tokens),
+            credit,
             provider,
             // 双名透传（trim 的理由与 provider 相同：空白不该造出一个
             // 「看起来不同的名字」）；空串语义 = 没有点名 / 没有发出去
@@ -557,6 +573,8 @@ impl NewRequestEntry {
                     // 「看起来不同的名字」）；空串语义 = 该轮没有账号记录
                     account: item.account.trim().to_string(),
                     account_id: item.account_id.trim().to_string(),
+                    candidate_id: item.candidate_id,
+                    member_id: item.member_id,
                     model: item.model.trim().to_string(),
                     reasoning: item.reasoning.trim().to_string(),
                     reason: item.reason,
@@ -602,9 +620,7 @@ impl NewRequestEntry {
             // 来源标记原样透传（不做任何推导）：它是调用方（入口 handler）
             // 才知道的事实，存储层只负责把它带进库里
             is_test: self.is_test,
-            // 客户端同理原样透传（trim 的理由与 provider 相同）：入口已经过
-            // `core::client::classify`，存储层不再重新归类 —— 存储层不认识
-            // UA 规则，两处各判一遍迟早会漂
+            // 分类在入口定稿，收尾时不因设置变动重新归类。
             source: self.source.normalized(),
         }
     }

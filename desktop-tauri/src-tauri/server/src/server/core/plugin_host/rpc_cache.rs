@@ -34,8 +34,13 @@ fn scope(provider: &str) -> String {
     format!("plugin:{provider}")
 }
 
+fn accepts_empty(provider: &str) -> bool {
+    crate::server::core::providers::is_scoped_runtime_provider(provider)
+        || super::script::known_provider(provider)
+}
+
 fn from_cached(provider: &str, cached: catalog_cache::CachedCatalog) -> Option<proto::ModelList> {
-    if crate::server::core::providers::is_scoped_runtime_provider(provider) && cached.models.len() == 1 {
+    if accepts_empty(provider) && cached.models.len() == 1 {
         let envelope = &cached.models[0];
         if envelope.get("id").and_then(Value::as_str) == Some(ENVELOPE_ID) {
             if envelope.get("version").and_then(Value::as_u64) != Some(ENVELOPE_VERSION)
@@ -76,9 +81,10 @@ fn valid_models(models: Vec<Value>, scoped: bool) -> Vec<Value> {
 }
 
 pub fn set_defaults(provider: &str, models: Vec<Value>) -> Option<(usize, i64)> {
-    let _write = crate::server::core::providers::is_scoped_runtime_provider(provider)
+    let _write = accepts_empty(provider)
         .then(|| write_gate().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     let restored = restore(provider);
+    crate::server::core::providers::catalog::invalidate();
     let mut map = table().lock().ok()?;
     let entry = map.entry(provider.to_string()).or_default();
     let recovered = if entry.remote.is_none() {
@@ -89,11 +95,12 @@ pub fn set_defaults(provider: &str, models: Vec<Value>) -> Option<(usize, i64)> 
         None
     };
     entry.fallback = valid_models(models, crate::server::core::providers::is_scoped_runtime_provider(provider));
+    crate::server::core::providers::catalog::invalidate();
     recovered
 }
 
 pub fn set_remote(provider: &str, mut list: proto::ModelList) -> usize {
-    let scoped = crate::server::core::providers::is_scoped_runtime_provider(provider);
+    let scoped = accepts_empty(provider);
     let _write = scoped.then(|| write_gate().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     if scoped && !list.meta.remote {
         return 0; // 静态或失败目录不能在持久层被重新标成远程成功。
@@ -113,11 +120,15 @@ pub fn set_remote(provider: &str, mut list: proto::ModelList) -> usize {
     if !scoped {
         catalog_cache::save(&scope(provider), &saved, list.meta.refreshed_at);
         let Ok(mut map) = table().lock() else { return 0 };
+        crate::server::core::providers::catalog::invalidate();
         map.entry(provider.to_string()).or_default().remote = Some(list);
+        crate::server::core::providers::catalog::invalidate();
         return count;
     }
     let mut map = table().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::server::core::providers::catalog::invalidate();
     map.entry(provider.to_string()).or_default().remote = Some(list.clone());
+    crate::server::core::providers::catalog::invalidate();
     // table 与 DB 不重叠持锁；scoped gate 仍保持跨请求的持久化写入顺序。
     drop(map);
     catalog_cache::save(&scope(provider), &saved, list.meta.refreshed_at);
@@ -145,14 +156,67 @@ pub fn meta(provider: &str) -> proto::CatalogMeta {
         .map(|list| list.meta.clone()).unwrap_or_default()
 }
 
+fn rename_list(models: &mut Vec<Value>, mapping: &HashMap<String, String>) -> usize {
+    let mut changed = 0;
+    for model in models.iter_mut() {
+        let Some(id) = model.get("id").and_then(Value::as_str) else { continue };
+        let Some(base) = mapping.get(&id.trim().to_ascii_lowercase()).cloned() else { continue };
+        if !id.eq_ignore_ascii_case(&base) {
+            model["id"] = Value::String(base);
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        let mut seen = HashSet::new();
+        models.retain(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| seen.insert(id.to_ascii_lowercase()))
+                .unwrap_or(true)
+        });
+    }
+    changed
+}
+
+/// 就地把插件缓存里的历史模型 ID 改成原始 ID（启动期后缀迁移用）。
+/// 只改内存中的清单并持久化；真正的路由表由插件下一次刷新重建。
+pub fn rename_models(provider: &str, mapping: &HashMap<String, String>) -> usize {
+    if mapping.is_empty() {
+        return 0;
+    }
+    let (changed, list) = {
+        let Ok(mut map) = table().lock() else { return 0 };
+        let Some(entry) = map.get_mut(provider) else { return 0 };
+        let mut changed = 0;
+        if let Some(remote) = entry.remote.as_mut() {
+            changed += rename_list(&mut remote.models, mapping);
+        }
+        changed += rename_list(&mut entry.fallback, mapping);
+        (changed, entry.remote.clone())
+    };
+    if changed > 0 {
+        crate::server::core::providers::catalog::invalidate();
+        if let Some(list) = list {
+            set_remote(provider, list);
+        }
+        crate::server::core::providers::catalog::invalidate();
+    }
+    changed
+}
+
 pub fn forget(provider: &str) {
     if let Ok(mut map) = table().lock() {
+        crate::server::core::providers::catalog::invalidate();
         map.remove(provider);
+        crate::server::core::providers::catalog::invalidate();
     }
 }
 
 pub fn clear_all() {
     if let Ok(mut map) = table().lock() {
+        crate::server::core::providers::catalog::invalidate();
         map.clear();
+        crate::server::core::providers::catalog::invalidate();
     }
 }
