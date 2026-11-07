@@ -22,7 +22,7 @@ Agent2API는 **AI 라우팅 게이트웨이와 Agent 클라이언트 설정 관�
 
 ## ✨ 핵심 기능
 
-- 🔌 **통합 모델 API** — OpenAI Chat / Responses / Images, Anthropic Messages 및 통합 모델 목록. Raccoon, Loomy, Antigravity, ModelScope가 이미지 생성을 제공하며 Loomy, Antigravity, ModelScope는 참조 이미지 편집도 지원. 생성과 편집은 AI 어시스턴트 도구로도 사용 가능
+- 🔌 **통합 모델 API** — OpenAI Chat / Responses / Images, Anthropic Messages 및 통합 모델 목록. Raccoon, Loomy, Antigravity, ModelScope, WorkBuddy, Doubao Work가 이미지 생성을 제공하며 Raccoon, Loomy, Antigravity, ModelScope, WorkBuddy는 참조 이미지 편집도 지원. 생성과 편집은 AI 어시스턴트 도구로도 사용 가능
 - 🧭 **AI 라우팅** — 모델 매핑, 계정 우선순위, 부하 분산, 세션 고정 및 장애 전환
 - 🤖 **Agent 클라이언트 설정 관리** — 여러 연결 프로필, 기존 설정 가져오기, 쓰기 미리보기 및 서비스 전환
 - 🧩 **플러그인 확장** — 추가 공급자 구현은 본체에 포함되지 않고 별도 설치·업데이트. 사용자 지정 공급자에는 플러그인 불필요
@@ -82,6 +82,8 @@ cd C:\agent2api-pkg; .\install-service.ps1
 ```bash
 docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/data aimodcc/agent2api:latest
 ```
+
+> Arch / Omarchy: `scripts/`에 로컬 소스 빌드용 강화 배포 세트(기본적으로 루프백만 바인딩)가 들어 있습니다. 자세한 내용: [설치와 배포 → Docker](install.ko.md#docker).
 
 어느 형태든 설치 후 패널(`http://127.0.0.1:3065/`. 서버와 Docker 는 호스트 IP 로 바꿔서)을 열어 관리자 계정을 등록하고, "게이트웨이 키" 페이지에서 키를 만드세요. 연결 확인: `curl http://127.0.0.1:3065/health`
 

@@ -34,6 +34,11 @@ type SegmentedControlOption<Value extends string> = {
    * 传 0 时整项按「空段」弱化，与账号页筛选的既有约定一致。
    */
   count?: number
+  /**
+   * 悬停提示（原生 title）。分段里没有第二行位置，说明性文字只能挂这儿 ——
+   * 比如账号设置里「轮询（换 IP）」为什么存在（免费档按 IP 限流，单 IP 用完一律 429）。
+   */
+  title?: string
   disabled?: boolean
 }
 
@@ -66,7 +71,7 @@ function SegmentedControl<Value extends string>({
       ref={containerRef}
       data-slot='segmented-control'
       className={cn(
-        'relative inline-flex gap-0.5 rounded-md border border-control-border bg-control p-0.5',
+        'relative inline-flex gap-0.5 rounded-md border border-hairline bg-control p-0.5 shadow-none',
         className
       )}
       value={value}
@@ -81,15 +86,16 @@ function SegmentedControl<Value extends string>({
           key={option.value}
           value={option.value}
           data-slot='segmented-item'
+          title={option.title}
           disabled={option.disabled}
           data-zero={option.count === 0 ? 'true' : undefined}
           className={cn(
             'group/seg relative z-[1] inline-flex h-6 items-center gap-[5px] rounded-sm border-0 bg-transparent px-2.5',
-            'text-xs font-medium whitespace-nowrap text-subtle select-none',
+            'text-xs font-normal whitespace-nowrap text-subtle select-none',
             'transition-[background-color,color] duration-150 ease-out',
-            'hover:bg-nav-hover hover:text-foreground',
+            'hover:bg-nav-hover hover:text-foreground focus-visible:outline-none focus-visible:shadow-focus',
             // 选中项让出底色（底色归滑块画），只留文字色
-            'data-checked:bg-transparent data-checked:text-primary-fg data-checked:hover:bg-transparent',
+            'data-checked:bg-transparent data-checked:text-foreground data-checked:hover:bg-transparent',
             'data-disabled:cursor-not-allowed data-disabled:opacity-40',
             // 计数为 0 的分段弱化；当前选中的那一档即使为 0 也保持正常
             'data-[zero=true]:data-unchecked:opacity-45'
@@ -100,7 +106,7 @@ function SegmentedControl<Value extends string>({
             <span
               className={cn(
                 'min-w-4 rounded-pill bg-surface-3 px-[5px] text-center text-[10.5px] font-semibold tabular-nums text-muted-foreground',
-                'group-data-checked/seg:bg-primary-tint group-data-checked/seg:text-primary-fg'
+                'group-data-checked/seg:bg-surface-2 group-data-checked/seg:text-foreground'
               )}
             >
               {option.count}

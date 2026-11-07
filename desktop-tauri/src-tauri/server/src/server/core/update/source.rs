@@ -1,16 +1,10 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use crate::server::config::{self, GithubAccessMode};
 use crate::server::core::task_state;
 use crate::server::logging;
 
-use super::token;
-
-const PREFERENCE_MS: i64 = 10 * 60_000;
+use super::{source_state, token};
 
 #[derive(Clone, Copy)]
 pub enum GithubSettings {
@@ -19,10 +13,6 @@ pub enum GithubSettings {
 }
 
 impl GithubSettings {
-    pub fn rate_limit_message(self, retry_at: i64) -> String {
-        self.message_for_token(retry_at, token::effective_token().is_some())
-    }
-
     fn message_for_token(self, retry_at: i64, filled: bool) -> String {
         if !filled {
             return match self {
@@ -43,18 +33,10 @@ impl GithubSettings {
         if !is_rate_limit_error(message) {
             return message.to_string();
         }
-        let filled = token::effective_token().is_some();
-        if filled && retry_at == 0 {
-            if let Some(seconds) = message
-                .split_once("请在 ")
-                .and_then(|(_, tail)| tail.split_once(" 秒后重试"))
-                .and_then(|(seconds, _)| seconds.parse::<i64>().ok())
-                .filter(|seconds| *seconds > 0)
-            {
-                return format!("GitHub 接口限流中，请在 {seconds} 秒后重试");
-            }
+        if retry_at <= logging::now_ms() {
+            return "上次 GitHub 限流的等待时间已结束，可重新检查".to_string();
         }
-        self.message_for_token(retry_at, filled)
+        self.message_for_token(retry_at, token::effective_token().is_some())
     }
 
     pub fn waiting_message(self, state: &task_state::TaskState) -> String {
@@ -67,9 +49,11 @@ impl GithubSettings {
     }
 }
 
-fn is_rate_limit_error(message: &str) -> bool {
+pub fn is_rate_limit_error(message: &str) -> bool {
     [
         "GitHub 接口限流中",
+        "GitHub 源「",
+        "上次 GitHub 限流",
         "GitHub 接口处于限流冷却期",
         "GitHub 接口访问受限",
         "查询插件更新失败：GitHub 返回 HTTP 403",
@@ -90,24 +74,21 @@ pub struct Candidate {
     pub url: String,
     pub original: String,
     pub source: Source,
-    key: String,
+    pub(super) id: String,
+    pub(super) key: String,
+    pub(super) context: String,
+    pub(super) proxy: Option<serde_json::Value>,
+    pub(super) egress: String,
+    pub(super) mode: GithubAccessMode,
     mirror_origin: Option<url::Url>,
 }
 
-struct Preference {
-    source: Source,
-    until: i64,
-}
-
-fn preferences() -> &'static Mutex<HashMap<String, Preference>> {
-    static MEMORY: OnceLock<Mutex<HashMap<String, Preference>>> = OnceLock::new();
-    MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 pub fn clear_preferences() {
-    if let Ok(mut memory) = preferences().lock() {
-        memory.clear();
-    }
+    source_state::clear();
+}
+
+pub fn status() -> serde_json::Value {
+    json!(source_state::snapshot())
 }
 
 pub fn is_official_api(value: &str) -> bool {
@@ -139,57 +120,90 @@ pub fn is_resource(value: &str) -> bool {
     }
 }
 
-fn preference_key(value: &str) -> String {
-    let settings = config::github_access();
-    let host = url::Url::parse(value)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_default();
-    let proxy = config::update_proxy();
-    let identity = serde_json::to_vec(&(host, settings, proxy)).unwrap_or_default();
-    format!("{:x}", Sha256::digest(identity))
+pub fn candidates(value: &str, allow_mirror: bool) -> Vec<Candidate> {
+    let mut candidates = configured_candidates(value, allow_mirror);
+    if candidates[0].mode == GithubAccessMode::Auto {
+        source_state::sort(&mut candidates);
+    }
+    candidates
 }
 
-pub fn candidates(value: &str, allow_mirror: bool) -> Vec<Candidate> {
+pub(super) fn configured_candidates(value: &str, allow_mirror: bool) -> Vec<Candidate> {
     let settings = config::github_access();
-    let key = preference_key(value);
+    let context = source_state::context_key_for(&settings);
+    let key = source_state::request_key(value, &context);
+    let proxy = config::update_proxy();
+    let egress = super::rate_limit::egress_key();
     let official = Candidate {
         url: value.to_string(),
         original: value.to_string(),
         source: Source::Official,
+        id: "official".to_string(),
         key: key.clone(),
+        context: context.clone(),
+        proxy: proxy.clone(),
+        egress: egress.clone(),
+        mode: settings.mode,
         mirror_origin: None,
     };
     if !allow_mirror || settings.mode == GithubAccessMode::Official || !is_resource(value) {
         return vec![official];
     }
-    let mirror = Candidate {
-        url: format!("{}{value}", settings.mirror_url),
-        original: value.to_string(),
-        source: Source::Mirror,
-        key: key.clone(),
-        mirror_origin: url::Url::parse(&settings.mirror_url).ok(),
-    };
-    let remembered = preferences().lock().ok().and_then(|memory| {
-        memory
-            .get(&key)
-            .filter(|item| item.until > logging::now_ms())
-            .map(|item| item.source)
-    });
-    let mirror_first = settings.mode == GithubAccessMode::Accelerated
-        || (settings.mode == GithubAccessMode::Auto && remembered == Some(Source::Mirror));
-    if mirror_first {
-        vec![mirror, official]
-    } else {
-        vec![official, mirror]
+    let mut candidates = vec![official];
+    for mirror in &settings.mirrors {
+        if !mirror.enabled || (is_official_api(value) && !mirror.supports_api) {
+            continue;
+        }
+        candidates.push(Candidate {
+            url: format!("{}{value}", mirror.url),
+            original: value.to_string(),
+            source: Source::Mirror,
+            id: mirror.url.clone(),
+            key: key.clone(),
+            context: context.clone(),
+            proxy: proxy.clone(),
+            egress: egress.clone(),
+            mode: settings.mode,
+            mirror_origin: url::Url::parse(&mirror.url).ok(),
+        });
     }
+    if settings.mode == GithubAccessMode::Accelerated {
+        candidates.sort_by_key(|candidate| {
+            if candidate.id == settings.mirror_url { 0 }
+            else if candidate.source == Source::Mirror { 1 }
+            else { 2 }
+        });
+    }
+    candidates
+}
+
+pub fn ensure_available(candidates: &[Candidate], headers: &[(String, String)]) -> Result<(), super::UpdateError> {
+    let mut limits = Vec::new();
+    let states = task_state::read_all().unwrap_or_default();
+    for candidate in candidates {
+        match candidate.stored_limit(headers, &states).filter(|limit| limit.retry_at > logging::now_ms()) {
+            Some(limit) => limits.push(limit),
+            None => return Ok(()),
+        }
+    }
+    Err(if limits.is_empty() { super::UpdateError::new("没有可用的 GitHub 源") }
+        else { super::UpdateError::rate_limited(limits) })
+}
+
+pub async fn download_candidates(
+    value: &str,
+    allow_mirror: bool,
+    headers: &[(String, String)],
+) -> Result<Vec<Candidate>, super::UpdateError> {
+    super::probe::rank(value, allow_mirror, headers).await
 }
 
 impl Candidate {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> String {
         match self.source {
-            Source::Official => "官方源",
-            Source::Mirror => "加速源",
+            Source::Official => "官方源".to_string(),
+            Source::Mirror => self.mirror_origin.as_ref()
+                .and_then(|url| url.host_str()).unwrap_or("加速源").to_string(),
         }
     }
 
@@ -226,115 +240,27 @@ impl Candidate {
     }
 
     pub fn remember(&self) {
-        if self.source == Source::Official {
-            return;
-        }
-        let now = logging::now_ms();
-        if let Ok(mut memory) = preferences().lock() {
-            memory.retain(|_, item| item.until > now);
-            if memory
-                .get(&self.key)
-                .is_some_and(|item| item.source == self.source)
-            {
-                return;
-            }
-            memory.insert(
-                self.key.clone(),
-                Preference {
-                    source: self.source,
-                    until: now + PREFERENCE_MS,
-                },
-            );
-        }
+        source_state::record(self, "ok", None, true);
     }
 
     pub fn forget(&self) {
-        if let Ok(mut memory) = preferences().lock() {
-            if memory
-                .get(&self.key)
-                .is_some_and(|item| item.source == self.source)
-            {
-                memory.remove(&self.key);
-            }
-        }
+        source_state::record(self, "failed", None, false);
     }
 
-    fn rate_key(&self, headers: &[(String, String)]) -> Option<String> {
-        if !is_official_api(&self.original) {
-            return None;
-        }
-        let auth = if self.source == Source::Official {
-            headers
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case("authorization"))
-                .map(|(_, value)| value.as_str())
-                .unwrap_or("")
-        } else {
-            ""
-        };
-        let proxy = config::update_proxy();
-        let origin = if self.source == Source::Mirror {
-            self.mirror_origin
-                .as_ref()
-                .map(|url| url.as_str())
-                .unwrap_or("")
-        } else {
-            "https://api.github.com"
-        };
-        let bytes = serde_json::to_vec(&(origin, proxy, auth)).unwrap_or_default();
-        Some(format!("githubRate:{:x}", Sha256::digest(bytes)))
+    pub(crate) fn observe(&self, state: &str, elapsed_ms: u64, selected: bool) {
+        source_state::record(self, state, Some(elapsed_ms), selected);
     }
 
-    pub fn cooling_message(&self, headers: &[(String, String)]) -> Option<String> {
-        let state = task_state::read(&self.rate_key(headers)?).ok()?;
-        let until = state.value.as_ref()?.get("retryAt")?.as_i64()?;
-        (until > logging::now_ms()).then(|| GithubSettings::Update.rate_limit_message(until))
-    }
-
-    pub fn record_rate_limit(&self, headers: &[(String, String)], response: &reqwest::Response) {
-        let Some(key) = self.rate_key(headers) else {
-            return;
-        };
-        let until = retry_deadline(response.headers(), response.status().as_u16());
-        if until > logging::now_ms() {
-            if let Err(error) = task_state::store_value(&key, json!({ "retryAt": until })) {
-                logging::verbose("[Update]", &error);
-            }
-        }
-    }
-}
-
-pub fn retry_deadline(headers: &reqwest::header::HeaderMap, status: u16) -> i64 {
-    let now = logging::now_ms();
-    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
-    let after = header("retry-after")
-        .and_then(|value| {
-            value
-                .parse::<i64>()
-                .ok()
-                .map(|seconds| now.saturating_add(seconds.max(0).saturating_mul(1000)))
-                .or_else(|| {
-                    chrono::DateTime::parse_from_rfc2822(value)
-                        .ok()
-                        .map(|date| date.timestamp_millis())
-                })
-        })
-        .unwrap_or(0);
-    let reset = if header("x-ratelimit-remaining") == Some("0") {
-        header("x-ratelimit-reset")
-            .and_then(|value| value.parse::<i64>().ok())
-            .map(|seconds| seconds.saturating_mul(1000).saturating_add(1000))
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    after.max(reset).max(if status == 403 || status == 429 {
-        now + 60_000
-    } else {
-        0
-    })
 }
 
 pub fn should_switch(candidate: &Candidate, status: reqwest::StatusCode) -> bool {
-    status.is_server_error() || (candidate.source == Source::Mirror && status.as_u16() == 404)
+    status.is_server_error()
+        || (candidate.source == Source::Mirror && matches!(status.as_u16(), 400 | 404 | 405 | 416))
+}
+
+pub(crate) fn failed_state(message: &str) -> &'static str {
+    if message.contains("限流") { "rateLimited" }
+    else if message.contains("超时") { "timeout" }
+    else if message.contains("格式") || message.contains("JSON") || message.contains("内容") { "invalid" }
+    else { "failed" }
 }

@@ -90,6 +90,9 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         // 路由不到的模型名去调（改造前这里只读 workbuddy 单家，另三家在界面上不可见）。
         // 每条另带 provider / providerLabel，供网关页按家分组。
         "models": crate::server::core::providers::catalog::session_models(state.store()),
+        // 启动期的历史统计整理是否还在后台跑（模型维度回填 / 来源维度回填 /
+        // 保留期裁剪）。界面可据此显示一条轻提示；它不影响账号与转发。
+        "maintenance": { "running": state.startup_maintenance_running() },
         // 指纹脱敏开关（与 GET /api/sanitize 同一个键、同一个值）
         config::KEY_SANITIZE_FINGERPRINTS: snapshot.sanitize_fingerprints(),
         // 插件申报的**账号行渲染参数**（`{provider: AccountFeatures}`）。
@@ -148,6 +151,16 @@ struct LoginMethodMetadata {
     manual_callback: bool,
     #[serde(default)]
     callback_input: LoginCallbackInput,
+    /// 插件要求这条 OAuth 流程只在应用内嵌窗口打开（不提供系统浏览器选项）。
+    ///
+    /// 用于登录页跑在本机回环地址上的插件（AStudio）：交给系统浏览器只会让
+    /// 用户多做一个没有意义的选择。只对 oauth 方式有效。
+    #[serde(default)]
+    embedded_only: bool,
+    #[serde(default)]
+    desktop_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    browser_mode: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
@@ -252,6 +265,11 @@ async fn read_login_methods(
         if method.method_index > 9_007_199_254_740_991 || !indices.insert(method.method_index) {
             return Err(GatewayError::with_status(502, "插件登录方式索引无效或重复"));
         }
+        if method.desktop_only && (!method.embedded_only || !matches!(method.kind, LoginMethodType::Oauth))
+            || method.browser_mode.as_deref().is_some_and(|mode| !matches!(mode, "choice" | "external" | "plugin" | "none"))
+        {
+            return Err(GatewayError::with_status(502, "插件登录窗口契约无效"));
+        }
         if matches!(method.callback_input, LoginCallbackInput::Code) && !method.manual_callback {
             return Err(GatewayError::with_status(502, "code 回调输入只能用于手动登录回调"));
         }
@@ -289,6 +307,9 @@ async fn read_login_methods(
         }
         if method.local_only && matches!(method.kind, LoginMethodType::Api) {
             return Err(GatewayError::with_status(502, "本机登录不能进入复制 API 凭证路线"));
+        }
+        if method.embedded_only && matches!(method.kind, LoginMethodType::Api) {
+            return Err(GatewayError::with_status(502, "API 凭证方式不能要求内嵌窗口"));
         }
     }
     metadata.instructions = metadata.instructions.map(|text| login_text(&text));
@@ -465,7 +486,14 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
             Ok(proxy) => proxy,
             Err(error) => return management_error(error.status_code, error.message),
         };
-        let mut options = json!({ "methodIndex": index, "inputs": inputs });
+        let mode = request.get("mode").and_then(Value::as_str).unwrap_or("external");
+        if !matches!(mode, "external" | "embedded" | "auto") {
+            return management_error(400, "登录打开方式无效");
+        }
+        if method.desktop_only && mode != "embedded" {
+            return management_error(400, "此登录方式需要桌面应用的内嵌窗口；浏览器或手机端请使用其他登录方式");
+        }
+        let mut options = json!({ "methodIndex": index, "inputs": inputs, "mode": mode });
         if let Some(selection) = &proxy {
             options["proxy"] = selection.resolved.clone();
         }
@@ -662,6 +690,7 @@ async fn start_plugin_web_login(
     let mut response = login_start_response(&start, &provider, edition, manual_callback, callback_input);
     if let Some(index) = method_index { response["methodIndex"] = json!(index); }
     if method_index.is_some() { response["localOnly"] = json!(local_only); }
+    crate::server::core::plugin_host::script::decorate_login(&provider, &start.flow, &mut response);
     // 所有返回字段均来自已校验的元数据与 LoginStart，不把 options / inputs 回显。
     ok_json(response)
 }
@@ -687,10 +716,6 @@ pub(crate) fn spawn_plugin_login_poll(
     provider: String,
 ) {
     crate::spawn_task(async move {
-        let Some(adapter) = handle.adapter() else {
-            crate::server::core::login::fail_plugin_login(&handle, "登录任务未绑定执行体，请重新发起");
-            return;
-        };
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_millis(crate::server::core::login::LOGIN_TIMEOUT_MS);
         let interval = Duration::from_millis(interval_ms.clamp(1_000, LOGIN_TIMEOUT_MS));
@@ -709,6 +734,10 @@ pub(crate) fn spawn_plugin_login_poll(
                 handle.cancel_provider_flow_locked(&flow).await;
                 return;
             }
+            let Some(adapter) = handle.adapter() else {
+                crate::server::core::login::fail_plugin_login(&handle, "登录任务未绑定执行体，请重新发起");
+                return;
+            };
             let poll = adapter.login_poll_async(&flow).await;
             // 请求在 await 中被取消或由回调落定：迟到的 Done 不得再落库。
             let task = handle.snapshot();
@@ -1016,6 +1045,10 @@ fn autoclaw_adapter(
 /// 放弃，存在服务端只会多一份要清理的状态）。回给前端让它随下一次请求带回。
 pub async fn login_sms_send(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
+    // 兼容旧缓存前端：它把 `provider: tabbit` 发到 AutoClaw 的端点。
+    if payload.get("provider").and_then(Value::as_str) == Some("tabbit") {
+        return tabbit_sms_send_inner(&state, &payload).await;
+    }
     let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
     let region = match autoclaw_region_of(&payload) {
         Ok(region) => region,
@@ -1042,6 +1075,10 @@ pub async fn login_sms_send(State(state): State<ServerState>, body: Bytes) -> Re
 /// 落盘、命名、去重、优先级分配全部复用插件那条落库通路。
 pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
+    // 兼容旧缓存前端：它把 `provider: tabbit` 发到 AutoClaw 的端点。
+    if payload.get("provider").and_then(Value::as_str) == Some("tabbit") {
+        return tabbit_sms_verify_inner(&state, &payload).await;
+    }
     let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
     let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
     let device_id = payload.get("deviceId").and_then(Value::as_str);
@@ -1187,6 +1224,152 @@ pub async fn login_loomy_sms_verify(State(state): State<ServerState>, body: Byte
                 .and_then(Value::as_str)
                 .unwrap_or("Loomy 账号");
             logging::log("[Login]", &format!("✅ Loomy 登录成功: {label}"));
+            let list = state.store().list_visible_accounts();
+            let account = list
+                .get("accounts")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("id").and_then(Value::as_str) == Some(&account_id))
+                })
+                .cloned()
+                .unwrap_or(account.public);
+            ok_json(json!({ "account": account, "list": list }))
+        }
+        Err(error) => management_error(error.status_code, error.message),
+    }
+}
+
+// ─── Tabbit 国内站手机号验证码登录（两段）───────────────────
+
+/// 发送短信验证码（**Tabbit 国内站专用**）。
+///
+/// body `{phone, uuid?, supportsCaptcha?}` → `{uuid}`。uuid 是这次登录的会话
+/// 标识：上游把刚发的码绑在它上面，登录时必须带同一个；网关不保存这个中间态，
+/// 回给前端随下一次请求带回即可。
+///
+/// ── 第二种成功形态：`{status:"captcha", captcha:{requestCode, verifyUrl}}` ──
+/// 风控判定人机可疑时上游不会发码，而是给一个滑块验证页。用户在那边手动完成
+/// 后**重新发一次码**才成功（官方网页版同样如此，见插件的 `challenge_of`）。
+/// 声明了 `supportsCaptcha` 的界面会拿到这个 200 + 状态，自己去开验证页并
+/// 引导用户再点一次；没声明的（旧缓存前端）收到 409 与一句可读提示。
+pub async fn login_tabbit_sms_send(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    tabbit_sms_send_inner(&state, &payload).await
+}
+
+/// 实际发码逻辑；也供旧版 `/api/session/login/sms/send` 按 `provider` 分派
+/// （旧缓存的前端会把 `provider: tabbit` 发到 AutoClaw 的端点）。
+async fn tabbit_sms_send_inner(state: &ServerState, payload: &Value) -> Response {
+    let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    // 过完滑块重发时要沿用同一个 uuid（同一轮登录），前端会带回来。
+    let uuid = payload.get("uuid").and_then(Value::as_str);
+    // 新界面声明自己认识「发码前要先过滑块」这种结果；不声明的一律按错误回，
+    // 免得旧缓存前端把它当成「已发送」而让用户等一条不会来的短信。
+    let supports_captcha = payload
+        .get("supportsCaptcha")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let Some(adapter) =
+        crate::server::core::providers::adapter::adapter_by_id("tabbit")
+    else {
+        return management_error(503, "Tabbit 的提供商插件没有安装，无法发送验证码");
+    };
+    match adapter
+        .admin_action(
+            state.store(),
+            "",
+            "login.sms-send",
+            &json!({ "phone": phone, "uuid": uuid }),
+        )
+        .await
+    {
+        Ok(result) => {
+            let needs_captcha =
+                result.get("status").and_then(Value::as_str) == Some("captcha");
+            if needs_captcha && !supports_captcha {
+                return management_error(
+                    409,
+                    "发送验证码前需要先完成滑块验证。请刷新页面后再试，或改用「填写凭证」粘贴 Cookie",
+                );
+            }
+            ok_json(result)
+        }
+        Err(error) => management_error(error.status_code, error.message),
+    }
+}
+
+/// 用手机号 + 验证码登录并**直接落成账号**（**Tabbit 国内站专用**）。
+///
+/// body `{phone, code, uuid, name?}` → `{account, list}`，响应形状与
+/// `POST /api/accounts` 一致；落盘、命名、去重复用插件的落库通路。
+pub async fn login_tabbit_sms_verify(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    tabbit_sms_verify_inner(&state, &payload).await
+}
+
+/// 实际换登录态逻辑；也供旧版 `/api/session/login/sms/verify` 按 `provider`
+/// 分派（旧缓存前端把 `provider: tabbit` 发到 AutoClaw 端点时仍能登录）。
+async fn tabbit_sms_verify_inner(state: &ServerState, payload: &Value) -> Response {
+    let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
+    // 新版前端传 `uuid`；旧缓存前端（AutoClaw 档案）把同一个中间态叫
+    // `deviceId`，两个都认，避免旧页面必须强刷才能登录。
+    let uuid = payload
+        .get("uuid")
+        .or_else(|| payload.get("deviceId"))
+        .and_then(Value::as_str);
+    let Some(adapter) =
+        crate::server::core::providers::adapter::adapter_by_id("tabbit")
+    else {
+        return management_error(503, "Tabbit 的提供商插件没有安装，无法登录");
+    };
+    let mut account = match adapter
+        .admin_action(
+            state.store(),
+            "",
+            "login.sms-verify",
+            &json!({
+                "phone": phone,
+                "code": code,
+                "uuid": uuid,
+                "name": payload.get("name"),
+            }),
+        )
+        .await
+    {
+        Ok(value) => {
+            match serde_json::from_value::<agent2api_provider_protocol::NormalizedAccount>(value) {
+                Ok(account) => account,
+                Err(error) => {
+                    return management_error(502, format!("插件返回的登录结果无法解析：{error}"))
+                }
+            }
+        }
+        Err(error) => return management_error(error.status_code, error.message),
+    };
+    if let Some(name) = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(public) = account.public.as_object_mut() {
+            public.insert(
+                "name".to_string(),
+                Value::String(name.chars().take(100).collect()),
+            );
+        }
+    }
+    match adapter.persist_login_account(&account) {
+        Ok(account_id) => {
+            let label = account
+                .public
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Tabbit 账号");
+            logging::log("[Login]", &format!("✅ Tabbit 登录成功: {label}"));
             let list = state.store().list_visible_accounts();
             let account = list
                 .get("accounts")
@@ -1444,6 +1627,13 @@ pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) ->
             interval,
             region.provider_id().to_string(),
         );
+    } else {
+        let login = state.login().clone();
+        let flow = flow.clone();
+        crate::spawn_task(async move {
+            tokio::time::sleep(Duration::from_millis(LOGIN_TIMEOUT_MS)).await;
+            login.cancel_async(&flow).await;
+        });
     }
     logging::log(
         "[Login]",

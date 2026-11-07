@@ -68,7 +68,7 @@ const CORS_METHODS: &str = "GET, POST, PUT, PATCH, OPTIONS, DELETE";
 /// `require_api_key` 判；且 `Allow-Origin: *` 下浏览器不会替跨源请求带 cookie，
 /// 凭证只能显式放进请求头 —— 这正是手机端要的形态。
 const CORS_HEADERS: &str =
-    "Content-Type, Authorization, x-api-key, x-panel-token, x-panel-refresh, x-panel-auth-mode";
+    "Content-Type, Authorization, x-api-key, x-panel-token, x-panel-refresh, x-panel-auth-mode, x-agent2api-client, x-title, x-client-type, x-cerebras-3rd-party-integration";
 
 /// 组装完整路由（面板 + 网关**同端口**：默认形态与桌面壳）。
 ///
@@ -313,10 +313,13 @@ pub fn panel_router(state: ServerState) -> Router {
         )
         .route("/api/routing/queue", get(api::routing_api::get_routing_queue))
         .route("/api/routing/workspace", get(api::routing_workspace::get_workspace))
+        .route("/api/routing/groups", get(api::routing_groups::get_groups).put(api::routing_groups::put_group))
+        .route("/api/routing/preview", post(api::routing_groups::preview))
         .route("/api/routing/profile", axum::routing::put(api::routing_workspace::put_profile))
         .route("/api/routing/sticky", get(api::routing_workspace::get_sticky))
         .route("/api/routing/sticky/clear", post(api::routing_workspace::clear_sticky))
         .route("/api/routing/replays", get(api::routing_workspace::get_replays))
+        .route("/api/routing/flow", get(api::routing_flow::get_flow))
         .route("/api/routing/trace", get(api::routing_trace::get_trace))
         .route("/api/routing/trace/request", get(api::routing_trace::get_trace_request))
         // ── 调试模式（设置页「通用 → 调试模式」）──
@@ -411,6 +414,7 @@ pub fn panel_router(state: ServerState) -> Router {
         // api::proxies 的模块头 —— 通配段会与 404 兜底互相干扰）。
         // 方法与形状见 api::agents 的模块头。
         .route("/api/agents", get(api::agents::list_agents))
+        .route("/api/agents/models", get(api::agents::list_models))
         .route("/api/agents/profiles", post(api::agents::save_profiles))
         .route("/api/agents/apply", post(api::agents::apply_profile))
         .route("/api/agents/preview", post(api::agents::preview_profile))
@@ -419,6 +423,47 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/agents/{id}/resources", get(api::agent_resources::get))
         .route("/api/agents/{id}/resources/preview", post(api::agent_resources::preview))
         .route("/api/agents/{id}/resources/apply", post(api::agent_resources::apply))
+        // ── 工具服务（「工具服务」页的管理面）──
+        // 上游提供商密钥、服务开关与超时、本机接入都要管理员权限，全部挂
+        // protected。运行时端点（/skill、/mcp、/api/web-search）在网关面，
+        // 见 `gateway_router` 的说明。
+        .route("/api/tools/servers", get(api::tools::get_servers))
+        .route("/api/tools/servers/{id}", axum::routing::patch(api::tools::patch_server))
+        .route("/api/tools/providers", get(api::tools::get_providers))
+        .route("/api/tools/api-keys", get(api::tools::list_api_keys))
+        .route(
+            "/api/tools/provider-selection",
+            get(api::tools::get_selection).put(api::tools::put_selection),
+        )
+        .route(
+            "/api/tools/providers/{provider}",
+            axum::routing::put(api::tools::put_provider),
+        )
+        .route(
+            "/api/tools/providers/{provider}/key",
+            axum::routing::delete(api::tools::delete_provider_key),
+        )
+        .route("/api/tools/providers/{provider}/test", post(api::tools::test_provider))
+        .route(
+            "/api/tools/vision/config",
+            get(api::tools::get_vision_config)
+                .put(api::tools::put_vision_config)
+                .delete(api::tools::delete_vision_config),
+        )
+        .route("/api/tools/vision/config/test", post(api::tools::test_vision))
+        .route("/api/tools/image-generation/config", get(api::tool_image_admin::config)
+            .put(api::tool_image_admin::save).delete(api::tool_image_admin::clear))
+        .route("/api/tools/image-generation/jobs", get(api::tool_image_admin::jobs))
+        .route("/api/tools/image-generation/jobs/{id}", axum::routing::delete(api::tool_image_admin::delete))
+        .route("/api/tools/image-generation/files/{id}", get(api::tool_image_admin::download))
+        .route("/api/tools/install-targets", get(api::tools::install_targets))
+        .route("/api/tools/install-info", get(api::tools::install_info))
+        .route("/api/tools/install-skill", post(api::tools::install_skill))
+        .route("/api/tools/install-mcp", post(api::tools::install_mcp))
+        .route("/api/tools/uninstall-skill", post(api::tools::uninstall_skill))
+        .route("/api/tools/uninstall-mcp", post(api::tools::uninstall_mcp))
+        .route("/api/tools/mcp-bridge/vision.js", get(api::tools::vision_bridge_script))
+        .route("/api/tools/mcp-bridge/image-generation.cjs", get(api::tools::image_bridge_script))
         // ── 侧边栏布局（菜单的分组 / 顺序 / 显隐）──
         // 挂 protected：布局是用户配置，且写操作会改两端共用的那一份。
         // 桌面壳的管理请求由壳自动带 Key，网页端走面板会话，两端都不受影响。
@@ -500,6 +545,16 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/session/login/loomy/sms/verify",
             post(api::session::login_loomy_sms_verify),
         )
+        // Tabbit 国内站的手机号验证码登录（同样两段、同样 protected）。
+        // 国际站不支持短信登录，插件只开了国内站的 `login.sms-*` 动作。
+        .route(
+            "/api/session/login/tabbit/sms/send",
+            post(api::session::login_tabbit_sms_send),
+        )
+        .route(
+            "/api/session/login/tabbit/sms/verify",
+            post(api::session::login_tabbit_sms_verify),
+        )
         // AutoClaw OAuth 网页登录（**国际版**的官方主方式）。两段都挂 protected
         // —— 它们要带验证码参数去打上游、并往任务表里登记一次登录，与 sms/*
         // 同级敏感。第三段（loopback 回调）**不再经过网关**：插件自己借 z.ai
@@ -530,6 +585,7 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/models/refresh", post(api::models::refresh_models))
         // 模型管理（启停 / 隐藏 / 映射）与网关 Key 列表：都是写配置的管理接口，挂 protected
         .route("/api/models/manage", get(api::model_manage::get_manage))
+        .route("/api/models/compact-routes", get(api::compact_routes::get_routes).put(api::compact_routes::put_routes))
         .route("/api/models/state", post(api::model_manage::set_state))
         .route("/api/models/mappings", post(api::model_manage::add_mapping))
         .route("/api/models/mappings/remove", post(api::model_manage::remove_mapping))
@@ -563,6 +619,7 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::assistant::get_config).put(api::assistant::put_config),
         )
         .route("/api/assistant/chat", post(api::assistant::chat))
+        .merge(api::assistant_coding::routes(state.clone()))
         .route("/api/assistant/images/generations", post(api::assistant_images::generations))
         .route("/api/assistant/images/edits", post(api::assistant_images::edits))
         .route("/api/assistant/images/files/{id}", get(api::assistant_images::download))
@@ -630,6 +687,8 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/plugins", get(api::plugins::list))
         .route("/api/plugins/settings", get(api::plugins::settings).patch(api::plugins::save_settings))
         .route("/api/plugins/progress", get(api::plugins::progress))
+        .route("/api/plugins/scripts/install", post(api::plugins::install_script))
+        .route("/api/plugins/scripts/change", post(api::plugins::change_script))
         .route(
             "/api/plugins/install",
             post(api::plugins::install).route_layer(axum::extract::DefaultBodyLimit::max(
@@ -659,6 +718,16 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/developer-role-compat",
             get(api::role_compat::get_role_compat).put(api::role_compat::put_role_compat),
+        )
+        // ── 第三方模型回答完自动折叠过程开关 ──
+        // 与 /api/developer-role-compat 同形的单开关端点（GET 读 / PUT 写），
+        // 挂 protected：它决定下发给客户端的 Responses 事件里要不要补阶段标记
+        // （改的是协议字节，敏感度与角色归一同一级）。实施点见
+        // `core::protocol::responses` 的 Responses 事件重建层。
+        .route(
+            "/api/reasoning-collapse",
+            get(api::reasoning_collapse::get_reasoning_collapse)
+                .put(api::reasoning_collapse::put_reasoning_collapse),
         )
         // ── Cline 伪装头的逐键覆盖 ──
         // 与 /api/sanitize 同形（GET 读 / PUT 写，响应体就是新状态），挂
@@ -699,6 +768,19 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/auto-continue",
             get(api::auto_continue::get_auto_continue).put(api::auto_continue::put_auto_continue),
         )
+        // ── 会话图片压缩（默认开）──
+        // 与 /api/auto-continue 同一族（GET 读 / PUT 写、改的是发给上游的
+        // 字节）：开关 + 长边 / 质量 / 阈值三项一起挂在同一条端点上。挂 protected
+        // 的理由与 /api/sanitize 相同 —— 它改写的是发给上游的请求体（本功能只作用
+        // 在对话链路，生图 / 图片编辑走独立分支、不经过压缩）。
+        .route("/api/vision-compatibility", get(api::vision_compat::get_settings).put(api::vision_compat::put_settings))
+        .route("/api/client-identification", get(api::client_identification::get_settings).put(api::client_identification::put_settings))
+        .route("/api/client-identification/preview", post(api::client_identification::preview_settings))
+        .route(
+            "/api/image-compress",
+            get(api::image_compress::get_image_compress)
+                .put(api::image_compress::put_image_compress),
+        )
         // ── 机器人校验开关 ──
         // 与 /api/debug 同形的单开关端点（GET 读 / PUT 写），挂 protected：
         // 它决定登录 / 注册是否要求 ALTCHA proof-of-work，敏感度同级。
@@ -714,6 +796,11 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/zcode/captcha",
             get(api::zcode_captcha::get_captcha).post(api::zcode_captcha::push_captcha),
+        )
+        // 领取专用验证任务：不入模型令牌池，面板独占处理并回传当次结果。
+        .route(
+            "/api/zcode/claim-verification",
+            post(api::zcode_claim_verification::verification),
         )
         // 令牌池的补货节奏设置（目标 / 轮询间隔 / 单轮上限）：与上面那条的
         // 分工见 `api::zcode_captcha_pool` 的模块头。stats 响应会把这三项
@@ -807,6 +894,8 @@ pub fn panel_router(state: ServerState) -> Router {
         // 「已注册路径 + 未注册方法」变成 405 兜底，而这个前缀下希望统一给 404。
         // 单独登记尾斜杠形态：`/api/scheduled-tasks/` 在 `{*rest}` 里匹配不上
         // （通配要求至少一个非空段），不登记就会落到全局 404。
+        .route("/api/maintenance", get(api::maintenance::overview))
+        .route("/api/maintenance/{*rest}", any(api::maintenance::entry))
         .route("/api/scheduled-tasks", any(api::scheduled_tasks::entry))
         .route("/api/scheduled-tasks/", any(api::scheduled_tasks::entry))
         .route(
@@ -858,6 +947,10 @@ pub fn panel_router(state: ServerState) -> Router {
         // 方法不匹配的兜底：Node 版没有 405 概念，一律落到 404 分支，
         // 所以这里把 405 也转成同样的 Not found 文案，保持行为一致
         .method_not_allowed_fallback(method_not_allowed)
+        // 文本响应统一 gzip：面板的 islands 产物与首屏 /api/session 都是大块文本，
+        // 不压会让远程打开面板等上几十秒（见 compression 模块头）。只挂管理面 ——
+        // 网关面的 /v1/* 是 SSE 流，不能在这里压。
+        .layer(middleware::from_fn(super::compression::gzip))
         // CORS 与 body 限制必须在最外层：404 与错误响应也要带 CORS 头
         .layer(middleware::from_fn(cors))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
@@ -890,6 +983,14 @@ pub fn gateway_router(state: ServerState) -> Router {
     let open = Router::new()
         .route("/v1/models", get(api::chat::list_models))
         .route("/v1/images/files/{id}", get(api::images::download))
+        // 工具服务的元数据与 REST 端点：GET 是免鉴权的服务说明；POST 由 handler
+        // 自己校验网关 Key（与 /skill、/mcp 同一口径），所以放在不挂统一中间件的
+        // 这一组 —— 放进 guarded 反而会被 `require_api_key` 的「/api/ 需面板会话
+        // 或不受限 Key」判据挡住（工具服务不承载模型请求，Key 的模型白名单无关）。
+        .route("/api/web-search", get(api::tool_runtime::api_metadata))
+        .route("/api/web-search/search", post(api::tool_runtime::api_search))
+        .route("/api/web-search/fetch", post(api::tool_runtime::api_fetch))
+        .route("/skill/web-search", get(api::tool_runtime::skill_metadata))
         .with_state(state.clone());
     // 三条协议入口 + Anthropic 的 token 计数端点：都查 API Key。
     // 与 chat/completions 完全同构：都走同一套转发链路，差异只在出入口的
@@ -905,6 +1006,22 @@ pub fn gateway_router(state: ServerState) -> Router {
         .route("/v1/messages/count_tokens", post(api::chat::count_tokens))
         .route("/v1/images/generations", post(api::images::generations))
         .route("/v1/images/edits", post(api::images::edits))
+        // 工具服务的既有协议入口：/skill 与 /mcp 不在 /v1 也不在 /api 下，
+        // `require_api_key` 对它们不做任何判定（见该中间件的分支），所以鉴权
+        // 必须由 handler 自己做 —— 这正是 `api::tool_runtime` 的做法。
+        .route("/skill/web-search/search", post(api::tool_runtime::skill_search))
+        .route("/skill/web-search/fetch", post(api::tool_runtime::skill_fetch))
+        .route(
+            "/mcp/web-search",
+            post(api::tool_runtime::mcp_web_search).get(api::tool_runtime::mcp_unsupported),
+        )
+        .route(
+            "/mcp/vision",
+            post(api::tool_runtime::mcp_vision).get(api::tool_runtime::mcp_unsupported),
+        )
+        .route("/mcp/image-generation", post(api::tool_runtime::mcp_image_generation)
+            .get(api::tool_runtime::mcp_unsupported).delete(api::tool_runtime::mcp_unsupported))
+        .route("/mcp/image-generation/files/{id}", get(api::tool_images::download))
         .layer(middleware::from_fn(require_api_key))
         .with_state(state);
     health.merge(open.merge(guarded))
@@ -1095,6 +1212,9 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
     }
     let model_access = api::model_access::authenticate(request.headers(), "").ok();
     let panel_session = crate::server::access::session_valid(request.headers());
+    if path.starts_with("/api/assistant/coding/") && !panel_session {
+        return errors::panel_login_required_response(request.headers());
+    }
     if !panel_session {
         if let Some(access) = &model_access {
             let restricted = access.scope.as_ref().is_some_and(|scope| scope.restricts_models() || scope.restricts_providers());
@@ -1115,74 +1235,12 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
             // Key 也能操作管理接口（桌面壳 / 脚本自动化的通道）
             return next.run(request).await;
         }
-        // 诊断：面板认证分支的 401 此前是静默的 —— 「登录成功却被弹回登录
-        // 页」时这一行是唯一现场：两路凭证（cookie / 请求头）各自看到了什么，
-        // 一眼定位是令牌没送到还是没存上。
-        // 除了「本家那把在不在」，还要看**这一趟到底带回来了哪几把 cookie**：
-        // 中转把多条 Set-Cookie 合并/丢一条时，浏览器回带的常常是探针或上一轮的
-        // 会话 —— "cookie=有"这三种情况在旧文案里长得一模一样，分不出"没送到"
-        // 与"送到但不是这把"。只列名字，值不写（见 `access::cookie_names`）。
-        let names = crate::server::access::cookie_names(request.headers());
-        let seen_headers: Vec<&str> = ["x-panel-token", "x-panel-refresh", "authorization"]
-            .into_iter()
-            .filter(|name| request.headers().contains_key(*name))
-            .collect();
-        // 指纹按**候选顺序**逐个列（最多两把）：同名 cookie 重复上行 + 头里还躺着
-        // 旧令牌时，"哪一把被试过"就是这一行要回答的问题 —— 只打第一把会把
-        // 「cookie 短路」这种故障伪装成「什么都没带」。
-        let fingerprints = crate::server::access::access_fingerprints(request.headers());
-        let credential_summary = format!(
-            "试过的凭证指纹={} 带回来的 cookie={} 凭证头={}",
-            if fingerprints.is_empty() {
-                "无".to_string()
-            } else {
-                fingerprints.join(",")
-            },
-            if names.is_empty() { "无".to_string() } else { names.join("|") },
-            if seen_headers.is_empty() { "无".to_string() } else { seen_headers.join("+") },
-        );
-        // ── 级别分三档，而不是「有没有带凭证」两档 ──────────────
-        // 三种 401 在请求上长得一样，含义完全不同：
-        //   · **什么都没带** —— 正常未登录。主界面首屏一次并发十几条 `/api/*`
-        //     （各页面岛挂载即加载），浏览器第一次打开面板就会把它们全撞出来。
-        //   · **带了凭证 + refresh 还活着** —— access 到期的**设计内中间态**。
-        //     access 寿命就是 `ACCESS_TTL`（2 小时），到点后第一条请求必然 401，
-        //     客户端随即拿 refresh 换新令牌并重试原请求，用户无感。面板里频率
-        //     最高的轮询（验证码令牌池，2.5 秒一轮）永远是第一个撞上的，于是
-        //     旧口径下每 2 小时准时刷一条 error、侧栏未读错误徽标 +1 —— 一条
-        //     正常流程被记成了故障（用户侧的实际反馈就是「挂着一晚上全是红字」）。
-        //   · **带了凭证 + 整条链已失效** —— 僵尸 cookie / 重放 / Key 配错。
-        //     这才是要报的：前两者都走 verbose（控制台仍然打印，日志页不当错误收）。
-        //
-        // 判据直接用 `access::has_live_refresh` —— 它本来就在 `errors::
-        // panel_login_required_response` 里决定「要不要清 cookie」，两处必须
-        // 同一个口径：会清 cookie 的现场才配 error。这里算一次、传下去复用，
-        // 避免同一请求对 refresh 表加两次锁。
+        // 日志只描述本次请求：未携带续期凭证，不代表客户端不能另行续期。
+        // 与响应的 cookie 处理复用同一次读数，不改变鉴权和清除规则。
         let live_refresh = crate::server::access::has_live_refresh(request.headers());
-        let presents = crate::server::access::presents_credentials(request.headers());
-        if !presents {
-            logging::verbose(
-                "[Security]",
-                &format!("面板未登录: {} {path}（{credential_summary}）", request.method()),
-            );
-        } else if live_refresh {
-            // 不写 ❌：这条不是错误，是续期流程的第一步
-            logging::verbose(
-                "[Security]",
-                &format!(
-                    "面板会话已过期（refresh 仍有效，等客户端续期）: {} {path}（{credential_summary}）",
-                    request.method()
-                ),
-            );
-        } else {
-            logging::log(
-                "[Security]",
-                &format!(
-                    "❌ 面板会话无效: {} {path}（{credential_summary}）",
-                    request.method()
-                ),
-            );
-        }
+        crate::server::access::diagnostics::log_rejection(
+            request.headers(), request.method(), &path, live_refresh,
+        );
         return errors::panel_login_required_response_with_refresh_state(live_refresh);
     }
     // ── 未注册闸门（headless 专属，桌面壳不开启）────────────────

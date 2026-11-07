@@ -400,11 +400,20 @@ pub fn shim_js() -> &'static str {
     if (hosts != null && (!Array.isArray(hosts) || hosts.some(function (host) {
       return typeof host !== 'string' || !host.trim().replace(/^\*\./, '').replace(/\.$/, '');
     }))) throw new Error('登录域名白名单格式无效');
-    var permittedHost = !Array.isArray(hosts) || hosts.length === 0 || hosts.some(function (host) {
-      if (typeof host !== 'string') return false;
-      var allowed = host.trim().toLowerCase().replace(/^\*\./, '').replace(/\.$/, '');
-      return allowed && (parsed.hostname.toLowerCase() === allowed
-        || parsed.hostname.toLowerCase().endsWith('.' + allowed));
+    var regularHosts = [];
+    var loopbackPages = [];
+    (Array.isArray(hosts) ? hosts : []).forEach(function (host) {
+      if (typeof host !== 'string') return;
+      var text = host.trim().toLowerCase();
+      // 插件申报的本机登录页（明确带端口，只认回环主机）
+      var page = /^(127\.0\.0\.1|localhost|\[::1\]):(\d+)$/.exec(text);
+      if (page) { loopbackPages.push({ host: page[1], port: page[2] }); return; }
+      var allowed = text.replace(/^\*\./, '').replace(/\.$/, '');
+      if (allowed) regularHosts.push(allowed);
+    });
+    var permittedHost = !Array.isArray(hosts) || regularHosts.length === 0 || regularHosts.some(function (allowed) {
+      return parsed.hostname.toLowerCase() === allowed
+        || parsed.hostname.toLowerCase().endsWith('.' + allowed);
     });
     var callbackHttp = parsed.protocol === 'http:'
       && ['localhost', '127.0.0.1', '[::1]'].indexOf(parsed.hostname) >= 0
@@ -412,7 +421,11 @@ pub fn shim_js() -> &'static str {
         return target.protocol === parsed.protocol && target.hostname === parsed.hostname
           && target.port === parsed.port && target.pathname === parsed.pathname;
       });
-    if (!permittedHost || (parsed.protocol !== 'https:' && !callbackHttp)) {
+    var loopbackPage = parsed.protocol === 'http:'
+      && loopbackPages.some(function (page) {
+        return parsed.hostname.toLowerCase() === page.host && (parsed.port || '80') === page.port;
+      });
+    if (!permittedHost || (parsed.protocol !== 'https:' && !callbackHttp && !loopbackPage)) {
       throw new Error('登录链接不是允许的 HTTPS 站点或合法本机回调地址');
     }
     return value; // 校验不重写原文，保留授权地址中的编码、顺序与签名。
@@ -1439,6 +1452,9 @@ pub fn shim_js() -> &'static str {
     startLogin: function (edition, mode, provider, socialRestore, options) {
       var target = String(provider || 'workbuddy').trim();
       var dynamic = hasMethodIndex(options);
+      if (target === 'monkeycode' || target === 'monkeycode-intl') {
+        return Promise.reject(new Error('MonkeyCode 自动网页登录仅限桌面端；浏览器面板请登录对应官网后粘贴 session。'));
+      }
       // 只有旧小浣熊入口才改 redirect/预检；动态方法不能被 provider 特判覆盖。
       if (!dynamic && target === 'raccoon') {
         var problem = raccoonCallbackOriginProblem();
@@ -1451,7 +1467,7 @@ pub fn shim_js() -> &'static str {
         // 不压缩第四参 socialRestore；第五参对象保持原字段/原值（含 proxy:null）。
         if (options !== undefined) body.options = options;
         if (dynamic) {
-          body.mode = mode || 'embedded';
+          body.mode = 'external';
           body.socialRestore = socialRestore === true;
           // 兼容当前 API 的平铺读取；options 字段也完整保留给新端点。
           body.methodIndex = options.methodIndex;
@@ -1569,6 +1585,9 @@ pub fn shim_js() -> &'static str {
     // 每轮都读到「没有这个方法」→ 安静退让 → 池子永远是空的，活动套餐通道
     // 整条不可用（Issue #163）。铸造本身仍发生在**浏览器**里（阿里云 SDK 跑在
     // 页面上），所以 headless 只要有人开着面板页就能维持池子 —— 与桌面端一致。
+    zcodeClaimVerification: function (payload) {
+      return call('POST', '/api/zcode/claim-verification', payload);
+    },
     zcodeCaptchaStats: function () {
       return call('GET', '/api/zcode/captcha');
     },
@@ -1605,13 +1624,19 @@ pub fn shim_js() -> &'static str {
     // 也进结果，多出一批「缺少登录态」的噪音行），点名账号同样不生效。
     refreshModels: function (payload) { return call('POST', '/api/models/refresh', payload || {}); },
     getModelManage: function () { return call('GET', '/api/models/manage'); },
+    getClientIdentification: function () { return call('GET', '/api/client-identification'); },
+    saveClientIdentification: function (payload) { return call('PUT', '/api/client-identification', payload); },
+    previewClientIdentification: function (payload) { return call('POST', '/api/client-identification/preview', payload); },
+    getCompactRoutes: function () { return call('GET', '/api/models/compact-routes'); },
+    saveCompactRoutes: function (payload) { return call('PUT', '/api/models/compact-routes', payload); },
     setModelState: function (payload) { return call('POST', '/api/models/state', payload); },
     // 第 4 / 第 5 个参数（思考等级 / 映射开关）都按「有没有传」决定是否进请求体：
     // 后端按「请求体里有没有这个键」区分三态，undefined 的键不会进 JSON
-    addModelMapping: function (alias, target, provider, reasoning, enabled) {
+    addModelMapping: function (alias, target, provider, reasoning, enabled, create) {
       var payload = { alias: alias, target: target, provider: provider };
       if (reasoning !== undefined) payload.reasoning = reasoning;
       if (enabled !== undefined) payload.enabled = enabled;
+      if (create !== undefined) payload.create = create;
       return call('POST', '/api/models/mappings', payload);
     },
     removeModelMapping: function (alias, target, provider) {
@@ -1687,9 +1712,13 @@ pub fn shim_js() -> &'static str {
     getRoutingConfig: function () { return call('GET', '/api/routing'); },
     getRoutingWorkspace: function (model) { return call('GET', '/api/routing/workspace' + toQuery({ model: model })); },
     saveRoutingProfile: function (payload) { return call('PUT', '/api/routing/profile', payload || {}); },
+    getRoutingGroups: function () { return call('GET', '/api/routing/groups'); },
+    saveRoutingGroup: function (payload) { return call('PUT', '/api/routing/groups', payload); },
+    previewRouting: function (payload) { return call('POST', '/api/routing/preview', payload); },
     getRoutingSticky: function (model) { return call('GET', '/api/routing/sticky' + toQuery({ model: model })); },
     clearRoutingSticky: function (payload) { return call('POST', '/api/routing/sticky/clear', payload || {}); },
     getRoutingReplays: function (query) { return call('GET', '/api/routing/replays' + toQuery(query)); },
+    getRoutingFlow: function (query) { return call('GET', '/api/routing/flow' + toQuery(query)); },
     getRoutingTrace: function (query) { return call('GET', '/api/routing/trace' + toQuery(query)); },
     getRoutingTraceRequest: function (query) { return call('GET', '/api/routing/trace/request' + toQuery(query)); },
     setRoutingConfig: function (patch) { return call('PUT', '/api/routing', patch || {}); },
@@ -1711,6 +1740,7 @@ pub fn shim_js() -> &'static str {
     // 存在 —— 只加一边时另一形态下的页面会报「桥接方法缺失」。契约见
     // api::agents 的模块头：写操作都返回整份 {clients}，就地替换）
     getAgents: function () { return call('GET', '/api/agents'); },
+    getAgentModels: function (gatewayKeyId) { return call('GET', '/api/agents/models' + (gatewayKeyId == null ? '' : '?gatewayKeyId=' + encodeURIComponent(gatewayKeyId))); },
     saveAgentProfiles: function (payload) { return call('POST', '/api/agents/profiles', payload || {}); },
     applyAgentProfile: function (payload) { return call('POST', '/api/agents/apply', payload || {}); },
     previewAgentProfile: function (payload) { return call('POST', '/api/agents/preview', payload || {}); },
@@ -1744,6 +1774,21 @@ pub fn shim_js() -> &'static str {
     getBalancesSnapshot: function () { return call('GET', '/api/accounts/usage/snapshot'); },
     getAccountConnections: function () { return call('GET', '/api/accounts/connections'); },
     checkinAllAccounts: function (id) { return call('POST', '/api/accounts/checkin', id ? { id: id } : {}); },
+    getCampaignRewards: function (id) {
+      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/campaigns');
+    },
+    claimCampaignReward: function (id, campaignId) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/campaigns/claim', { campaignId: campaignId });
+    },
+    redeemCampaignBenefit: function (id, code) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/campaigns/redeem', { code: code });
+    },
+    getOfficeaceSubscription: function (id) {
+      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/officeace-subscription');
+    },
+    activateOfficeaceSubscription: function (id) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/officeace-subscription/activate', {});
+    },
     // ── Loomy 新手任务（查询 / 一键领取）──
     // 与桌面 `bridge.rs` 的同名方法成对维护：签到后界面查询任务状态、有未领取才
     // 弹窗领取（accounts-dialog-onboarding）。
@@ -1775,7 +1820,7 @@ pub fn shim_js() -> &'static str {
       return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/growth/travel', {});
     },
 
-    // ── 手机验证码登录（AutoClaw 国内版 / Loomy）──
+    // ── 手机验证码登录（AutoClaw 国内版 / Loomy / Tabbit 国内版）──
     // 与桌面 `bridge.rs` 的同名方法**必须成对存在**（理由见下面 ZCode 那段的
     // 说明）：界面只知道「手机号 + 中间态」，走哪个端点由两份桥各自决定。
     //
@@ -1791,27 +1836,48 @@ pub fn shim_js() -> &'static str {
       var provider = isObject && input.provider ? String(input.provider) : '';
       var path = provider === 'loomy'
         ? '/api/session/login/loomy/sms/send'
-        : '/api/session/login/sms/send';
+        : provider === 'tabbit'
+          ? '/api/session/login/tabbit/sms/send'
+          : '/api/session/login/sms/send';
       return call('POST', path, {
         phone: phone,
         provider: provider || undefined,
+        // 与桌面桥同名同义：声明「认识发码前的滑块验证状态」，网关据此回
+        // 200 + `{status:"captcha"}` 而不是 409；uuid 用于过完验证重发时
+        // 沿用同一轮登录（见 api::session::login_tabbit_sms_send 的说明）。
+        supportsCaptcha: isObject && input.supportsCaptcha ? true : undefined,
+        uuid: isObject && input.uuid ? String(input.uuid) : undefined,
       });
+    },
+    // 打开上游给的人机验证页。网页面板没有壳命令可用，直接开新标签：
+    // 这一下由用户点按钮触发，不会被弹窗拦截。不用 `noopener` 参数 ——
+    // 它会让 window.open 返回 null，看起来像「被拦截」；改成打开后清 opener。
+    openVerifyPage: function (url) {
+      var opened = window.open(String(url || ''), '_blank');
+      // 被拦截时 reject 而不是返回 false：界面据此把地址显示出来让人手动访问，
+      // 而不是以为验证页已经开了、干等一个不会出现的窗口。
+      if (!opened) return Promise.reject(new Error('浏览器拦截了弹窗'));
+      try { opened.opener = null; } catch (error) { /* 跨域时改不了，忽略 */ }
+      return Promise.resolve(true);
     },
     verifySmsLogin: function (payload) {
       payload = payload || {};
       var provider = payload.provider ? String(payload.provider) : '';
       var path = provider === 'loomy'
         ? '/api/session/login/loomy/sms/verify'
-        : '/api/session/login/sms/verify';
+        : provider === 'tabbit'
+          ? '/api/session/login/tabbit/sms/verify'
+          : '/api/session/login/sms/verify';
       var body = {
         phone: String(payload.phone || ''),
         code: String(payload.code || ''),
       };
-      // deviceId（AutoClaw）/ msgid（Loomy）：两个中间态都按「有值才带」整形
-      // —— 空串会被后端当成一个真值带上去。字段名由界面按各自链路给（见
-      // ui/sms-login.js 的 SMS_PROFILES），这里只透传，不替它做归一。
+      // deviceId（AutoClaw）/ msgid（Loomy）/ uuid（Tabbit）按「有值才带」整形。
+      // 字段名由界面按各自链路给（见 ui/sms-login.js 的 SMS_PROFILES），
+      // 发码返回的中间态必须原样回传，不能丢掉，也不替它做归一。
       if (payload.deviceId) body.deviceId = String(payload.deviceId);
       if (payload.msgid) body.msgid = String(payload.msgid);
+      if (payload.uuid) body.uuid = String(payload.uuid);
       if (payload.name) body.name = String(payload.name);
       if (provider) body.provider = provider;
       return call('POST', path, body);
@@ -1866,6 +1932,10 @@ pub fn shim_js() -> &'static str {
     },
 
     // ── 间隔型定时任务 ──
+    getMaintenance: function (query) { return call('GET', '/api/maintenance?' + new URLSearchParams(query || {}).toString()); },
+    getMaintenanceRecord: function (id) { return call('GET', '/api/maintenance/records/' + encodeURIComponent(id)); },
+    runMaintenance: function (id) { return call('POST', '/api/maintenance/run/' + encodeURIComponent(id), {}); },
+    retryMaintenance: function (id, itemId) { return call('POST', '/api/maintenance/records/' + encodeURIComponent(id) + '/retry', itemId == null ? {} : { itemId: itemId }); },
     getScheduledTasks: function () { return call('GET', '/api/scheduled-tasks'); },
     saveScheduledTask: function (id, patch) {
       return call('PATCH', '/api/scheduled-tasks/' + encodeURIComponent(String(id || '')), patch);
@@ -1921,6 +1991,8 @@ pub fn shim_js() -> &'static str {
     // 拉起，同一个容器、可写层保留）。未开 AGENT2API_SELF_UPDATE 的部署由
     // 后端 400 拒绝；面板按 check 返回的 selfUpdate 字段决定是否显示这些入口。
     installUpdate: function () { return call('POST', '/api/update/install', {}); },
+    startSystemdUpdate: function (payload) { return call('POST', '/api/update/systemd', payload); },
+    startWindowsServiceUpdate: function (payload) { return call('POST', '/api/update/windows-service', payload); },
     restartService: function () { return call('POST', '/api/update/restart', {}); },
 
     // ── 出站指纹脱敏 ──
@@ -1937,6 +2009,14 @@ pub fn shim_js() -> &'static str {
     getDeveloperRoleCompat: function () { return call('GET', '/api/developer-role-compat'); },
     saveDeveloperRoleCompat: function (enabled) {
       return call('PUT', '/api/developer-role-compat', { developerRoleCompat: enabled === true });
+    },
+
+    // ── 第三方模型回答完自动折叠过程 ──
+    // 与桌面桥（src/bridge.rs 的 getReasoningCollapse / saveReasoningCollapse）
+    // 同一映射：两边接口名与签名必须一致，界面代码零改动地跑在两边
+    getReasoningCollapse: function () { return call('GET', '/api/reasoning-collapse'); },
+    saveReasoningCollapse: function (enabled) {
+      return call('PUT', '/api/reasoning-collapse', { thirdPartyReasoningCollapse: enabled === true });
     },
 
     // ── Cline 伪装头（转发头逐键覆盖）──
@@ -2052,15 +2132,19 @@ pub fn shim_js() -> &'static str {
     //   · 宿主中转（cookie 往返不通）：令牌在 localStorage，必须放进
     //     `x-panel-token`（自定义头被剥时还有标准的 Authorization 兜底）；
     //   · 未注册管理员的部署：用户输入的网关 Key 是唯一凭证。
-    directCredentials: function () {
-      var headers = {};
-      var access = storedPanelToken('access');
-      if (access) {
-        headers['x-panel-token'] = access;
-        headers['Authorization'] = 'Bearer ' + access;
+    // 每次取凭证前复用普通请求的提前续期；refresh=true 只用于明确的面板 401。
+    // 只重读 localStorage 不会续期，拿回的仍是同一把失效令牌。
+    directCredentials: async function (refresh) {
+      if (refresh) {
+        if (!(await tryRefresh())) {
+          clearPanelAuth();
+          window.location.href = '/login';
+          return new Promise(function () {});
+        }
+      } else {
+        await ensureFreshSession();
       }
-      if (apiKey) headers['x-api-key'] = apiKey;
-      return Promise.resolve(headers);
+      return authHeaders({});
     },
 
     // ── 机器人校验开关（登录 / 注册的 ALTCHA proof-of-work，分两端）──
@@ -2142,6 +2226,10 @@ pub fn shim_js() -> &'static str {
     // ── 排队等待（次数 / 单次秒数）──
     getQueue: function () { return call('GET', '/api/queue'); },
     saveQueue: function (patch) { return call('PUT', '/api/queue', patch); },
+    // ── 会话图片压缩（开关 + 长边 / 质量 / 阈值三项）──
+    // 与桌面桥（src/bridge.rs 的 getImageCompress / saveImageCompress）逐字同形。
+    getImageCompress: function () { return call('GET', '/api/image-compress'); },
+    saveImageCompress: function (patch) { return call('PUT', '/api/image-compress', patch); },
     // ── 验证码令牌池（ZCode 活动套餐通道的补货节奏）──
     getCaptchaPool: function () { return call('GET', '/api/zcode/captcha-pool'); },
     saveCaptchaPool: function (patch) { return call('PUT', '/api/zcode/captcha-pool', patch); },

@@ -360,6 +360,126 @@ impl AccountStore {
         Ok(removed)
     }
 
+    /// 把该提供商名下**等于给定地址**的账号级覆盖项清掉，返回被清理的账号名。
+    ///
+    /// 消费方是「提供商的 Base URL 改动」那次保存（`api::custom_providers::
+    /// update_custom_provider`）。早先版本新建提供商时会把当时的地址抄进首个
+    /// 账号（历史行为），而账号上的 `baseUrl` 是**覆盖项**、转发时优先 ——
+    /// 于是改提供商地址后请求仍打旧地址，界面上看不到那份值也改不掉
+    /// （issue #455 的形状）。
+    ///
+    /// 值**逐字相等**（去首尾空白、去末尾斜杠后）才清：导入来的账号可能刻意
+    /// 指到另一个地址，那是有意的覆盖项，不能一并抹掉。清理是「回到跟随
+    /// 提供商」，不是删除用户的配置 —— 地址仍由提供商那条记录提供。
+    pub fn clear_custom_base_url_overrides(
+        &self,
+        provider_id: &str,
+        matched: &str,
+    ) -> Result<Vec<String>, AccountStoreError> {
+        let provider_id = provider_id.trim();
+        let target = matched.trim().trim_end_matches('/');
+        if provider_id.is_empty() || target.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _guard = self.guard();
+        let records = self.records_for_provider(&_guard, provider_id);
+        let mut cleared: Vec<String> = Vec::new();
+        for mut record in records {
+            let Some(current) = record
+                .fields()
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(|text| text.trim_end_matches('/'))
+            else {
+                continue;
+            };
+            if current != target {
+                continue;
+            }
+            let name = record.name();
+            record.remove("baseUrl");
+            record.set_updated_at(logging::now_ms());
+            self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))?;
+            cleared.push(name);
+        }
+        Ok(cleared)
+    }
+
+    /// 改一条自定义账号的 **baseUrl 覆盖项**（`PATCH /api/accounts` 的
+    /// `baseUrl` 分支）。
+    ///
+    /// 语义（与界面上的「改回跟随提供商」一一对应）：
+    ///   - `null` 或空串 = **清除**覆盖项，转回落用提供商的 baseUrl；
+    ///   - 非空字符串 = 校验后写入（与提供商侧同一套 `normalize_base_url`）。
+    ///
+    /// 为什么提供这个入口：覆盖项在账号公开形态里透出（`baseUrl`），但界面
+    /// 以前只显示提供商那一层，账号里的旧值既看不见也改不掉。早先版本新建
+    /// 提供商时抄进账号的那份旧地址就是这样卡住的（issue #455）。
+    pub fn update_custom_base_url(
+        &self,
+        id: &str,
+        value: &Value,
+    ) -> Result<Vec<String>, AccountStoreError> {
+        let id = id.trim();
+        let _guard = self.guard();
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
+            return Err(AccountStoreError::not_found("账号不存在"));
+        };
+        if !record.provider().starts_with(custom_providers::ID_PREFIX) {
+            return Err(AccountStoreError::bad_request(
+                "只有自定义提供商的账号有上游地址覆盖项",
+            ));
+        }
+        let next = match value {
+            Value::Null => None,
+            Value::String(text) => {
+                let text = text.trim();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(
+                        custom_providers::normalize_base_url(text)
+                            .map_err(AccountStoreError::bad_request)?,
+                    )
+                }
+            }
+            _ => {
+                return Err(AccountStoreError::bad_request(
+                    "baseUrl 必须是字符串或 null（null = 跟随提供商）",
+                ))
+            }
+        };
+        let before = record
+            .fields()
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        if before == next {
+            return Ok(Vec::new());
+        }
+        let change = match &next {
+            Some(url) => {
+                record.set("baseUrl", Value::String(url.clone()));
+                format!("上游地址覆盖 → 已设为 {url}")
+            }
+            None => {
+                record.remove("baseUrl");
+                "上游地址覆盖 → 已清除（跟随提供商）".to_string()
+            }
+        };
+        record.set_updated_at(logging::now_ms());
+        let name = record.name();
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))?;
+        logging::log(
+            "[Accounts]",
+            &format!("🌐 自定义账号上游地址已更新: {name}（{change}）"),
+        );
+        Ok(vec![change])
+    }
+
     /// 按账号 id 取它的 provider —— **仅当它属于自定义提供商时**返回 Some。
     ///
     /// 消费方是 `api::accounts::refresh_account` 的分支：自定义账号没有可刷新
@@ -388,8 +508,7 @@ impl AccountStore {
     /// 代理在锁内只做**解析**（读 Clash 快照，本地文件 IO；与
     /// `get_session_by_id` 同一口径），真正的网络动作都在锁外。
     pub fn custom_credential_by_id(&self, account_id: &str) -> Option<CustomCredential> {
-        let _guard = self.guard();
-        let record = self.record_by_id(&_guard, account_id)?;
+        let record = self.read_record(account_id)?;
         Some(credential_of_record(&record))
     }
 
@@ -804,10 +923,8 @@ fn describe_balance_query_changes(
 /// 自定义账号的**内部凭证快照**（`custom_credential_by_id` /
 /// `first_custom_credential` 的返回值）。
 ///
-/// 与公开形态（`to_custom_public_account`）的字段差别只有两个：
-/// `apiKey`（明文，出网鉴权用）与代理的**已解析形态**（`ResolvedProxy`，
-/// 直接可交给 egress；解析失败按直连兜底 —— 公开形态里那是给用户看的
-/// 「解析失败」气泡，这里是转发可执行的出口）。
+/// 与公开形态相比，这里保留出网鉴权所需的 API Key、已解析出口及代理异常原因。
+/// 代理异常不能被查询与目录刷新误当成未配置代理。
 pub struct CustomCredential {
     /// 账号 id
     pub account_id: String,
@@ -820,8 +937,9 @@ pub struct CustomCredential {
     pub no_auth: bool,
     /// 账号上的 baseUrl **覆盖项**（None = 未覆盖，转发回落提供商的 baseUrl）
     pub base_url_override: Option<String>,
-    /// 出网代理（None = 未配置 / 解析失败 → 直连）
+    /// 出网代理（None = 未配置，异常原因单独保留）。
     pub proxy: Option<ResolvedProxy>,
+    pub proxy_error: Option<String>,
 }
 
 /// 一条记录 → 凭证快照（两个入口共用一份取数口径，不会各漂一份）
@@ -830,11 +948,11 @@ fn credential_of_record(record: &StoredAccount) -> CustomCredential {
     // 轮询档取下一个出口：凭证快照的消费方（余额查询、拉清单）都是**真实出网**，
     // 与转发同一条口径；展示那一路（公开形态）走 `describe_account_proxy`，
     // 它不动游标（见 `core::proxies` 的两个解析入口）。
-    let proxy = match resolve_account_proxy_rotating(Some(&record.proxy()), record.id()) {
-        Some(resolution) => resolution.resolved().cloned(),
-        // 无代理配置 → 直连（与「解析失败回退直连」在出网行为上等价，
-        // 区别只在日志：这里没有请求上下文可挂 notice，静默直连即可）
-        None => None,
+    let (proxy, proxy_error) = match resolve_account_proxy_rotating(Some(&record.proxy()), record.id()) {
+        Some(crate::server::core::proxies::ProxyResolution::Resolved(proxy))
+            if !proxy.host.trim().is_empty() && proxy.port.is_some_and(|port| port > 0) => (Some(proxy), None),
+        Some(_) => (None, Some("账号代理不可用，请检查账号设置；本次操作未改走直连".to_string())),
+        None => (None, None),
     };
     CustomCredential {
         account_id: record.id().to_string(),
@@ -851,5 +969,6 @@ fn credential_of_record(record: &StoredAccount) -> CustomCredential {
             .map(str::to_string)
             .filter(|text| !text.is_empty()),
         proxy,
+        proxy_error,
     }
 }

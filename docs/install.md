@@ -85,8 +85,11 @@ Stop-Service Agent2API
 .\install-service.ps1 -Uninstall
 ```
 
-**升级**：解压新版本包，重跑一次 `install-service.ps1` 即可（脚本会先停服务、
-覆盖程序与界面、再启动；数据与配置不动）。
+**一键更新**：标准 Windows 服务安装可在「设置 → 更新」点击「一键更新」。确认后自动下载 Windows x64 服务端包，独立校验官方摘要，由临时升级进程停止服务、等待文件占用释放、备份替换并重新启动。确认新版服务运行后页面自动刷新；账号、配置和数据不删除。
+
+**旧安装接入 / 手动升级**：把新版服务端包解压到新的目录，以管理员身份运行一次 `install-service.ps1`。脚本默认保留已登记的安装目录、数据目录、端口、环境配置和服务账号；只有显式传入的端口等选项才覆盖原值，目录迁移需单独进行。此次接入完成后可使用面板一键更新。
+
+程序目录仅系统和管理员可写，升级工作目录为 `<安装目录>\.service-update`，不新增常驻服务。`AGENT2API_WINDOWS_UPDATE=0` 可在服务环境变量中关闭入口。自定义服务账号、目录链接、网络路径及受外部进程组托管的部署保留手动升级，不自动提权。替换失败会恢复旧文件；新版启动未确认时保留升级日志与备份，不自动回退数据库。
 
 > **两个 Windows 特有的坑，脚本已经处理好了**：
 > 服务进程的工作目录是 `C:\Windows\system32` 而不是 exe 所在目录 —— 界面目录靠
@@ -124,9 +127,11 @@ journalctl -u agent2api -f
 再退出，SSE 长连接不会被打断）都已配好。配置改 `/etc/agent2api/agent2api.env`
 后 `systemctl restart agent2api` 生效。
 
-> **裸机不要开 `AGENT2API_SELF_UPDATE`**：那是容器内的方案（换文件后退出，靠
-> 容器 restart 策略拉起）。裸机上程序文件属 root、服务账号无权替换，单元里已
-> 显式设成 `0`。升级走 `install.sh --upgrade`。
+> **systemd 一键更新**：标准安装已包含受限升级程序，面板点击「一键更新」并确认后，会下载、独立核验官方校验值、备份替换、重启并确认新版服务。账号与配置保留，网关继续以普通账号运行，程序目录仍由 root 保护。
+>
+> 旧安装先下载包含本功能的新版服务端包，在新包目录执行一次 `sudo bash install.sh --upgrade`，补装升级组件后即可使用。自定义服务账号或安装路径不会被脚本强行改写，继续使用原部署方式升级。`AGENT2API_SYSTEMD_UPDATE=0` 可关闭面板入口；停用 `agent2api-updater.socket` 可停用升级组件。`AGENT2API_SELF_UPDATE` 仍为 Docker 专用，不要在裸机开启。
+>
+> 更新组件通过本机 socket 工作，不开放网络端口。默认从官方索引核验发布仓库；需固定仓库或为独立校验配置代理时，管理员可在 `/etc/agent2api/updater.env` 设置 `AGENT2API_UPDATER_REPO=owner/repo` 或 `HTTPS_PROXY`。替换失败会还原；新版启动未确认成功时保留 `/opt/agent2api/.before-update-*` 恢复文件并报告失败，不自动回退数据库。
 
 ### 装完之后
 
@@ -160,11 +165,13 @@ http://<服务器IP>:3065/
 
 Linux 写在 `/etc/agent2api/agent2api.env`；Windows 改服务注册表的
 `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment`（`install-service.ps1`
-已经写好基础项，重跑脚本会覆盖）。
+已经写好基础项，重跑时保留已有配置，只按显式参数修改对应项）。
 
 > **账号无法预置**：账号需要扫码 / 验证码 / 粘贴凭证，这一步由上游协议决定，
 > 绕不过去。批量部署可以把已经配好的**数据目录整个拷过去**（SQLite 库 +
 > `account.key` 在同一个目录里），账号随之迁移。
+
+**Trae 回答完整性检查（桌面端 / 服务端 / Docker）**：默认开启。只有排查兼容性误判时，才给网关进程设置 `AGENT2API_TRAE_NO_REQUIRE_TERMINAL=1`（也接受 `true` / `yes` / `on`），再重启网关让插件继承新环境。关闭后可能重新把缺少上游结束信号的半截回答当成成功；移除该变量并重启可恢复检查。此开关需要包含该修复的「提供商增强」插件。
 
 ## Docker
 
@@ -202,9 +209,79 @@ services:
 | `AGENT2API_ALLOW_NO_KEY` | 置 `1` 关闭 fail-closed（未配 Key 也放行 `/v1`，仅限纯内网） |
 | `AGENT2API_CAPTCHA_ENABLED` | 登录页人机验证：默认 `1` 开启，`0` 关闭 |
 | `AGENT2API_SELF_UPDATE` | 容器内的更新入口：默认 `1` 开启（面板可「下载并更新」）；置 `0` 关闭，只走手动升级 |
+| `AGENT2API_IMAGE_CACHE_MB` | 生成图片的内存下载缓存上限（MiB，默认 `128`，范围 8~4096）。写坏 / 越界回落默认值 |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | 会话图片压缩结果的内存缓存上限（MiB，默认 `128`，范围 8~4096，口径同上） |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 进阶：把「检查更新 / 下载更新」换成自建源。前者换仓库（默认跟上游 `aimod-cc/Agent2API`，fork 后可改），后者换 API 根（默认 `https://api.github.com`，需返回与 GitHub 同形的 release JSON）。配了自建源后，下载白名单只额外放行**该源自己的域名**（按源的 scheme：配 `http://` 就允许明文下载，仅建议本地演练/内网镜像用）|
 
 从源码构建：克隆本仓库后 `docker compose up -d --build`（镜像里只有网关与面板，不含 Rust 工具链）。
+
+### Arch / Omarchy：本机源码部署（Docker）
+
+`scripts/` 里带了一套 Arch 系（Omarchy / EndeavourOS / Manjaro 等通用）的本机部署配置，默认只把端口发布到本机回环：
+
+- `scripts/omarchy-compose.yml` —— 独立于根目录 `docker-compose.yml` 的加固版 compose：端口默认只发布到 `127.0.0.1`，宿主端口 / 容器名 / 镜像 / 容器 uid/gid 可用 `.env` 参数化，支持预置管理员与第一把网关 Key，构建阶段走宿主网络；
+- `scripts/omarchy-agent2api.sh` —— 日常操作脚本：`up` / `build` / `down` / `restart` / `status` / `logs` / `health` / `backup` / `restore` / `doctor` / `config`。
+
+前置依赖（Arch / Omarchy）：
+
+```bash
+sudo pacman -S --needed git docker docker-compose curl jq sqlite
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # 首次加入后需重新登录
+```
+
+需要换宿主端口、放开局域网或预置 Key 时，在仓库根建 `.env`（不要提交）：
+
+```ini
+AGENT2API_BIND_ADDRESS=127.0.0.1   # 要局域网访问才改成 0.0.0.0，并自行配防火墙
+AGENT2API_HOST_PORT=3065           # 宿主发布端口；被占用时换一个
+AGENT2API_UID=1000                 # 让 ./data 归当前用户；非 root 运行建议配合 AGENT2API_SELF_UPDATE=0
+AGENT2API_GID=1000
+# AGENT2API_CONTAINER_NAME=agent2api
+# AGENT2API_IMAGE=agent2api:local
+# AGENT2API_ADMIN_USER=…            # AGENT2API_ADMIN_PASSWORD=…（无人值守才预置）
+# AGENT2API_PROXY_API_KEY=sk-…      # 预置第一把网关 Key（可选）
+```
+
+启动与日常操作（脚本已自动带上 compose 文件与项目目录参数）：
+
+```bash
+scripts/omarchy-agent2api.sh up               # 构建并启动，等 /health 通过
+scripts/omarchy-agent2api.sh doctor           # 依赖 / 守护进程 / 端口占用 / 数据目录自检
+scripts/omarchy-agent2api.sh status           # 端口绑定、健康、镜像与数据目录一览
+scripts/omarchy-agent2api.sh backup           # 停服 → 打包 ./data → 起服（写到 ./backups）
+scripts/omarchy-agent2api.sh restore <归档>   # 恢复；旧数据自动改名保留
+```
+
+不想用脚本时，等价命令是 `docker compose --project-directory . -f scripts/omarchy-compose.yml up -d --build`（`--project-directory` 必须指向仓库根，否则 `.env` 与 `./data` 会落到 `scripts/` 下）。
+
+Arch 上的两个已知坑：
+
+- **构建阶段访问 GitHub 超时**：镜像构建要经 Cargo 拉取 `ProvidersPlugin/Agent2Providers` 的 git 依赖，Docker bridge 访问 GitHub 超时的机器直接构建会失败；用 `scripts/omarchy-agent2api.sh build` 先建镜像（走宿主网络 `--network host`），再 `up` 启动即可，运行时仍是普通 bridge 网络。
+- **容器内访问 GitHub 不通**（插件在线安装 / 更新失败）：已安装的插件从 `data/plugins` 加载，不影响现有账号与模型。要在线装 / 更新插件：在宿主下载插件包走面板「插件 → 上传安装」，或临时用 `--network host` 起容器完成安装。不要为此把端口发布到 `0.0.0.0`。
+
+数据都在 `./data`（SQLite 库与 `account.key` 必须成对备份；`backup` 会先停服保证一致性，`restore` 会把旧数据改名保留）。容器以 `.env` 的 uid/gid 运行时，建议同时设 `AGENT2API_SELF_UPDATE=0`（容器内自更新以 root 运行为前提，见下文「容器内更新」）。
+
+> 原生桌面与 systemd 服务端在 Arch / Omarchy 上同样可装（见上文对应章节）；但 systemd 服务以独立 `agent2api` 用户运行且 `ProtectHome=true`，依赖「导入本机登录态」的账号在这条路径上不可用 —— 需要这类账号时优先用 Docker，或在面板里粘贴凭证。
+
+### 内存占用
+
+镜像里的网关（Linux 目标）已内置 jemalloc 内存分配器。长时间运行、多账号并发转发时，它比系统自带的分配器更不容易产生内存碎片、RSS 也不容易缓慢增长 —— 这正是小内存机器最常被拖垮或 OOM 的一环。
+
+小内存机器建议给容器设一个内存上限：超限时内核杀掉进程，再由 `restart: unless-stopped` 拉起，表现为「重启一次」，而不是把宿主机（或同机其它服务）拖垮。
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+compose 用户在服务里加一行 `mem_limit: 1g`（`docker-compose.yml` 里已附注释示例）；swarm 或 `docker compose --compatibility` 用 `deploy.resources.limits.memory`。1g 只是起点，按实际并发量调。
+
+两处常驻内存的图片缓存上限都能用环境变量调小（默认各 `128` MiB）：`AGENT2API_IMAGE_CACHE_MB`（生成图片的下载缓存）、`AGENT2API_IMAGE_COMPRESS_CACHE_MB`（会话图片压缩结果缓存）。写坏或越界会回落默认值，不会让服务起不来。
+
+`MALLOC_ARENA_MAX=2` 这类 glibc 分配器调优，只对**没有内置 jemalloc 的形态**有意义（旧版镜像、自行编译的服务端、桌面端）；本镜像已不需要设它。
 
 **网页面板的功能差异**（源于「没有本机桌面客户端」）：网页登录（WorkBuddy / Qoder / Cline）、手机验证码、粘贴凭证完全可用；需要本机回调的网页登录（AutoClaw / CatPaw / Accio / CodeArts / Trae）与「导入本机登录态」不可用，请改用粘贴凭证。桌面端开着「同时开放网页管理面板」时，用浏览器访问该面板也是这一套差异 —— 同一份界面、同一套判定。
 
@@ -246,7 +323,7 @@ print(resp.choices[0].message.content)
 
 ## 局域网访问
 
-默认只监听 `127.0.0.1`。开启「设置 → 通用 → 局域网访问」后改听所有网卡，局域网设备把 API 地址指向本机 IP 即可共用（界面会给出完整地址）。出于安全，开启前必须注册面板管理员：管理接口要求管理员会话或网关 Key，无可用 Key 时转发接口同样拒绝服务（开启流程会自动补一把「默认」Key）；也可选择同时开放网页面板（默认关闭）。改动重启生效。
+默认只监听 `127.0.0.1`。开启「设置 → 通用 → 局域网访问」后改听所有网卡，局域网设备把 API 地址指向本机 IP 即可共用（界面会给出完整地址）。出于安全，开启前必须注册面板管理员：管理接口要求管理员会话或网关 Key，无可用 Key 时转发接口同样拒绝服务（开启流程会自动补一把「默认」Key）；也可选择同时开放网页面板（默认关闭）。改动重启生效。用 `scripts/omarchy-compose.yml` 部署的（见 [Docker](#docker) 的 Arch / Omarchy 一节）默认还把端口发布在回环上，要局域网访问需把 `.env` 的 `AGENT2API_BIND_ADDRESS` 设成 `0.0.0.0`。
 
 桌面端（Windows / macOS）装包里就带着网页面板那一份 `ui/`，打开「同时开放网页管理面板」后局域网设备用浏览器访问同一地址即是管理界面 —— 与 Docker 版是同一份界面；**桌面窗口自己不走网页登录**（没有登录页），它以本机第一把网关 Key 作为凭证，打开这个开关不需要你额外登录桌面端。网页登录页只在浏览器访问面板时出现。
 

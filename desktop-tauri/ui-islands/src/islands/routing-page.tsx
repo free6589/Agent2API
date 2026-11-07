@@ -1,136 +1,225 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
-import { Badge, Button, Empty, FieldGroup, Label, SegmentedControl, Spinner, cn, confirmDialog } from '@ui'
+import { Badge, Button, Empty, SegmentedControl, Spinner, confirmDialog } from '@ui'
 import { t } from '../i18n'
 import { AccountSettingsDialog } from './accounts-settings-dialog'
-import { providerOf } from './accounts-domain'
-import { GroupSettingsDialog, manualOrderBlockedMessage } from './accounts-group-settings'
-import { RoutingCanvas } from './routing-canvas'
-import { ModelGatewayLink } from './routing-links'
-import {
-  AddRouteModelDialog, AddRouteProviderDialog, ProviderRoutingDialog, RoutingSettingsDialog,
-} from './routing-settings'
-import { RoutingTracePage } from './routing-trace-page'
+import type { AccountSorting } from './accounts-shared'
+import { getStore, subscribe } from './accounts-store'
+import { adoptAccountSorting } from './accounts-sort'
+import { GroupSettingsDialog } from './accounts-group-settings'
+import { RoutingSettingsDialog } from './routing-settings'
 import { RoutingStickyDialog } from './routing-sticky'
-import {
-  accountOrder, accountOrderLocked, accountOrderRules, addModel, cloneProfile, loadWorkspace, moveAccount, patch, saveProfile,
-  selectModel, snapshot, subscribe,
-} from './routing-state'
-import { IconButton, RouteIcon } from './routing-ui'
-import { host, type ReplayRow } from './routing-types'
+import { RoutingConfigPanel } from './routing-config-panel'
+import { RoutingGroupPanel } from './routing-group-panel'
+import { RoutingCreateDialog } from './routing-create-dialog'
+import { useRouteGroups } from './routing-group-state'
+import { useRoutingAccounts } from './routing-accounts'
+import { RoutingRail } from './routing-rail'
+import { RoutingConfigShell } from './routing-canvas-layout'
+import { RoutingExecTimeline } from './routing-exec-timeline'
+import { RoutingRequestList } from './routing-request-list'
+import { useRoutingReplay } from './routing-replay-state'
+import { draftDirty, useRoutingEditor } from './routing-editor-state'
+import { RouteIcon, stickyLabel, strategyLabel } from './routing-ui'
+import { isTraceRunning, requestKey } from './routing-trace-model'
+import { bridge, errorMessage, host, type ReplayRow, type RoutingWorkspace } from './routing-types'
 
-type Modal = { kind: 'settings' | 'sticky' | 'add-model' | 'add-provider' }
-  | { kind: 'provider' | 'sort'; id: string }
-  | { kind: 'account'; id: string }
 let requestTrace: ((row?: ReplayRow | null) => void) | undefined
-
-function AccountRoutePosition({ id }: { id: string }) {
-  const state = React.useSyncExternalStore(subscribe, snapshot)
-  const account = state.workspace?.accounts.find(account => account.id === id)
-  if (!account) return null
-  const provider = providerOf(account)
-  const ids = accountOrder(provider)
-  const index = ids.indexOf(id)
-  const locked = accountOrderLocked(provider)
-  return <FieldGroup orientation='horizontal' className='field-row'>
-    <Label>{t('当前路由位置')}</Label><span className='text-xs'>{state.model || t('全局配置')} · {t('第 {n} 位', { n: index + 1 })}</span>
-    <IconButton name='arrowUp' title={t('提高优先级')} disabled={state.busy || index <= 0 || locked} onClick={() => void moveAccount(provider, id, -1)} />
-    <IconButton name='arrowDown' title={t('降低优先级')} disabled={state.busy || index >= ids.length - 1 || locked} onClick={() => void moveAccount(provider, id, 1)} />
-    <span className='detail'>{locked ? manualOrderBlockedMessage(accountOrderRules(provider)) : state.model ? t('顺序修改即时保存，仅作用于当前视图。') : t('全局顺序与账号页联动，修改即时保存。')}</span>
-  </FieldGroup>
-}
+let refreshWorkspace: (() => void) | undefined
 
 export function RoutingPage() {
-  const state = React.useSyncExternalStore(subscribe, snapshot)
-  const [modal, setModal] = React.useState<Modal | null>(null)
-  const [mode, setMode] = React.useState<'config' | 'trace'>('config')
-  const [initialTrace, setInitialTrace] = React.useState<ReplayRow | null>(null)
-  const workspace = state.workspace
+  const [mode, setMode] = React.useState<'config' | 'replay'>('config')
+  const [selected, setSelected] = React.useState<ReplayRow | null>(null)
+  const [refreshToken, setRefreshToken] = React.useState(0)
+  const sortingState = React.useSyncExternalStore(subscribe, getStore)
+  const [sortingSyncBusy, setSortingSyncBusy] = React.useState(false)
+  const [sortingError, setSortingError] = React.useState('')
+  const sortSequence = React.useRef(0)
+  const replay = useRoutingReplay(true, mode === 'config' ? '' : undefined)
+  const refreshRouting = React.useCallback(() => { replay.invalidateWorkspace(); replay.refresh() }, [replay.invalidateWorkspace, replay.refresh])
+  const editor = useRoutingEditor(refreshRouting)
+  const groups = useRouteGroups(refreshRouting, () => { void editor.load('') })
+  const accountControl = useRoutingAccounts(editor, replay.suspendWorkspace, replay.resumeWorkspace)
+  const pageEditor = { ...editor, busy: editor.busy || accountControl.busy || sortingState.sortBusy || sortingSyncBusy }
+  const busyRef = React.useRef(pageEditor.busy)
+  busyRef.current = pageEditor.busy
+  const dirtyCount = editor.dirtyCount + groups.dirtyCount
+  const [modal, setModal] = React.useState<
+    | { kind: 'sticky' }
+    | { kind: 'account' | 'sort'; id: string }
+    | { kind: 'protection'; workspace: RoutingWorkspace }
+    | { kind: 'create' }
+    | null
+  >(null)
+  const workspace = editor.draft?.workspace || replay.workspace
+  const sortSnapshot = replay.workspace?.sorting && (!workspace?.sorting || replay.workspace.sorting.updatedAt > workspace.sorting.updatedAt)
+    ? replay.workspace.sorting : workspace?.sorting
+  const sorting = sortingState.sorting && (!sortSnapshot || sortingState.sorting.updatedAt > sortSnapshot.updatedAt) ? sortingState.sorting : sortSnapshot
+  const profile = editor.draft?.mode === 'inherit' ? workspace?.inheritedProfile : editor.draft?.profile
+  const strategy = groups.draft?.group.strategy || profile?.strategy || workspace?.globalSettings?.routingStrategy || workspace?.settings.routingStrategy
+  const sticky = groups.draft?.group.sticky || profile?.sticky || workspace?.globalSettings?.routingSticky || workspace?.settings.routingSticky
+  const scopeModel = groups.draft?.group.model || editor.scope
+
+  React.useEffect(() => { void editor.load('') }, [editor.load])
+  React.useEffect(() => { if (sortSnapshot) adoptAccountSorting(sortSnapshot) }, [sortSnapshot])
   React.useEffect(() => {
-    requestTrace = row => { setModal(null); setInitialTrace(row || null); setMode('trace') }
-    return () => { requestTrace = undefined }
-  }, [])
+    if (!replay.workspace || accountControl.busy || editor.busy || sortingState.sortBusy || sortingSyncBusy) return
+    editor.syncAccounts(replay.workspace.accounts, replay.workspace.updatedAt)
+    editor.syncWorkspace(replay.workspace)
+    editor.syncSorting(replay.workspace.sorting)
+  }, [replay.workspace, accountControl.busy, editor.busy, sortingState.sortBusy, sortingSyncBusy, editor.syncAccounts, editor.syncWorkspace, editor.syncSorting])
+  const reloadSorting = React.useCallback(async () => {
+    const id = ++sortSequence.current
+    busyRef.current = true
+    replay.invalidateWorkspace()
+    setSortingSyncBusy(true); setSortingError('')
+    try {
+      const next = await bridge().getRoutingWorkspace()
+      if (id !== sortSequence.current) return
+      editor.syncAccounts(next.accounts, next.updatedAt)
+      editor.syncWorkspace(next)
+      editor.syncSorting(next.sorting)
+      adoptAccountSorting(next.sorting)
+    } catch (failure) {
+      if (id === sortSequence.current) setSortingError(t('消耗规则已保存，但路由列表刷新失败：{error}', { error: errorMessage(failure) }))
+    } finally {
+      if (id === sortSequence.current) { setSortingSyncBusy(false); refreshRouting() }
+    }
+  }, [editor.syncAccounts, editor.syncWorkspace, editor.syncSorting, replay.invalidateWorkspace, refreshRouting])
   React.useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (!document.hidden && mode === 'config' && host().wbApp?.currentPage === 'routing' && !state.busy && !modal) void loadWorkspace(true)
-    }, 3000)
-    return () => window.clearInterval(timer)
-  }, [modal, state.busy, mode])
-  const closeModal = () => { setModal(null); void loadWorkspace(true) }
-  const configured = workspace?.configuredModels || []
-  const models = state.model && !configured.some(model => model.toLowerCase() === state.model.toLowerCase()) ? [...configured, state.model] : configured
-  const reset = async () => {
-    const model = state.model
-    if (!await confirmDialog(model ? t('确定删除「{model}」的独立路由配置？删除后该模型将使用全局路由。不会删除模型、账号或请求记录。', { model })
-      : t('解除全局路由的参与范围限制，继续使用与账号页共用的手动顺序和自动消耗规则；模型独立配置保持不变。'), {
-      title: model ? t('删除独立路由') : t('恢复默认路由'), confirmText: model ? t('删除') : t('恢复'), destructive: Boolean(model),
-    })) return
-    if (await saveProfile(null, model) && model && snapshot().model === model) await selectModel('')
+    const changed = (event: Event) => {
+      const next = (event as CustomEvent<AccountSorting>).detail
+      if (!next?.rules || !next.accountOrder) return
+      void reloadSorting()
+    }
+    window.addEventListener('wb:account-sorting', changed)
+    return () => { sortSequence.current++; window.removeEventListener('wb:account-sorting', changed) }
+  }, [reloadSorting])
+  React.useEffect(() => {
+    if (mode !== 'replay' || !selected || !isTraceRunning(selected)) return
+    let alive = true
+    let pending = false
+    const timer = window.setInterval(async () => {
+      if (pending || document.hidden || host().wbApp?.currentPage !== 'routing') return
+      pending = true
+      try {
+        const next = await bridge().getRoutingTraceRequest({ id: selected.id, ts: selected.ts })
+        if (alive) setSelected(current => current && requestKey(current) === requestKey(next) ? next : current)
+      } catch { /* 下个周期再试 */ }
+      finally { pending = false }
+    }, 2500)
+    return () => { alive = false; window.clearInterval(timer) }
+  }, [mode, selected?.id, selected?.ts, selected && isTraceRunning(selected)])
+
+  const openRequest = (row: ReplayRow) => { setSelected(row); setMode('replay') }
+  const openScope = (model: string) => {
+    if (busyRef.current || groups.busy) return
+    const group = Object.values(groups.drafts).find(draft => draft.group.model.toLowerCase() === model.toLowerCase())
+    groups.select(group?.group.id || '')
+    if (!group) void editor.load(model)
   }
-  const openReplay = () => { setInitialTrace(null); setMode('trace') }
+  const openConfig = (model: string) => { setMode('config'); openScope(model) }
+  const refreshReplay = async () => {
+    replay.refresh()
+    setRefreshToken(value => value + 1)
+    if (!selected) return
+    try {
+      const next = await bridge().getRoutingTraceRequest({ id: selected.id, ts: selected.ts })
+      setSelected(current => current && requestKey(current) === requestKey(next) ? next : current)
+    } catch { /* 列表下次刷新会带回新状态 */ }
+  }
+  const close = () => { setModal(null); refreshRouting() }
+  const reloadConfig = async () => {
+    replay.refresh()
+    if (groups.selected) { await groups.reload(); return }
+    if (editor.draft && draftDirty(editor.draft)
+      && !await confirmDialog(t('重新读取会丢弃当前范围的未保存草稿，其他范围的草稿保留。'), { title: t('重新读取配置'), confirmText: t('重新读取') })) return
+    void editor.load(editor.scope, true)
+  }
+  React.useEffect(() => {
+    requestTrace = row => { if (row) setSelected({ ...row }); setMode('replay') }
+    refreshWorkspace = replay.refresh
+    return () => { requestTrace = undefined; refreshWorkspace = undefined }
+  }, [replay.refresh])
+
+  const groupModels = Object.values(groups.drafts).map(draft => draft.group.model)
+  const reserved = [...(workspace?.models || []), ...(workspace?.configuredModels || []), ...Object.keys(editor.drafts),
+    ...(groups.data?.catalog || []).map(choice => choice.model), ...groupModels]
+  const rail = <RoutingRail editor={pageEditor} groups={groups} workspace={workspace} onModel={openScope} onGroup={id => { if (!busyRef.current) groups.select(id) }}
+    onAdd={() => setModal({ kind: 'create' })} />
+  const accountSettings = (id: string) => {
+    if (busyRef.current) return
+    setModal({ kind: 'account', id })
+  }
+  const groupSettings = (id: string) => {
+    if (busyRef.current || groups.busy) return
+    if (sorting) adoptAccountSorting(sorting)
+    setModal({ kind: 'sort', id })
+  }
+
   return <>
-    <div className='routing-modebar'><SegmentedControl aria-label={t('路由视图')} value={mode} onValueChange={value => { closeModal(); setMode(value) }} options={[
-      { value: 'config', label: <><RouteIcon name='settings' />{t('路由配置')}</> },
-      { value: 'trace', label: <><RouteIcon name='requests' />{t('请求跟踪')}</> },
-    ]} /><span>{mode === 'config' ? t('配置请求的参与范围与优先顺序') : t('查看实际请求的选路、尝试与结果')}</span></div>
-    <div className='routing-config-view' hidden={mode !== 'config'}>
-    {state.error ? <div className='routing-page-error' role='alert'><RouteIcon name='info' /><span>{state.error}</span><Button variant='ghost' size='sm' onClick={() => void loadWorkspace()}>{t('重试')}</Button></div> : null}
-    <div className='routing-workspace'>
-      {workspace ? <ModelGatewayLink model={state.model} zoom={state.zoom} revision={workspace.updatedAt} running={(workspace.metrics.running || 0) > 0} /> : null}
-      <aside className='routing-model-rail'>
-        <div className='routing-model-head'><span>{t('模型路由')}</span><IconButton name='plus' title={t('新增模型独立路由')} disabled={!workspace || state.busy} onClick={() => setModal({ kind: 'add-model' })} /></div>
-        <Button variant='ghost' className={cn('routing-model-item', !state.model && 'is-selected')} disabled={state.busy} onClick={() => void selectModel('')}>
-          <span className='routing-model-mark'><RouteIcon name='route' size={18} /></span><span><b>{t('全局配置')}</b><em>{t('未配置模型的默认路由')}</em></span>{!state.model ? <span className='routing-model-dot' /> : null}
-        </Button>
-        <div className='routing-model-divider'>{t('模型独立配置')}<Badge variant='secondary' shape='tag'>{configured.length}</Badge></div>
-        <div className='routing-model-list'>{models.map(model => <Button key={model} variant='ghost' className={cn('routing-model-item', state.model.toLowerCase() === model.toLowerCase() && 'is-selected')} disabled={state.busy} onClick={() => void selectModel(model)}>
-          <span className='routing-model-mark'><RouteIcon name='gateway' size={17} /></span><span><b title={model}>{model}</b><em>{configured.includes(model) ? t('独立路由') : t('继承全局')}</em></span>
-          {state.model.toLowerCase() === model.toLowerCase() ? <span className='routing-model-dot' /> : null}
-        </Button>)}</div>
-        <Button variant='ghost' className='routing-add-model' disabled={!workspace || state.busy} onClick={() => setModal({ kind: 'add-model' })}><span>＋</span>{t('新增模型')}</Button>
-        <div className='routing-model-help'><RouteIcon name='info' /><p>{t('切换模型后，右侧只展示该模型的提供商与账号路由。')}</p></div>
-      </aside>
-      <div className='routing-map-area'>
-        <div className='routing-map-head'>
-          <div className='routing-map-title'>
-            <b>{state.model || t('全局配置')}</b>
-            <Badge variant='brand' shape='tag'>{state.model ? workspace?.customized ? t('独立配置') : t('继承全局') : workspace?.globalCustomized ? t('全局配置') : t('默认路由')}</Badge>
-            {state.busy ? <span className='routing-save-state'><Spinner className='size-3' />{t('保存中…')}</span> : null}
-          </div>
-          <div className='routing-map-actions'>
-            {state.model && !workspace?.customized ? <Button variant='outline' size='sm' disabled={!workspace || state.busy} onClick={() => void saveProfile(cloneProfile())}>{t('创建独立配置')}</Button> : null}
-            <Button variant='outline' size='sm' disabled={!workspace} onClick={openReplay}>
-              <RouteIcon name='requests' /><span>{t('请求跟踪')}</span>
-            </Button>
-            <Button variant='outline' size='sm' disabled={!workspace} onClick={() => setModal({ kind: 'sticky' })}>
-              <RouteIcon name='route' /><span>{t('会话粘滞')}</span>
-              {workspace ? <Badge variant='secondary' shape='tag'>{workspace.stickyCount}</Badge> : null}
-            </Button>
-            <Button variant='outline' size='sm' disabled={!workspace} onClick={() => setModal({ kind: 'settings' })}>
-              <RouteIcon name='settings' /><span>{t('设置')}</span>
-            </Button>
-            <IconButton name='refresh' title={t('刷新路由')} disabled={state.loading || state.busy} onClick={() => void loadWorkspace()} />
-            <Button variant='ghost' size='sm' className={cn(state.model && 'text-destructive')} disabled={!workspace || state.busy || !(state.model ? workspace.customized : workspace.globalCustomized)} onClick={() => void reset()}>{state.model ? t('删除') : t('恢复默认')}</Button>
-          </div>
-        </div>
-        {workspace ? <RoutingCanvas workspace={workspace} search={state.search} zoom={state.zoom} selected={state.selectedProvider}
-          onAccount={id => setModal({ kind: 'account', id })} onProvider={id => setModal({ kind: 'provider', id })}
-          onSettings={() => setModal({ kind: 'settings' })} onAddProvider={() => setModal({ kind: 'add-provider' })}
-          onSticky={() => setModal({ kind: 'sticky' })} onReplay={openReplay} />
-          : <div className='routing-loading'><Empty>{state.loading ? <><Spinner />{t('正在读取路由…')}</> : t('路由工作台不可用')}</Empty></div>}
-        <div className='routing-map-foot'><span>{state.model ? t('拖动提供商与账号调整顺序，修改即时保存。') : t('全局顺序与账号页联动，修改即时保存。')}</span><span>{t('队列为无会话预演；实际粘性命中和重试顺延以回放为准。')}</span><div><Button variant='ghost' size='sm' aria-label={t('缩小画布')} disabled={state.zoom <= 0.7} onClick={() => patch({ zoom: Math.max(0.7, state.zoom - 0.1) })}>−</Button><Button variant='ghost' size='sm' onClick={() => patch({ zoom: 1 })}>{Math.round(state.zoom * 100)}%</Button><Button variant='ghost' size='sm' aria-label={t('放大画布')} disabled={state.zoom >= 1.4} onClick={() => patch({ zoom: Math.min(1.4, state.zoom + 0.1) })}>＋</Button></div></div>
+    <div className='routing-page-bar'>
+      <SegmentedControl aria-label={t('路由模式')} value={mode} onValueChange={setMode} options={[
+        { value: 'config', label: <><RouteIcon name='route' />{t('路由配置')}{dirtyCount ? <Badge variant='warning' shape='tag'>{dirtyCount}</Badge> : null}</> },
+        { value: 'replay', label: <><RouteIcon name='requests' />{t('请求回放')}</> },
+      ]} />
+      <span className='routing-page-policy'>{mode === 'config'
+        ? workspace ? `${groups.draft && strategy === 'provider' ? t('成员内轮询') : strategyLabel(strategy)} · ${t('粘滞 {mode}', { mode: stickyLabel(sticky) })}` : ''
+        : t('历史只读，不影响当前配置')}</span>
+      <div className='routing-page-actions'>
+        {mode === 'replay' ? <Button variant='ghost' size='sm' onClick={() => host().wbApp?.showPage('requests')}><RouteIcon name='requests' />{t('请求日志')}</Button> : null}
+        <Button variant='ghost' size='sm' onClick={() => setModal({ kind: 'sticky' })}><RouteIcon name='lock' />{t('会话粘滞')}</Button>
+        {mode === 'replay'
+          ? <Button variant='ghost' size='sm' disabled={replay.loading} onClick={() => void refreshReplay()}><RouteIcon name='refresh' />{t('刷新')}</Button>
+          : <Button variant='ghost' size='sm' disabled={editor.loading || pageEditor.busy || groups.loading || groups.busy} onClick={() => void reloadConfig()}><RouteIcon name='refresh' />{t('重新读取')}</Button>}
       </div>
     </div>
-    </div>
-    <div className='routing-trace-view' hidden={mode !== 'trace'}><RoutingTracePage active={mode === 'trace'} initialRow={initialTrace} onConfig={model => { void selectModel(model); setMode('config') }} /></div>
-    {workspace && modal?.kind === 'settings' ? <RoutingSettingsDialog workspace={workspace} onClose={closeModal} /> : null}
-    {workspace && modal?.kind === 'provider' ? <ProviderRoutingDialog key={`${state.model}:${modal.id}`} provider={modal.id} workspace={workspace} onSort={() => setModal({ kind: 'sort', id: modal.id })} onClose={closeModal} /> : null}
-    {workspace && modal?.kind === 'sort' ? <GroupSettingsDialog provider={modal.id} onClose={closeModal} /> : null}
-    {workspace && modal?.kind === 'add-provider' ? <AddRouteProviderDialog workspace={workspace} onClose={closeModal} /> : null}
-    {workspace && modal?.kind === 'add-model' ? <AddRouteModelDialog workspace={workspace} onAdd={addModel} onClose={closeModal} /> : null}
-    {modal?.kind === 'sticky' ? <RoutingStickyDialog model={state.model} onClose={closeModal} /> : null}
-    {workspace && modal?.kind === 'account' ? <AccountSettingsDialog key={modal.id} id={modal.id} initialAccount={workspace.accounts.find(account => account.id === modal.id)}
-      routeContext={<AccountRoutePosition id={modal.id} />} onClose={() => { closeModal(); void loadWorkspace() }} /> : null}
+
+    {replay.error && mode === 'replay' ? <div className='routing-page-error' role='alert'>
+      <RouteIcon name='info' /><span>{replay.error}</span><Button variant='ghost' size='sm' onClick={replay.refresh}>{t('重试')}</Button>
+    </div> : null}
+
+    {mode === 'config' ? <div className='routing-config-view'>
+      {editor.error && !editor.draft ? <div className='routing-page-error' role='alert'>
+        <RouteIcon name='info' /><span>{editor.error}</span><Button variant='ghost' size='sm' onClick={() => void editor.load(editor.scope, true)}>{t('重新读取')}</Button>
+      </div> : null}
+      {sortingError ? <div className='routing-page-error' role='alert'><RouteIcon name='info' /><span>{sortingError}</span>
+        <Button variant='ghost' size='sm' disabled={sortingSyncBusy} onClick={() => void reloadSorting()}>{t('重试')}</Button></div> : null}
+      <RoutingConfigShell>
+        {rail}
+        {groups.selected ? <RoutingGroupPanel key={groups.selected} editor={groups} accounts={replay.workspace?.accounts || workspace?.accounts || []}
+          reserved={reserved} baseUrl={host().wbPortPanel?.gatewayBase() || `http://127.0.0.1:${workspace?.gateway.port || 3065}`}
+          onAccount={accountSettings} sorting={sorting} now={replay.now} onSort={groupSettings} /> :
+          <RoutingConfigPanel key={editor.scope} editor={pageEditor} scope={editor.scope} now={replay.now} accountControl={accountControl} onScope={openScope}
+            onAccount={accountSettings} onSort={groupSettings}
+            onProtection={workspace => setModal({ kind: 'protection', workspace })} />}
+      </RoutingConfigShell>
+    </div> : <div className='routing-replay-layout'>
+      <aside className='routing-request-rail'>
+        <RoutingRequestList active query={replay.query} selectedKey={selected ? requestKey(selected) : ''} refreshToken={refreshToken}
+          onOpenRequest={openRequest} onModel={replay.selectModel} onMinutes={replay.setMinutes} onScope={replay.setScope} onSearch={replay.setSearch} />
+      </aside>
+      <section className='routing-replay-main'>
+        {selected ? <RoutingExecTimeline key={requestKey(selected)} row={selected} now={replay.now}
+          onDetail={row => host().wbRequestDetail?.open(row.id, row)} onConfig={openConfig} />
+          : <Empty>{replay.loading ? <Spinner /> : t('选择左侧请求查看选路过程')}</Empty>}
+      </section>
+    </div>}
+
+    {modal?.kind === 'create' && workspace && groups.data ? <RoutingCreateDialog workspace={workspace} choices={groups.data.catalog}
+      accounts={replay.workspace?.accounts || workspace.accounts} reserved={reserved} groupModels={groupModels}
+      disabled={pageEditor.busy || editor.loading || groups.busy || groups.loading} modelError={editor.error} onClose={() => setModal(null)}
+      onCreateModel={async model => { const created = await editor.create(model); if (created) groups.select(''); return created }}
+      onCreateGroup={groups.create} /> : null}
+    {modal?.kind === 'sticky' ? <RoutingStickyDialog model={mode === 'config' ? scopeModel : replay.model} onClose={close} /> : null}
+    {modal?.kind === 'protection' ? <RoutingSettingsDialog protectionOnly workspace={modal.workspace} onClose={close} /> : null}
+    {modal?.kind === 'sort' ? <GroupSettingsDialog key={modal.id} provider={modal.id} onClose={close}
+      accounts={workspace?.accounts} sorting={sorting}
+      routeContext={groups.selected || editor.scope && editor.draft?.mode !== 'inherit'
+        ? <p className='routing-config-note'>{t('这里调整的是账号组的全局消耗规则；当前独立路由的账号顺序保持不变。')}</p> : undefined} /> : null}
+    {modal?.kind === 'account' ? <AccountSettingsDialog key={modal.id} id={modal.id} initialAccount={replay.workspace?.accounts.find(account => account.id === modal.id) || workspace?.accounts.find(account => account.id === modal.id)} onClose={close}
+      routeContext={<p className='routing-config-note'>{t('账号设置与所有路由共用，不改变当前路由的参与名单。')}</p>} /> : null}
   </>
 }
 
@@ -140,23 +229,10 @@ function mount() {
   if (!section || section.dataset.routingMounted === '1') return
   section.dataset.routingMounted = '1'
   createRoot(section).render(<RoutingPage />)
-  if (host().wbApp?.currentPage === 'routing') void loadWorkspace()
 }
-declare global {
-  interface Window {
-    wbRoutingPanel?: {
-      load(): Promise<void>
-      openReplay(row?: ReplayRow | null): Promise<void>
-    }
-  }
-}
+declare global { interface Window { wbRoutingPanel?: { load(): Promise<void>; openReplay(row?: ReplayRow | null): Promise<void> } } }
 window.wbRoutingPanel = {
-  load: () => loadWorkspace(),
-  async openReplay(row) {
-    host().wbRequestDetail?.close?.()
-    host().wbApp?.showPage('routing')
-    requestTrace?.(row)
-  },
+  async load() { refreshWorkspace?.() },
+  async openReplay(row) { host().wbRequestDetail?.close?.(); host().wbApp?.showPage('routing'); requestTrace?.(row) },
 }
-if (document.querySelector(selector)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+mountOnPage('routing', selector, mount)

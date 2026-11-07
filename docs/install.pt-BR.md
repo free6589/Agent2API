@@ -83,7 +83,11 @@ Stop-Service Agent2API
 .\install-service.ps1 -Uninstall
 ```
 
-**Atualização**: extraia a versão nova e rode `install-service.ps1` de novo (ele para o serviço, sobrescreve programa e UI e inicia outra vez; dados e configuração ficam intactos).
+**Atualização com um clique**: instalações padrão como serviço Windows oferecem essa opção em Configurações → Atualizações. Após confirmar, o pacote Windows x64 é baixado e validado independentemente pelo hash oficial. Um processo temporário para o serviço, aguarda a liberação dos arquivos, faz backup, substitui e reinicia. A página é recarregada após confirmar a nova versão; contas, configurações e dados são preservados.
+
+**Instalações antigas / atualização manual**: extraia o pacote novo em outra pasta e execute `install-service.ps1` uma vez como administrador. Caminhos de instalação e dados, portas, variáveis e conta de serviço são preservados por padrão. Somente opções explícitas, como a porta, substituem os valores existentes; migração de diretórios é separada. Depois disso, use o painel para atualizar.
+
+Somente SYSTEM e administradores podem gravar os arquivos do programa. A pasta de trabalho é `<pasta de instalação>\.service-update`; nenhum serviço permanente é adicionado. Use `AGENT2API_WINDOWS_UPDATE=0` no ambiente do serviço para desativar a opção. Contas personalizadas, links de diretório, caminhos de rede e ambientes gerenciados por jobs externos continuam com atualização manual, sem elevação automática. Falhas na substituição restauram os arquivos antigos; falhas na inicialização preservam logs e backups sem reverter o banco de dados.
 
 > **Duas armadilhas específicas do Windows que o script já resolve**:
 > o diretório de trabalho de um processo de serviço é `C:\Windows\system32`, não a pasta do exe — o diretório da UI é localizado a partir do caminho do exe, então nada muda; o diretório de dados é gravado explicitamente na entrada de registro do serviço como `AGENT2API_PROXY_HOME` (sem isso os dados cairiam em `C:\Windows\system32\config\systemprofile` do LocalSystem, onde ninguém acharia).
@@ -114,7 +118,11 @@ journalctl -u agent2api -f
 
 Início no boot, reinício automático após travamento (`Restart=always`) e desligamento gracioso no SIGTERM (espera as requisições em andamento, então conexões SSE longas não são cortadas) já vêm configurados. Depois de editar `/etc/agent2api/agent2api.env`, rode `systemctl restart agent2api`.
 
-> **Não ative `AGENT2API_SELF_UPDATE` em máquina física**: aquele é o mecanismo de dentro do contêiner (troca arquivos, encerra e deixa a política de restart do contêiner subir de novo). Em máquina física os arquivos do programa pertencem ao root e a conta do serviço não pode substituí-los; a unidade já o define como `0` explicitamente. Atualize com `install.sh --upgrade`.
+> **Atualização systemd com um clique**: instalações padrão incluem um programa de atualização restrito. Após confirmar no painel, ele baixa, valida independentemente o checksum oficial, faz backup e substitui os arquivos, reinicia e confirma o novo serviço. Contas e configurações são preservadas; o gateway continua sem privilégios e os arquivos do programa permanecem protegidos pelo root.
+>
+> Em instalações antigas, baixe um novo pacote do servidor que inclua esse recurso e execute `sudo bash install.sh --upgrade` uma vez na pasta extraída para instalar o componente. Contas de serviço ou caminhos personalizados não são sobrescritos; mantenha seu procedimento de implantação. Use `AGENT2API_SYSTEMD_UPDATE=0` para desativar a opção no painel, ou desative `agent2api-updater.socket` para desativar o componente. `AGENT2API_SELF_UPDATE` continua exclusivo do Docker.
+>
+> O componente usa um socket local, sem abrir portas de rede. Por padrão, valida o repositório de releases pelo índice oficial. Para fixar um repositório ou configurar um proxy para a validação independente, configure `AGENT2API_UPDATER_REPO=owner/repo` ou `HTTPS_PROXY` em `/etc/agent2api/updater.env`. Falhas na substituição restauram os arquivos antigos. Se a nova inicialização não for confirmada, os arquivos de recuperação ficam em `/opt/agent2api/.before-update-*` e a falha é informada; o banco de dados nunca é revertido automaticamente.
 
 ### Depois de instalar
 
@@ -145,9 +153,11 @@ Tanto o administrador quanto a chave de gateway podem ser predefinidos por vari�
 | `AGENT2API_LOG_FILE` | Caminho do arquivo de log; padrão `{diretório de dados}/logs/server.log` |
 | `AGENT2API_VERBOSE` | `1` ativa o log de debug |
 
-No Linux coloque-as em `/etc/agent2api/agent2api.env`; no Windows edite a chave de registro do serviço `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment` (o `install-service.ps1` já grava o básico ali; rodar o script de novo sobrescreve).
+No Linux coloque-as em `/etc/agent2api/agent2api.env`; no Windows edite a chave de registro do serviço `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment` (o `install-service.ps1` grava as configurações básicas e, nas execuções seguintes, preserva as existentes, alterando apenas as opções informadas explicitamente como parâmetros).
 
 > **Contas não podem ser predefinidas**: elas exigem leitura de QR code / código por SMS / credenciais coladas, o que é decidido pelos protocolos do upstream — não há como contornar. Para implantação em massa, copie um **diretório de dados** já configurado (o banco SQLite e o `account.key` ficam lado a lado) e as contas vão junto.
+
+**Verificação de integridade da resposta do Trae (desktop / servidor / Docker)**: ativada por padrão. Somente ao investigar falsos positivos de compatibilidade, defina `AGENT2API_TRAE_NO_REQUIRE_TERMINAL=1` no ambiente do processo do gateway (`true`, `yes` e `on` também são aceitos) e reinicie o gateway para que o plugin herde o novo ambiente. Desativá-la pode voltar a aceitar respostas parciais sem o sinal de conclusão do upstream como bem-sucedidas; remova a variável e reinicie para restaurar a verificação. Essa opção exige o pacote de provedores que contém esta correção.
 
 ## Docker
 
@@ -185,9 +195,79 @@ Variáveis de ambiente (todas opcionais):
 | `AGENT2API_ALLOW_NO_KEY` | `1` desativa o fail-closed (serve `/v1` mesmo sem chave configurada — só para redes internas) |
 | `AGENT2API_CAPTCHA_ENABLED` | Widget de verificação humana na tela de login: `1` ativado (padrão), `0` desativado |
 | `AGENT2API_SELF_UPDATE` | Ponto de atualização dentro do contêiner: `1` ativado por padrão (o painel oferece "Baixar e atualizar"); `0` desativa e deixa apenas a atualização manual |
+| `AGENT2API_IMAGE_CACHE_MB` | Limite do cache em memória de download das imagens geradas (MiB, padrão `128`, faixa 8–4096). Valores inválidos ou fora da faixa voltam ao padrão |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | Limite do cache em memória do resultado da compactação de imagens de sessão (MiB, padrão `128`, faixa 8–4096, mesmas regras) |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Avançado: aponte "verificar atualizações / baixar atualizações" para a sua própria fonte. O primeiro troca o repositório (por padrão segue o upstream `aimod-cc/Agent2API`; em fork, sobrescreva), o segundo troca a raiz da API (padrão `https://api.github.com`; deve devolver um JSON de release no formato do GitHub). Com uma fonte própria configurada, a lista de permissões de download passa a aceitar, além disso, apenas **o próprio host dessa fonte** (o esquema segue a fonte: uma fonte `http://` também permite download em texto puro — só para ensaios locais / espelhos internos) |
 
 Compilar a partir do código: clone o repositório e rode `docker compose up -d --build` (a imagem contém apenas o gateway e o painel, sem toolchain Rust).
+
+### Arch / Omarchy: implantação local a partir do código (Docker)
+
+`scripts/` traz um conjunto de implantação local para sistemas baseados em Arch (Omarchy / EndeavourOS / Manjaro, entre outros), que publica a porta apenas na interface de loopback:
+
+- `scripts/omarchy-compose.yml` — um compose reforçado, independente do `docker-compose.yml` da raiz: a porta é publicada somente em `127.0.0.1`; porta do host / nome do contêiner / imagem / uid/gid do contêiner podem ser parametrizados via `.env`; pré-configuração do administrador e da primeira chave de gateway é suportada; o build usa a rede do host;
+- `scripts/omarchy-agent2api.sh` — utilitário do dia a dia: `up` / `build` / `down` / `restart` / `status` / `logs` / `health` / `backup` / `restore` / `doctor` / `config`.
+
+Pré-requisitos (Arch / Omarchy):
+
+```bash
+sudo pacman -S --needed git docker docker-compose curl jq sqlite
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # após entrar no grupo, faça login novamente
+```
+
+Para trocar a porta do host, abrir a rede local ou pré-configurar chaves, crie um `.env` na raiz do repositório (não o versione):
+
+```ini
+AGENT2API_BIND_ADDRESS=127.0.0.1   # só mude para 0.0.0.0 se precisar de acesso pela rede local, e configure o firewall por conta própria
+AGENT2API_HOST_PORT=3065           # porta publicada no host; escolha outra se estiver em uso
+AGENT2API_UID=1000                 # mantém ./data sob o seu usuário; para não root, combine com AGENT2API_SELF_UPDATE=0
+AGENT2API_GID=1000
+# AGENT2API_CONTAINER_NAME=agent2api
+# AGENT2API_IMAGE=agent2api:local
+# AGENT2API_ADMIN_USER=…            # AGENT2API_ADMIN_PASSWORD=… (somente para implantações não assistidas)
+# AGENT2API_PROXY_API_KEY=sk-…      # pré-configura a primeira chave de gateway (opcional)
+```
+
+Início e operação diária (o script já passa o arquivo de compose e o diretório de projeto):
+
+```bash
+scripts/omarchy-agent2api.sh up                  # compila e inicia, aguardando /health
+scripts/omarchy-agent2api.sh doctor              # dependências / daemon / conflito de portas / autodiagnóstico do diretório de dados
+scripts/omarchy-agent2api.sh status              # vínculo da porta, saúde, imagem e diretório de dados de relance
+scripts/omarchy-agent2api.sh backup              # para → arquiva ./data → reinicia (grava em ./backups)
+scripts/omarchy-agent2api.sh restore <arquivo>   # restaura; os dados antigos são renomeados e preservados
+```
+
+Sem o utilitário, o comando equivalente é `docker compose --project-directory . -f scripts/omarchy-compose.yml up -d --build` (`--project-directory` precisa apontar para a raiz do repositório, senão `.env` e `./data` caem dentro de `scripts/`).
+
+Duas armadilhas conhecidas no Arch:
+
+- **GitHub inacessível durante o build**: a construção da imagem baixa a dependência git `ProvidersPlugin/Agent2Providers` via Cargo, então máquinas cuja bridge do Docker não alcança o GitHub falham no build simples; rode antes `scripts/omarchy-agent2api.sh build` (compila na rede do host, `--network host`) e depois `up`. Em execução a rede continua sendo uma bridge comum.
+- **GitHub inacessível dentro do contêiner** (falha na instalação/atualização online de plugins): os plugins instalados carregam de `data/plugins`, então contas e modelos existentes continuam funcionando. Para instalar/atualizar um plugin online: baixe o pacote do plugin no host e use o painel "Plugins → enviar e instalar", ou inicie o contêiner temporariamente com `--network host`. Não publique a porta em `0.0.0.0` por causa disso.
+
+Todo o estado fica em `./data` (o banco SQLite e o `account.key` devem ser copiados em par; o `backup` para o serviço antes, por consistência, e o `restore` renomeia os dados antigos à parte). Quando o contêiner roda com uid/gid do `.env`, defina também `AGENT2API_SELF_UPDATE=0` (a autoratualização dentro do contêiner pressupõe root, veja "Atualização dentro do contêiner" abaixo).
+
+> O app desktop nativo e o servidor systemd também podem ser instalados no Arch / Omarchy (veja as seções acima); porém o serviço systemd roda como um usuário dedicado `agent2api` com `ProtectHome=true`, então contas que dependem de "importar estado de login do desktop" não funcionam nesse caminho — prefira o Docker ou cole as credenciais no painel.
+
+### Uso de memória
+
+O gateway da imagem (alvos Linux) já vem com o alocador jemalloc embutido. Em execuções longas e com vários encaminhamentos de contas em paralelo ele fragmenta bem menos que o alocador do sistema, e o RSS deixa de subir aos poucos — que é justamente onde máquinas com pouca memória costumam travar ou ser mortas por OOM.
+
+Em máquinas com pouca memória, vale limitar a memória do contêiner: ao ultrapassar, o kernel mata o processo e o `restart: unless-stopped` o levanta de novo — o resultado é "um reinício" em vez de derrubar o host (ou outros serviços na mesma máquina).
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+No compose, adicione `mem_limit: 1g` ao serviço (há um exemplo comentado no `docker-compose.yml`); em swarm ou `docker compose --compatibility`, use `deploy.resources.limits.memory`. Encare o 1g como ponto de partida e ajuste à sua concorrência.
+
+Os dois caches de imagem mantidos em memória podem ser reduzidos por variável de ambiente (128 MiB cada por padrão): `AGENT2API_IMAGE_CACHE_MB` (cache de download das imagens geradas) e `AGENT2API_IMAGE_COMPRESS_CACHE_MB` (cache do resultado da compactação de imagens de sessão). Valores inválidos ou fora da faixa voltam ao padrão e nunca impedem a inicialização.
+
+Ajustes de alocador glibc como `MALLOC_ARENA_MAX=2` só fazem sentido em builds **sem** jemalloc (imagens antigas, servidor compilado por você, desktop); esta imagem não precisa disso.
 
 **Diferenças de recursos no painel web** (decorrem de "não haver cliente de desktop local"): login pela web (WorkBuddy / Qoder / Cline), código por SMS e credenciais coladas funcionam plenamente; logins pela web que exigem callback nesta máquina (AutoClaw / CatPaw / Accio / CodeArts / Trae) e a "importação do estado de login local" não estão disponíveis — use credenciais coladas. Com o desktop e a opção de expor o painel ativadas, abrir no navegador mostra as mesmas diferenças: uma interface, um conjunto de regras.
 
@@ -229,7 +309,7 @@ print(resp.choices[0].message.content)
 
 ## Acesso pela rede local
 
-Por padrão o gateway escuta apenas `127.0.0.1`. Ao ativar "Configurações → Geral → Acesso pela rede local" ele passa a escutar todos os adaptadores e os dispositivos da rede só precisam apontar o endereço da API para o IP desta máquina (a interface mostra o endereço completo). Por segurança, é obrigatório registrar um administrador do painel antes de ativar: a API de gerenciamento passa a exigir sessão de administrador ou uma Gateway Key e, sem chave ativa, a API de encaminhamento também recusa (o fluxo cria uma chave "padrão" automaticamente). O painel web pode ser exposto à rede local opcionalmente (fechado por padrão). As mudanças valem após reiniciar.
+Por padrão o gateway escuta apenas `127.0.0.1`. Ao ativar "Configurações → Geral → Acesso pela rede local" ele passa a escutar todos os adaptadores e os dispositivos da rede só precisam apontar o endereço da API para o IP desta máquina (a interface mostra o endereço completo). Por segurança, é obrigatório registrar um administrador do painel antes de ativar: a API de gerenciamento passa a exigir sessão de administrador ou uma Gateway Key e, sem chave ativa, a API de encaminhamento também recusa (o fluxo cria uma chave "padrão" automaticamente). O painel web pode ser exposto à rede local opcionalmente (fechado por padrão). As mudanças valem após reiniciar. Implantações que usam `scripts/omarchy-compose.yml` (veja a subseção Arch / Omarchy em [Docker](#docker)) publicam a porta apenas no loopback por padrão; para acesso pela rede local, defina `AGENT2API_BIND_ADDRESS=0.0.0.0` no `.env`.
 
 Os instaladores de desktop (Windows / macOS) já incluem a pasta `ui/` do painel web: ao ativar também a opção de expor o painel de gerenciamento à rede local, dispositivos da rede podem abrir o mesmo endereço no navegador e ver a interface de gerenciamento — a mesma interface da versão Docker. **A janela do desktop em si nunca passa pelo login web** (não existe página de login no app): ela se autentica com a primeira Gateway Key desta máquina, então ligar esse interruptor não pede login no app. A página de login web só aparece quando um navegador abre o painel.
 

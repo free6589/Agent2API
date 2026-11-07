@@ -22,7 +22,7 @@ Agent2API は **AI ルーティングゲートウェイと Agent クライアン
 
 ## ✨ 主な機能
 
-- 🔌 **統一モデル API** — OpenAI Chat / Responses / Images、Anthropic Messages と統一モデル一覧。Raccoon、Loomy、Antigravity、ModelScope が画像生成を提供し、Loomy、Antigravity、ModelScope は参照画像の編集にも対応。生成と編集は AI アシスタントのツールからも利用可能
+- 🔌 **統一モデル API** — OpenAI Chat / Responses / Images、Anthropic Messages と統一モデル一覧。Raccoon、Loomy、Antigravity、ModelScope、WorkBuddy、豆包工作 が画像生成を提供し、Raccoon、Loomy、Antigravity、ModelScope、WorkBuddy は参照画像の編集にも対応。生成と編集は AI アシスタントのツールからも利用可能
 - 🧭 **AI ルーティング** — モデルマッピング、アカウント優先度、負荷分散、セッション固定、フェイルオーバー
 - 🤖 **Agent クライアント設定管理** — 複数の接続設定、既存設定のインポート、書き込みプレビュー、サービス切り替え
 - 🧩 **プラグイン拡張** — 追加プロバイダーは本体に同梱せず個別にインストール・更新。カスタムプロバイダーにはプラグイン不要
@@ -82,6 +82,8 @@ cd C:\agent2api-pkg; .\install-service.ps1
 ```bash
 docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/data aimodcc/agent2api:latest
 ```
+
+> Arch / Omarchy: `scripts/` にローカルのソースビルド運用向けの強化セット（既定でループバックのみ）が同梱されています。詳細: [インストールとデプロイ → Docker](install.ja.md#docker)。
 
 どの形態でも、導入後にパネル（`http://127.0.0.1:3065/`。サーバーと Docker はホストの IP に読み替え）を開いて管理者アカウントを登録し、「ゲートウェイキー」ページでキーを作成してください。疎通確認: `curl http://127.0.0.1:3065/health`
 

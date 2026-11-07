@@ -350,10 +350,13 @@ fn verdict_of(
 
 /// 多轮 usage 的合并（口径见模块头「代价」条）。
 ///
-/// 四项**全部求和**：续写的每一轮都是一次真实的上游往返，第 N 轮的 prompt 里装着
-/// 前 N-1 轮的全部内容（上游就是这么计费的），`cache_read` 同样按轮发生
-/// （每轮各自命中一次缓存）。求和后，请求日志与限流记账读到的才是「这条客户端
-/// 请求实际花了多少」。
+/// token 四项与积分消耗**全部求和**：续写的每一轮都是一次真实的上游往返，
+/// 第 N 轮的 prompt 里装着前 N-1 轮的全部内容（上游就是这么计费的），
+/// `cache_read` 同样按轮发生（每轮各自命中一次缓存），`credit` 也是逐轮扣的。
+/// 求和后，请求日志与限流记账读到的才是「这条客户端请求实际花了多少」。
+///
+/// `credit` 是 `Option`：只要有一轮上报了就算数（没上报的轮按 0 参与求和），
+/// 全部轮次都没上报才保持 None（= 这一家不提供该读数）。
 ///
 /// 与 `RequestTelemetry::report_usage` 的「最后一次为准」**不冲突**：那条服务的是
 /// 同一条上游流里补发的增量帧（后到的即最终值），这里服务的是**跨轮** ——
@@ -368,6 +371,10 @@ pub fn sum_tokens(rounds: &[usage::UsageTokens]) -> usage::UsageTokens {
         acc.completion += round.completion;
         acc.total += round.total;
         acc.cache_read += round.cache_read;
+        acc.credit = match (acc.credit, round.credit) {
+            (None, None) => None,
+            (left, right) => Some(left.unwrap_or(0.0) + right.unwrap_or(0.0)),
+        };
         acc
     })
 }
@@ -379,12 +386,18 @@ pub fn sum_tokens(rounds: &[usage::UsageTokens]) -> usage::UsageTokens {
 /// 这是跨轮求和后唯一诚实的写法：没有任何一轮的原始 usage 能代表总量。
 /// 只在真的续写过（≥2 轮）时才走这里，单轮响应一个字节都不动。
 pub fn usage_json(tokens: &usage::UsageTokens) -> Value {
-    json!({
+    let mut value = json!({
         "prompt_tokens": tokens.prompt,
         "completion_tokens": tokens.completion,
         "total_tokens": tokens.total,
         "prompt_tokens_details": { "cached_tokens": tokens.cache_read },
-    })
+    });
+    // 积分只在真有读数时写：拼出 `"credit": null` 会让下游误以为这一家
+    // 「报了一个没有值」，而缺键与 null 在 `extract_usage` 里本来就等价。
+    if let (Some(credit), Some(object)) = (tokens.credit, value.as_object_mut()) {
+        object.insert("credit".to_string(), json!(credit));
+    }
+    value
 }
 
 /// 从一份 chat 完成体里取 token 数（缺失 / 非对象都按全 0，与单轮口径一致）。
@@ -539,7 +552,7 @@ impl TurnAccumulator {
         };
         // usage 抄一份（旁路读取，不参与帧的构造）；用量采集的权威点仍在 `sse.rs`
         if let Some(usage_object) = value.get("usage").filter(|usage| usage.is_object()) {
-            self.usage = Some(usage_object.clone());
+            crate::server::core::protocol::usage::merge_chat(&mut self.usage, usage_object);
         }
         if value.get("error").is_some() {
             self.saw_error = true;
@@ -708,6 +721,7 @@ impl Continuation {
         let mut texts: Vec<String> = Vec::new();
         let mut reasonings: Vec<String> = Vec::new();
         let mut tokens: Vec<usage::UsageTokens> = Vec::new();
+        let mut cache_creation: Option<i64> = None;
         // 逐轮累加的工作体（第 3 轮的 messages 里要带第 1、2 轮各自的半截答案，
         // 而不是只带最后那一轮 —— 否则模型会把它自己写过的第一段忘掉）
         let mut working = self.base_body.clone();
@@ -736,6 +750,12 @@ impl Continuation {
             texts.push(parts.text.clone());
             reasonings.push(parts.reasoning.clone());
             tokens.push(tokens_of_completion(&body));
+            if let Some(count) = body.get("usage")
+                .and_then(crate::server::core::protocol::usage::TokenUsage::from_chat)
+                .and_then(|tokens| tokens.cache_creation)
+            {
+                cache_creation = Some(cache_creation.unwrap_or(0).saturating_add(count));
+            }
             if repeat || !looks_truncated(&verdict) || rounds >= self.max_rounds || self.telemetry.is_cancelled() {
                 break;
             }
@@ -762,9 +782,13 @@ impl Continuation {
         // 跨轮用量求和：先覆盖遥测（每轮各自的 report_usage 是「最后一次为准」，
         // 这里把「最后一次」改写成合并值），再写进客户端看到的那份体
         let merged = sum_tokens(&tokens);
-        self.telemetry.report_usage(&usage_json(&merged));
+        let mut merged_usage = usage_json(&merged);
+        if let Some(count) = cache_creation {
+            merged_usage["cache_creation_input_tokens"] = json!(count);
+        }
+        self.telemetry.report_usage(&merged_usage);
         if let Some(usage_object) = body.as_object_mut() {
-            usage_object.insert("usage".to_string(), usage_json(&merged));
+            usage_object.insert("usage".to_string(), merged_usage);
         }
         let Some(choice) = body
             .get_mut("choices")
@@ -984,8 +1008,16 @@ async fn forward_round_with(
     client_headers: &HeaderMap,
     telemetry: &Arc<usage::RequestTelemetry>,
     allowed_providers: Option<KeyScope>,
-    body: Value,
+    mut body: Value,
 ) -> Result<ForwardOutcome, crate::server::errors::GatewayError> {
+    if telemetry.vision_continuation().is_none() && body.get("_wb_route_group_id").and_then(Value::as_str).is_some() {
+        let snapshot = telemetry.snapshot();
+        let candidate = snapshot.route.as_ref().and_then(|route| route.get("pickedCandidate")).and_then(Value::as_str).unwrap_or("");
+        if candidate.is_empty() || snapshot.account_id.is_empty() || snapshot.upstream_model.is_empty() {
+            return Err(crate::server::errors::GatewayError::with_status(503, "路由组自动续写缺少原模型与账号，已停止续写"));
+        }
+        body["_wb_route_continue"] = json!({ "candidateId": candidate, "accountId": snapshot.account_id, "model": snapshot.upstream_model });
+    }
     service
         .forward(ForwardRequest {
             body,
@@ -1316,14 +1348,15 @@ mod truncation_criteria {
         assert_eq!(9, round.completion, "同一轮里后到的 usage 是最终值");
 
         let rounds = [
-            usage::UsageTokens { prompt: 10, completion: 9, total: 19, cache_read: 4 },
-            usage::UsageTokens { prompt: 20, completion: 5, total: 25, cache_read: 0 },
+            usage::UsageTokens { prompt: 10, completion: 9, total: 19, cache_read: 4, credit: Some(0.25) },
+            usage::UsageTokens { prompt: 20, completion: 5, total: 25, cache_read: 0, credit: Some(0.5) },
         ];
         let merged = sum_tokens(&rounds);
         assert_eq!(30, merged.prompt, "每轮的 prompt 都含全部历史，真实成本按轮求和");
         assert_eq!(14, merged.completion);
         assert_eq!(44, merged.total);
         assert_eq!(4, merged.cache_read);
+        assert_eq!(Some(0.75), merged.credit, "积分也是逐轮扣的，跨轮按和计");
         let json = usage_json(&merged);
         assert_eq!(merged, usage::extract_usage(&json).unwrap(), "合并值必须能被提取侧读回来");
     }

@@ -22,7 +22,7 @@ Agent2API is an **AI routing gateway with Agent client takeover**. It exposes a 
 
 ## ✨ Key Features
 
-- 🔌 **Unified model APIs** — OpenAI Chat / Responses / Images and Anthropic Messages, with a unified model catalog; Raccoon, Loomy, Antigravity and ModelScope supply image generation, while Loomy, Antigravity and ModelScope also support reference-image editing. Both are available as AI assistant tools
+- 🔌 **Unified model APIs** — OpenAI Chat / Responses / Images and Anthropic Messages, with a unified model catalog; Raccoon, Loomy, Antigravity, ModelScope, WorkBuddy and Doubao Work supply image generation, while Raccoon, Loomy, Antigravity, ModelScope and WorkBuddy also support reference-image editing. Both are available as AI assistant tools
 - 🧭 **AI routing** — model mapping, account priority, load balancing, session affinity and failover in one place
 - 🤖 **Agent client takeover** — manage multiple connection profiles for local clients, import existing settings, preview writes and switch between the gateway and custom services
 - 🧩 **Plugin extensions** — additional provider implementations are installed and updated separately, not bundled with the application; custom providers do not require them
@@ -82,6 +82,8 @@ cd C:\agent2api-pkg; .\install-service.ps1
 ```bash
 docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/data aimodcc/agent2api:latest
 ```
+
+> On Arch / Omarchy, a source-build setup hardened for local use (loopback-only by default) ships in `scripts/`: see [Installation & deployment → Docker](./docs/install.en.md#docker).
 
 Whichever form you pick, open the panel afterwards (`http://127.0.0.1:3065/`; use the host IP for the server and Docker forms), register the admin account, then create a key on the "Gateway Keys" page. Connectivity check: `curl http://127.0.0.1:3065/health`
 

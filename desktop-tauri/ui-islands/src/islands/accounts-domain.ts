@@ -38,6 +38,7 @@ import { providerFeatures, type ProviderFeatures } from './accounts-features'
 import { t } from '../i18n'
 import { limiterHit } from './accounts-limiter-model'
 import { accountReloginText } from './accounts-authorization'
+import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
 
 // 能力表与插件申报的读取在 accounts-features.ts（那边的模块头说明了查询顺序）。
 // 这里转出去，是因为域层的既有调用点（`providerFeatures` 被 app.js / report.js /
@@ -587,10 +588,10 @@ export function isEnabled(account: AccountRecord | null | undefined): boolean {
 
 /**
  * 账号是否处于限流状态（存在未到恢复时间的限额记录）。
- * 传入 model 时只判定该模型 —— 限额是按模型记的，一个账号可能对 A 模型限额、
- * 对 B 模型完全正常。
+ * 传入 model 时只判定该模型；账号级冷却则对全部模型生效。
  */
 export function isRateLimited(account: AccountRecord | null | undefined, model = ''): boolean {
+  if (upstreamCooldownOf(account)) return true
   const limits = account?.rateLimits || {}
   const now = Date.now()
   if (model) return Number(limits[model]?.resetAt) > now
@@ -1263,7 +1264,15 @@ export type AccountTag = { text: string; kind: 'plain' | 'bad'; title: string }
  * 禁用的账号开关明明是关着的，再标一枚是把同一件事说两遍）。
  */
 export function accountTags(account: AccountRecord): AccountTag[] {
+  const suspendedReason = upstreamSuspendedReasonOf(account)
   return [
+    suspendedReason
+      ? {
+        text: t('上游限制 · 已禁用'),
+        kind: 'bad' as const,
+        title: suspendedReason,
+      }
+      : null,
     account.needsRelogin
       ? {
         text: t('需要重新登录'),
@@ -1292,12 +1301,12 @@ export function accountTags(account: AccountRecord): AccountTag[] {
         title: t('这条自定义账号既没有 API Key，也没有勾选「无需鉴权」：转发时会被跳过，该提供商下的模型也不会出现在模型列表里。去账号「设置」里补上 Key，或勾选「该上游无需鉴权」'),
       }
       : null,
-    // 代理配了解析不出来时明确标出：转发会回退直连，属于需要留意的情况
+    // 代理解析失败时明确标出，不能让用户以为仍在使用指定出口。
     account.proxy?.error
       ? {
         text: t('代理异常'),
         kind: 'bad' as const,
-        title: t('{error}（转发时会回退直连）', { error: account.proxy.error }),
+        title: t('{error}（不会自动改为直连）', { error: account.proxy.error }),
       }
       : null,
     // 走套餐池（Start Plan）通道时标出来：它不是默认值，而「这条请求到底花的

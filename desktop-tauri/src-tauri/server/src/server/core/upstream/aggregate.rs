@@ -10,15 +10,13 @@
 //!     （最后一种是 Cline 免费池的写法，见 `consume_line` 的说明）
 //!   - `delta.tool_calls` 按 `index` 合并（id/type 覆盖、function.name 与
 //!     function.arguments 追加）
-//!   - `usage` 取最后一次出现（上游在末尾 chunk 下发）
+//!   - `usage` 按字段保留最近一次上报，末帧缺项不清空先到的输入与缓存
 //!   - `finish_reason` 取最后一次非空
 //!   - 帧里的 `error` 字段 → 抛 502（上游把错误写在流里）
 //!   - id/created 缺失时给 `wb-agg-<毫秒>` / 当前秒兜底
 //!
 //! ── usage 旁路提取（请求统计）────────────────────────────────
-//! `consume_chunk` 里顺手把 `usage` 抄进 `usage::RequestTelemetry`。
-//! **不影响响应体**：决定下发 `usage` 字段的是 `self.usage`（本文件的
-//! 既有逻辑），旁路只写另一个结构体，两者互不干扰。
+//! 聚合后的规范 usage 同时用于客户端响应与请求统计，缓存字段识别口径共用。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -131,8 +129,9 @@ async fn aggregate_frame_stream_inner(
     // 下面这个 `while let` 永不退出 —— 聚合明明已经读到上游 EOF，却要空转到
     // 非流式总超时（默认 300 秒）才报 502（详见 `cancellable` 的说明）。
     let mut stream = cancellation::cancellable(stream, telemetry.cancel_token());
-    let mut buffer = String::new();
+    let mut buffer = Vec::<u8>::new();
     let mut acc = CompletionAccumulator {
+        native_tools: super::native_tools::Repair::new(&policy.native_tools),
         rewrite: policy.rewrite,
         strip_newline_chunks: policy.strip_newline_chunks,
         ..Default::default()
@@ -164,10 +163,10 @@ async fn aggregate_frame_stream_inner(
             telemetry.note_first_frame();
         }
         // 原始字节由输入侧（HTTP 字节流或协议翻译流）采集，聚合器只消费 chat 帧。
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.extend_from_slice(&chunk);
         // 逐行消费（只处理到最后一个 '\n' 之前的内容）
-        while let Some(index) = buffer.find('\n') {
-            let line = buffer[..index].trim().to_string();
+        while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line = String::from_utf8_lossy(&buffer[..index]).trim().to_string();
             buffer.drain(..=index);
             if line.is_empty() {
                 continue;
@@ -179,11 +178,14 @@ async fn aggregate_frame_stream_inner(
         }
     }
     // 尾行（上游没以换行结尾）
-    let tail = buffer.trim().to_string();
+    let tail = String::from_utf8_lossy(&buffer).trim().to_string();
     if !tail.is_empty() {
         acc.consume_line(&tail, &telemetry)?;
     }
 
+    if let Some(frame) = acc.native_tools.flush(&json!({ "id": acc.id, "model": acc.model, "created": acc.created })) {
+        acc.consume_chunk(&frame, &telemetry)?;
+    }
     Ok(acc.into_completion())
 }
 
@@ -205,6 +207,7 @@ struct CompletionAccumulator {
     /// 丢弃「整片只有换行」的 content 分片（WorkBuddy / AutoClaw 的保活节拍，
     /// 判据与理由见 `sse::is_newline_keepalive`）。false = 与接入前逐字一致。
     strip_newline_chunks: bool,
+    native_tools: super::native_tools::Repair,
 }
 
 impl CompletionAccumulator {
@@ -214,29 +217,37 @@ impl CompletionAccumulator {
             return Ok(());
         };
         let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
+        if data == "[DONE]" {
+            if let Some(frame) = self.native_tools.flush(&json!({ "id": self.id, "model": self.model, "created": self.created })) {
+                self.consume_chunk(&frame, telemetry)?;
+            }
             return Ok(());
         }
+        if data.is_empty() { return Ok(()); }
         // Node: `try { handleChunk(JSON.parse(line)) } catch { /* 非 JSON 行忽略 */ }`
         // —— 非 JSON 行静默忽略，但 handleChunk 抛出的 WorkBuddyUpstreamError 要透出
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            if let Some(frame) = self.native_tools.flush(&json!({ "id": self.id, "model": self.model, "created": self.created })) {
+                self.consume_chunk(&frame, telemetry)?;
+            }
             return Ok(());
         };
-        self.consume_chunk(&chunk, telemetry)
+        for chunk in self.native_tools.transform(&chunk) {
+            self.consume_chunk(&chunk, telemetry)?;
+        }
+        Ok(())
     }
 
     fn consume_chunk(&mut self, chunk: &Value, telemetry: &RequestTelemetry) -> Result<(), GatewayError> {
         let Some(object) = chunk.as_object() else {
             return Ok(());
         };
-        // ── usage 旁路提取（请求统计）──────────────────────────────
-        // 放在错误判定**之前**：上游把错误写在流里时也可能带上已消耗的
-        // usage（提示词已计费），旁路先抄一份不影响下面照常抛 502。
-        // 为什么这里的失败同样是「无副作用」的：只读 `chunk` 的一个成员，
-        // 不碰 `self.usage`（那才是决定响应体 usage 字段的那份），
-        // 所以返回值与不接钩子时完全一致。
-        if let Some(usage) = object.get("usage") {
-            telemetry.report_usage(usage);
+        // 错误帧也可能带已消耗的用量，必须先合并记账，再传播错误。
+        if let Some(usage) = object.get("usage").filter(|usage| usage.is_object()) {
+            crate::server::core::protocol::usage::merge_chat(&mut self.usage, usage);
+            if let Some(merged) = &self.usage {
+                telemetry.report_usage(merged);
+            }
         }
         if let Some(error) = object.get("error") {
             let message = error
@@ -261,12 +272,6 @@ impl CompletionAccumulator {
                 self.created = created.as_i64().or_else(|| created.as_f64().map(|value| value as i64)).unwrap_or(0);
             }
         }
-        if let Some(usage) = object.get("usage") {
-            if usage.is_object() {
-                self.usage = Some(usage.clone());
-            }
-        }
-
         let Some(choice) = object
             .get("choices")
             .and_then(Value::as_array)

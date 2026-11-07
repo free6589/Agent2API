@@ -1,7 +1,11 @@
 import * as React from 'react'
 import { Badge, Button, HtmlContent, StatusDot } from '@ui'
 import { t } from '../../i18n'
+import { NameEyeButton } from '../accounts-panels'
+import { maskName } from '../accounts-store'
+import { numberText } from '../accounts-shared'
 import { apiKeyRequestLabel, clientRequestLabel } from './source-filters'
+import { visionDetail } from '../../../../ui-shared/request-vision-detail'
 
 export type RequestEntry = {
   id?: string; ts?: number; status?: number; error?: string | null
@@ -10,6 +14,10 @@ export type RequestEntry = {
   clientReasoning?: string; upstreamReasoning?: string
   durationMs?: number; firstResponseMs?: number | null
   promptTokens?: number; completionTokens?: number; totalTokens?: number; cacheReadTokens?: number
+  /** 上游按请求上报的积分消耗（后端 `credit`）；null / 缺键 = 这一家没上报，
+   *  与 0（确实零消耗）是两件事 —— 前者显示「—」 */
+  credit?: number | null
+  route?: unknown
   attempts?: number; attemptDetails?: unknown[]; sensitiveHits?: unknown[]
   /** 模型测试发起的请求（后端 `is_test`；此前落盘的老行没有这个键） */
   isTest?: boolean
@@ -17,6 +25,8 @@ export type RequestEntry = {
   /** 来源客户端（后端 `client`：入口按下游 User-Agent 分类的结果；
    *  空串 / 缺键 = 没有记录 —— 旧行、模型测试、请求未带 UA 的行） */
   client?: string
+  clientLabel?: string
+  clientEvidence?: import('../../../../ui-shared/client-identification').ClientEvidence
   apiKeyId?: string; apiKeyName?: string; apiKeySource?: string
 }
 
@@ -183,7 +193,7 @@ function runningFirstLine(entry: RequestEntry): React.ReactNode {
  * 一处实现 —— 列设置重排时才不会各画一个样。类名与旧实现的产出逐字一致（CSS 与窄窗口重排都按
  * 这些类名走），空态占位的类名也照旧（重试列空时只有 .req-none，没有 .req-retry）。
  */
-export function RequestCell({ entry, column }: { entry: RequestEntry; column: VisibleColumn }): React.ReactNode {
+export function RequestCell({ entry, column, namesHidden }: { entry: RequestEntry; column: VisibleColumn; namesHidden: boolean }): React.ReactNode {
   const { align, key } = column
   const base = column.sel.slice(1) + (key === 'dur' || key === 'speed' ? ' req-num' : '')
   const className = `${base} ta-${align}`
@@ -220,7 +230,9 @@ export function RequestCell({ entry, column }: { entry: RequestEntry; column: Vi
               title={t('这条明细没有记录提供商（旧数据或请求未走到转发）')}>—</span>
           )}
           {entry.accountName ? (
-            <span className='req-acct' title={entry.accountId || entry.accountName}>{entry.accountName}</span>
+            <span className='req-acct' title={namesHidden ? undefined : entry.accountId || entry.accountName}>
+              {namesHidden ? maskName(entry.accountName) : entry.accountName}
+            </span>
           ) : (
             <span className='req-acct is-empty'
               title={t('请求在任何账号接手之前就失败了')}>—</span>
@@ -337,25 +349,9 @@ export function RequestCell({ entry, column }: { entry: RequestEntry; column: Vi
     }
 
     case 'client': {
-      // 后端存的是**归类结果**（Codex / ZCode / Claude Code / …，见 core::client），
-      // 空串 = 没有记录（旧行、模型测试、请求未带 UA）。产品名是标识符不翻译，
-      // 只有兜底类 `other` 翻成「其它」；空值给占位符而不是空格子。
-      const value = String(entry.client ?? '').trim()
-      if (!value && !entry.isTest) {
-        return (
-          <span key={key} className={`${className} is-empty`}
-            title={t('这条明细没有记录来源客户端（旧数据、模型测试，或请求未带 User-Agent）')}>—</span>
-        )
-      }
       const label = clientRequestLabel(entry)
-      return (
-        <span key={key} className={className}
-          title={value === 'other'
-            ? t('识别到 User-Agent，但不属于已知的客户端类型：{ua}', { ua: value })
-            : t('来源客户端：{client}', { client: label })}>
-          {label}
-        </span>
-      )
+      return <span key={key} className={className}
+        title={entry.clientEvidence?.userAgent || t('来源客户端：{client}', { client: label })}>{label}</span>
     }
 
     case 'apiKey': {
@@ -389,11 +385,34 @@ export function RequestCell({ entry, column }: { entry: RequestEntry; column: Vi
       return <span key={key} className={`${className}${speed ? '' : ' req-none'}`} title={SPEED_TIP}>{speed || '—'}</span>
     }
 
+    case 'credit': {
+      // 进行中：积分要等上游最后一个 chunk 的 usage 才到，此刻没有读数可给
+      // （与「用量」列同一处置：留空比「-」更准确）。
+      if (isRunning(entry)) return <span key={key} className={className} />
+      // 失败请求不记录用量（后端 normalize 已把 credit 清成 None）：这里与
+      // 「用量」列用同一句说明，避免把「失败清零」误读成「这一家没上报」。
+      if (!isOk(entry) && visionDetail(entry.route)?.mode !== 'assist_call') {
+        return <span key={key} className={`${className} is-empty`} title={t('失败请求不记录用量')}>—</span>
+      }
+      const value = entry.credit
+      if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+        return (
+          <span key={key} className={`${className} is-empty`} title={t('上游没有返回积分消耗')}>—</span>
+        )
+      }
+      return (
+        <span key={key} className={className}
+          title={t('本次请求消耗 {credit} 积分', { credit: numberText(value) })}>
+          {numberText(value)}
+        </span>
+      )
+    }
+
     case 'usage': {
       // 进行中：用量要等收尾才记账，此刻没有任何读数可给 —— 留空比「-」更准确
       if (isRunning(entry)) return <span key={key} className={className} />
       // 失败请求的 token 由后端一律清零，写「0」会让人以为真的消耗了这些量
-      if (!isOk(entry)) {
+      if (!isOk(entry) && visionDetail(entry.route)?.mode !== 'assist_call') {
         return (
           <span key={key} className={className} title={t('失败请求不记录用量')}>
             <span className='req-usage-line'>in: - / out: - / all: -</span>
@@ -424,11 +443,10 @@ export function RequestCell({ entry, column }: { entry: RequestEntry; column: Vi
 
     case 'detail': {
       const id = entry.id ? String(entry.id) : ''
-      // 只有带 id 的行才有入口（旧数据与「转发前就失败」的请求都没有报文可看）
-      if (!id) return <span key={key} className={`req-none ${base} ta-${align}`}>-</span>
+      if (!id && !entry.clientEvidence) return <span key={key} className={`req-none ${base} ta-${align}`}>-</span>
       return (
         <span key={key} className={className}>
-          <Button size='sm' variant='outline' className='req-detail-btn' title={t('查看该请求的上游原始报文')}
+          <Button size='sm' variant='outline' className='req-detail-btn' title={t('请求详情')}
             onClick={() => { void shared().wbRequestDetail?.open?.(id, entry) }}>{t('详情')}</Button>
         </span>
       )
@@ -440,14 +458,19 @@ export function RequestCell({ entry, column }: { entry: RequestEntry; column: Vi
 }
 
 /** 表头：按可见列逐格产出，顺序与数据行逐格一致（两处都走 visibleColumns） */
-export function headRow(columns: VisibleColumn[]): React.ReactNode {
+export function headRow(columns: VisibleColumn[], namesHidden: boolean): React.ReactNode {
   return (
     <div className='req-head' key='__head'>
       {columns.map(column => (
         <span key={column.key} data-col={column.key}
           className={`${column.sel.slice(1)}${column.key === 'dur' || column.key === 'speed' ? ' req-num' : ''} ta-${column.align}`}
           title={column.key === 'speed' ? SPEED_TIP : undefined}>
-          {column.label}
+          {column.key === 'target' ? (
+            <span className='req-target-label'>
+              {column.label}
+              <NameEyeButton hidden={namesHidden} />
+            </span>
+          ) : column.label}
         </span>
       ))}
     </div>

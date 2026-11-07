@@ -106,7 +106,7 @@ fn store() -> Option<&'static LogStore> {
 /// 是否开启 verbose（默认关闭，与 Node 版一致）
 pub fn is_verbose() -> bool {
     *VERBOSE.get().unwrap_or(&false)
-        || crate::server::config::with_raw(|raw| raw.get("debugMode").and_then(Value::as_bool) == Some(true)).unwrap_or(false)
+        || crate::server::config::debug_mode_enabled()
 }
 
 /// 当前毫秒 Unix 时间戳（对应 Node 版 `Date.now()`）。
@@ -237,13 +237,13 @@ pub fn log(tag: &str, text: &str) {
     };
     // 与 Node 版一致：message 为「标签 + 文案」，前端列表里能直接看到来源
     let message = format!("{tag} {trimmed}");
-    store.append(NewEntry {
+    crate::server::core::blocking::in_place(|| store.append(NewEntry {
         level: infer_level(tag, trimmed),
         category: category_of(tag),
         message: &message,
         data: None,
         ts: None,
-    });
+    }));
 }
 
 /// 显式指定级别的日志，其余行为与 `log()` 完全一致。
@@ -265,13 +265,13 @@ pub fn log_with_level(tag: &str, text: &str, level: &str) {
         return;
     };
     let message = format!("{tag} {trimmed}");
-    store.append(NewEntry {
+    crate::server::core::blocking::in_place(|| store.append(NewEntry {
         level,
         category: category_of(tag),
         message: &message,
         data: None,
         ts: None,
-    });
+    }));
 }
 
 /// 调试日志：只有开关打开时才入库（对应 Node 版 verbose()）。
@@ -289,13 +289,13 @@ pub fn verbose(tag: &str, text: &str) {
         return;
     };
     let message = format!("{tag} {trimmed}");
-    store.append(NewEntry {
+    crate::server::core::blocking::in_place(|| store.append(NewEntry {
         level: "debug",
         category: category_of(tag),
         message: &message,
         data: None,
         ts: None,
-    });
+    }));
 }
 
 /// 结构化事件上报（对应 Node 版 logEvent）。
@@ -315,13 +315,13 @@ pub fn log_event(
         return None;
     }
     let store = store()?;
-    store.append(NewEntry {
+    crate::server::core::blocking::in_place(|| store.append(NewEntry {
         level,
         category,
         message,
         data: data.as_ref(),
         ts: None,
-    })
+    }))
 }
 
 /// 供路由层读取日志库（查询/统计/清空）。未初始化时返回 None，

@@ -23,7 +23,9 @@ import {
 import { accountName, formatExpiry, formatRelative, isRateLimited } from '../lib/format'
 import { expiryOf, hasExpiry, isLongLivedCredential, supportsUsage } from '../lib/providerFacts'
 import { usageIndex, usageText } from '../lib/usage'
+import { useDisplayClock } from '../../../ui-shared/use-display-clock'
 import { credentialExpiryRowsOf, credentialExpiryText } from '../../../ui-shared/credential-expiry'
+import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
 import { providerLabel } from '../lib/providers'
 import { usePolling } from '../lib/usePolling'
 import { usePullToRefresh, PullIndicator } from '../components/PullToRefresh'
@@ -51,7 +53,7 @@ export function AccountsPage() {
   const [filters, setFilters] = useState<AccountFilters>(DEFAULT_FILTERS)
   const [filterOpen, setFilterOpen] = useState(false)
   const [query, setQuery] = useState('')
-  const [openId, setOpenId] = useState<string | null>(null)
+  const [openId, setOpenId] = useState<string | null>(() => state.route.params?.id || null)
   const [adding, setAdding] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -417,10 +419,13 @@ function AccountRow({
   onToggle: (next: boolean) => void
   busy: boolean
 }) {
+  const now = useDisplayClock()
   const limited = isRateLimited(account)
+  const cooldown = upstreamCooldownOf(account)
+  const suspendedReason = upstreamSuspendedReasonOf(account)
   const expiresAt = expiryOf(account)
   const expired = expiresAt > 0 && expiresAt <= Date.now()
-  const tone = account.needsRelogin
+  const tone = account.needsRelogin || suspendedReason
     ? 'bad'
     : !account.enabled
       ? 'mute'
@@ -431,13 +436,17 @@ function AccountRow({
           : 'ok'
   const badgeText = account.needsRelogin
     ? t('需重登')
-    : !account.enabled
-      ? t('已禁用')
-      : limited
-        ? t('限流')
-        : expired
-          ? t('已过期')
-          : t('正常')
+    : suspendedReason
+      ? t('上游限制 · 已禁用')
+      : !account.enabled
+        ? t('已禁用')
+        : cooldown
+          ? t('账号冷却')
+          : limited
+            ? t('限流')
+            : expired
+              ? t('已过期')
+              : t('正常')
   // 有效期：这家没有这个概念时不显示，而不是显示「—」（少一行噪音）；
   // 长期有效的家写「长期有效」—— 与「—」（读不到到期时间）是两件事
   const credentialRows = credentialExpiryRowsOf(account, expiresAt)
@@ -445,7 +454,7 @@ function AccountRow({
     ? t('长期有效')
     : hasExpiry(account.provider) ? formatExpiry(expiresAt) : ''
   // 余额：只有这家有查询能力时才占一行；快照里没有这一行 = 还没查过
-  const usageView = usageText(usageRow)
+  const usageView = usageText(usageRow, now)
   const showUsage = supportsUsage(account)
   const usageColor =
     usageView.kind === 'bad'
@@ -468,7 +477,7 @@ function AccountRow({
       <Button size='default' variant='ghost'
         type='button'
         onClick={onOpen}
-        style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 11, background: 'none', border: 0, padding: 0, textAlign: 'left' }}
+        style={{ flex: 1, minWidth: 0, height: 'auto', display: 'flex', alignItems: 'center', gap: 11, background: 'none', border: 0, padding: 0, textAlign: 'left' }}
       >
         <span style={{ width: 20, flex: 'none', fontSize: 11, color: 'var(--m-text-3)', fontVariantNumeric: 'tabular-nums', textAlign: 'center' }}>
           #{rank}
@@ -507,6 +516,12 @@ function AccountRow({
               <span style={{ flex: 'none', color: usageView.failureStatus ? 'var(--m-text-3)' : usageColor }} title={usageView.detail}>· {usageView.text}</span>
             ) : null}
           </div>
+          {showUsage && usageView.expiry ? (
+            <div className='mt-1.5 text-xs text-warning whitespace-normal break-words' title={usageView.expiry.detail}>
+              <Badge tone='warn'>{usageView.expiry.badge}</Badge>
+              {usageView.expiry.today ? <span className='ml-1.5'>{usageView.expiry.today}</span> : null}
+            </div>
+          ) : null}
           {showUsage && usageView.failureStatus ? (
             <div className='text-xs text-destructive whitespace-normal break-words mt-1' title={usageView.failureDetail}>
               {usageView.failureStatus}
@@ -520,6 +535,11 @@ function AccountRow({
               </span>
             </div>)}
           </div> : null}
+          {suspendedReason || cooldown ? (
+            <div className={`text-xs ${suspendedReason ? 'text-destructive' : 'text-warning'} whitespace-normal break-words mt-1`}>
+              {suspendedReason || [t('{time} 恢复', { time: formatRelative(cooldown?.resetAt) }), cooldown?.message].filter(Boolean).join(' · ')}
+            </div>
+          ) : null}
           {account.needsRelogin ? (
             <div className='text-xs text-destructive whitespace-normal break-words mt-1'>
               {account.needsReloginReason || t('登录授权已失效，请重新登录；自动续期无法恢复已过期或已撤销的刷新令牌。')}

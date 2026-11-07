@@ -32,6 +32,7 @@ export function MorePage() {
         { id: 'checkin', label: t('签到中心'), icon: 'checkin' },
         { id: 'models', label: t('模型管理'), icon: 'model' },
         { id: 'agent', label: t('Agent 配置'), icon: 'agent' },
+        { id: 'tools', label: t('MCP & Skills'), icon: 'tools' },
         { id: 'proxies', label: t('网络代理'), icon: 'proxy' },
         { id: 'keys', label: t('网关 Key'), icon: 'key' },
         { id: 'docs', label: t('接口文档'), icon: 'doc' },
@@ -42,7 +43,7 @@ export function MorePage() {
       entries: [
         { id: 'requests', label: t('请求日志'), icon: 'request', badge: limited ? String(limited) : undefined },
         { id: 'logs', label: t('运行日志'), icon: 'log' },
-        { id: 'tasks', label: t('定时任务'), icon: 'task' },
+        { id: 'tasks', label: t('自动维护'), icon: 'task' },
       ],
     },
     {
@@ -71,9 +72,9 @@ export function MorePage() {
               <div style={{ padding: '0 20px 4px', fontSize: 11.5, fontWeight: 600, color: 'var(--m-text-3)', letterSpacing: '.02em' }}>
                 {group.title}
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4, padding: '4px 10px 10px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 4, padding: '4px 10px 10px' }}>
                 {group.entries.map(entry => (
-                  <Button size='default' variant='ghost'
+                  <Button size='default' variant='ghost' className='h-auto min-w-0 whitespace-normal'
                     key={entry.id}
                     type='button'
                     onClick={() => store.push(entry.id)}
@@ -92,6 +93,7 @@ export function MorePage() {
                     }}
                   >
                     <span
+                      className='shrink-0'
                       style={{
                         width: 44,
                         height: 44,

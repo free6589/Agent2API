@@ -87,8 +87,11 @@ Stop-Service Agent2API
 .\install-service.ps1 -Uninstall
 ```
 
-**升級**：解壓新版本包，重跑一次 `install-service.ps1` 即可（腳本會先停服務、
-覆蓋程式與介面、再啟動；資料與設定不動）。
+**一鍵更新**：標準 Windows 服務安裝可在「設定 → 更新」點擊「一鍵更新」。確認後自動下載 Windows x64 伺服器套件，獨立驗證官方摘要，由臨時升級程序停止服務、等待檔案占用釋放、備份替換並重新啟動。確認新版服務執行後頁面自動重新整理；帳號、設定和資料不刪除。
+
+**舊安裝接入 / 手動升級**：把新版伺服器套件解壓縮到新的目錄，以管理員身分執行一次 `install-service.ps1`。腳本預設保留已登記的安裝目錄、資料目錄、連接埠、環境設定和服務帳號；只有明確傳入的連接埠等選項才覆蓋原值，目錄遷移需單獨進行。此次接入完成後可使用面板一鍵更新。
+
+程式目錄僅系統和管理員可寫，升級工作目錄為 `<安裝目錄>\.service-update`，不新增常駐服務。`AGENT2API_WINDOWS_UPDATE=0` 可在服務環境變數中關閉入口。自訂服務帳號、目錄連結、網路路徑及受外部處理程序群組託管的部署保留手動升級，不自動提升權限。替換失敗會恢復舊檔案；新版啟動未確認時保留升級日誌與備份，不自動回退資料庫。
 
 > **兩個 Windows 特有的坑，腳本已經處理好了**：
 > 服務行程的工作目錄是 `C:\Windows\system32` 而不是 exe 所在目錄 —— 介面目錄靠
@@ -126,9 +129,11 @@ journalctl -u agent2api -f
 再結束，SSE 長連線不會被打斷）都已配好。設定改 `/etc/agent2api/agent2api.env`
 後 `systemctl restart agent2api` 生效。
 
-> **裸機不要開 `AGENT2API_SELF_UPDATE`**：那是容器內的方案（換檔案後結束，靠
-> 容器 restart 策略拉起）。裸機上程式檔案屬 root、服務帳號無權替換，單元裡已
-> 明確設成 `0`。升級走 `install.sh --upgrade`。
+> **systemd 一鍵更新**：標準安裝已包含受限升級程式，在面板點擊「一鍵更新」並確認後，會下載、獨立驗證官方校驗值、備份替換、重新啟動並確認新版服務。帳號與設定保留，閘道繼續以一般帳號執行，程式目錄仍由 root 保護。
+>
+> 舊安裝先下載包含本功能的新版伺服器套件，在新套件目錄執行一次 `sudo bash install.sh --upgrade`，補裝升級元件後即可使用。自訂服務帳號或安裝路徑不會被腳本強制改寫，繼續使用原部署方式升級。`AGENT2API_SYSTEMD_UPDATE=0` 可關閉面板入口；停用 `agent2api-updater.socket` 可停用升級元件。`AGENT2API_SELF_UPDATE` 仍為 Docker 專用，不要在裸機開啟。
+>
+> 更新元件透過本機 socket 運作，不開放網路連接埠。預設從官方索引驗證發布倉庫；需固定倉庫或為獨立驗證設定代理時，管理員可在 `/etc/agent2api/updater.env` 設定 `AGENT2API_UPDATER_REPO=owner/repo` 或 `HTTPS_PROXY`。替換失敗會還原；新版啟動未確認成功時保留 `/opt/agent2api/.before-update-*` 恢復檔案並報告失敗，不自動回退資料庫。
 
 ### 裝完之後
 
@@ -162,11 +167,13 @@ http://<伺服器IP>:3065/
 
 Linux 寫在 `/etc/agent2api/agent2api.env`；Windows 改服務登錄檔的
 `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment`（`install-service.ps1`
-已經寫好基礎項，重跑腳本會覆蓋）。
+已經寫好基礎項，重跑時保留既有設定，只依明確傳入的參數修改對應項目）。
 
 > **帳號無法預置**：帳號需要掃碼 / 驗證碼 / 貼上憑證，這一步由上游協定決定，
 > 繞不過去。批量部署可以把已經配好的**資料目錄整個拷過去**（SQLite 庫 +
 > `account.key` 在同一個目錄裡），帳號隨之遷移。
+
+**Trae 回答完整性檢查（桌面端 / 伺服器端 / Docker）**：預設開啟。僅在排查相容性誤判時，才為閘道行程設定 `AGENT2API_TRAE_NO_REQUIRE_TERMINAL=1`（也接受 `true` / `yes` / `on`），再重新啟動閘道，讓外掛繼承新環境。關閉後可能再次把缺少上游結束訊號的半截回答視為成功；移除該變數並重新啟動即可恢復檢查。此開關需要包含此修復的「提供商增強」外掛。
 
 ## Docker
 
@@ -204,9 +211,79 @@ services:
 | `AGENT2API_ALLOW_NO_KEY` | 設 `1` 關閉 fail-closed（未設 Key 也放行 `/v1`，僅限純內網） |
 | `AGENT2API_CAPTCHA_ENABLED` | 登入頁人機驗證元件：預設 `1` 開啟，`0` 關閉 |
 | `AGENT2API_SELF_UPDATE` | 容器內的更新入口：預設 `1` 開啟（面板可「下載並更新」）；設 `0` 關閉，只走手動升級 |
+| `AGENT2API_IMAGE_CACHE_MB` | 生成圖片的下載記憶體快取上限（MiB，預設 `128`，範圍 8~4096）。寫壞 / 越界回落預設值 |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | 工作階段圖片壓縮結果的記憶體快取上限（MiB，預設 `128`，範圍 8~4096，口徑同上） |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 進階：把「檢查更新 / 下載更新」換成自建源。前者換儲存庫（預設跟上游 `aimod-cc/Agent2API`，fork 後可改），後者換 API 根（預設 `https://api.github.com`，需返回與 GitHub 同形的 release JSON）。配了自建源後，下載白名單只額外放行**該源自己的網域**（按源的 scheme：配 `http://` 就允許明文下載，僅建議本地演練 / 內網映像用） |
 
 從原始碼建置：複製本專案後 `docker compose up -d --build`（映像裡只有閘道與面板，不含 Rust 工具鏈）。
+
+### Arch / Omarchy：本機原始碼部署（Docker）
+
+`scripts/` 裡帶了一套 Arch 系（Omarchy / EndeavourOS / Manjaro 等通用）的本機部署設定，預設只把連接埠發布到本機回環：
+
+- `scripts/omarchy-compose.yml` —— 獨立於根目錄 `docker-compose.yml` 的強化版 compose：連接埠預設只發布到 `127.0.0.1`，宿主連接埠 / 容器名 / 映像 / 容器 uid/gid 可用 `.env` 參數化，支援預置管理員與第一把閘道 Key，建置階段走宿主網路；
+- `scripts/omarchy-agent2api.sh` —— 日常操作腳本：`up` / `build` / `down` / `restart` / `status` / `logs` / `health` / `backup` / `restore` / `doctor` / `config`。
+
+前置依賴（Arch / Omarchy）：
+
+```bash
+sudo pacman -S --needed git docker docker-compose curl jq sqlite
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # 首次加入後需重新登入
+```
+
+需要換宿主連接埠、開放區網或預置 Key 時，在儲存庫根建 `.env`（不要提交）：
+
+```ini
+AGENT2API_BIND_ADDRESS=127.0.0.1   # 要區網存取才改成 0.0.0.0，並自行配防火牆
+AGENT2API_HOST_PORT=3065           # 宿主發布連接埠；被佔用時換一個
+AGENT2API_UID=1000                 # 讓 ./data 歸目前使用者；非 root 執行建議配合 AGENT2API_SELF_UPDATE=0
+AGENT2API_GID=1000
+# AGENT2API_CONTAINER_NAME=agent2api
+# AGENT2API_IMAGE=agent2api:local
+# AGENT2API_ADMIN_USER=…            # AGENT2API_ADMIN_PASSWORD=…（無人值守才預置）
+# AGENT2API_PROXY_API_KEY=sk-…      # 預置第一把閘道 Key（可選）
+```
+
+啟動與日常操作（腳本已自動帶上 compose 檔與專案目錄參數）：
+
+```bash
+scripts/omarchy-agent2api.sh up               # 建置並啟動，等 /health 通過
+scripts/omarchy-agent2api.sh doctor           # 依賴 / 常駐程式 / 連接埠佔用 / 資料目錄自我檢查
+scripts/omarchy-agent2api.sh status           # 連接埠綁定、健康、映像與資料目錄一覽
+scripts/omarchy-agent2api.sh backup           # 停服 → 打包 ./data → 起服（寫到 ./backups）
+scripts/omarchy-agent2api.sh restore <歸檔>   # 還原；舊資料自動改名保留
+```
+
+不想用腳本時，等價命令是 `docker compose --project-directory . -f scripts/omarchy-compose.yml up -d --build`（`--project-directory` 必須指向儲存庫根，否則 `.env` 與 `./data` 會落到 `scripts/` 下）。
+
+Arch 上的兩個已知坑：
+
+- **建置階段存取 GitHub 逾時**：映像建置要經 Cargo 拉取 `ProvidersPlugin/Agent2Providers` 的 git 依賴，Docker bridge 存取 GitHub 逾時的機器直接建置會失敗；用 `scripts/omarchy-agent2api.sh build` 先建映像（走宿主網路 `--network host`），再 `up` 啟動即可，執行時仍是普通 bridge 網路。
+- **容器內存取 GitHub 不通**（外掛線上安裝 / 更新失敗）：已安裝的外掛從 `data/plugins` 載入，不影響現有帳號與模型。要線上裝 / 更新外掛：在宿主下載外掛套件走面板「外掛 → 上傳安裝」，或臨時用 `--network host` 啟動容器完成安裝。不要為此把連接埠發布到 `0.0.0.0`。
+
+資料都在 `./data`（SQLite 資料庫與 `account.key` 必須成對備份；`backup` 會先停服保證一致性，`restore` 會把舊資料改名保留）。容器以 `.env` 的 uid/gid 執行時，建議同時設 `AGENT2API_SELF_UPDATE=0`（容器內自更新以 root 執行為前提，見下文「容器內更新」）。
+
+> 原生桌面與 systemd 伺服器端在 Arch / Omarchy 上同樣可裝（見上文對應章節）；但 systemd 服務以獨立 `agent2api` 使用者執行且 `ProtectHome=true`，依賴「匯入本機登入狀態」的帳號在這條路徑上不可用 —— 需要這類帳號時優先用 Docker，或在面板裡貼上憑證。
+
+### 記憶體佔用
+
+映像裡的閘道（Linux 目標）已內建 jemalloc 記憶體配置器。長時間執行、多帳號並行轉發時，它比系統內建的配置器更不容易產生記憶體碎片、RSS 也不容易緩慢成長 —— 這正是小記憶體機器最常被拖垮或 OOM 的一環。
+
+小記憶體機器建議給容器設一個記憶體上限：超限時核心會終止行程，再由 `restart: unless-stopped` 拉起，表現為「重啟一次」，而不是把主機（或同機其它服務）拖垮。
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+compose 使用者在服務裡加一行 `mem_limit: 1g`（`docker-compose.yml` 已附註解示例）；swarm 或 `docker compose --compatibility` 用 `deploy.resources.limits.memory`。1g 只是起點，依實際併發量調整。
+
+兩處常駐記憶體的圖片快取上限都能用環境變數調小（預設各 `128` MiB）：`AGENT2API_IMAGE_CACHE_MB`（生成圖片的下載快取）、`AGENT2API_IMAGE_COMPRESS_CACHE_MB`（工作階段圖片壓縮結果快取）。寫壞或越界會回落預設值，不會讓服務起不來。
+
+`MALLOC_ARENA_MAX=2` 這類 glibc 配置器調校，只對**沒有內建 jemalloc 的形態**有意義（舊版映像、自行編譯的伺服器端、桌面端）；本映像已不需要設定它。
 
 **網頁面板的功能差異**（源於「沒有本機桌面客戶端」）：網頁登入（WorkBuddy / Qoder / Cline）、手機驗證碼、貼上憑證完全可用；需要本機回呼的網頁登入（AutoClaw / CatPaw / Accio / CodeArts / Trae）與「匯入本機登入狀態」不可用，請改用貼上憑證。桌面端開著「同時開放網頁管理面板」時，用瀏覽器存取該面板也是這一套差異 —— 同一份介面、同一套判定。
 
@@ -248,7 +325,7 @@ print(resp.choices[0].message.content)
 
 ## 區域網路存取
 
-預設只監聽 `127.0.0.1`。開啟「設定 → 一般 → 區域網路存取」後改聽所有網路介面卡，區域網路裝置把 API 位址指向本機 IP 即可共用（介面會給出完整位址）。出於安全，開啟前必須註冊面板管理員：管理介面要求管理員工作階段或閘道 Key，無可用 Key 時轉發介面同樣拒絕服務（開啟流程會自動補一把「預設」Key）；也可選擇同時開放網頁面板（預設關閉）。變更重新啟動後生效。
+預設只監聽 `127.0.0.1`。開啟「設定 → 一般 → 區域網路存取」後改聽所有網路介面卡，區域網路裝置把 API 位址指向本機 IP 即可共用（介面會給出完整位址）。出於安全，開啟前必須註冊面板管理員：管理介面要求管理員工作階段或閘道 Key，無可用 Key 時轉發介面同樣拒絕服務（開啟流程會自動補一把「預設」Key）；也可選擇同時開放網頁面板（預設關閉）。變更重新啟動後生效。用 `scripts/omarchy-compose.yml` 部署的（見 [Docker](#docker) 的 Arch / Omarchy 一節）預設還把連接埠發布在回環上，要區網存取需把 `.env` 的 `AGENT2API_BIND_ADDRESS` 設成 `0.0.0.0`。
 
 桌面端（Windows / macOS）安裝包裡就帶著網頁面板那一份 `ui/`，開啟「同時開放網頁管理面板」後區域網路裝置用瀏覽器存取同一網址即是管理介面 —— 與 Docker 版是同一份介面；**桌面視窗自己不走網頁登入**（沒有登入頁），它以本機第一把閘道 Key 作為憑證，開啟這個開關不需要你額外登入桌面端。網頁登入頁只在瀏覽器存取面板時出現。
 

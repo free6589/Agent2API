@@ -50,6 +50,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::server::config;
+use crate::server::core::compact_routing::{self, RequestFormat};
 use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::continuation::{self, Continuation};
 use crate::server::core::upstream::usage::RequestTelemetry;
@@ -113,9 +114,13 @@ pub async fn chat_completions(
         .map(|items| items.len())
         .unwrap_or(0);
     let user_agent = pipeline::user_agent_of(&headers);
+    let body_len = body.len();
+    let dedupe_key = pipeline::sha256_hex(&body);
+    let raw_request = pipeline::capture_raw_body(&body);
 
     // ③ 调试落盘：保存最近一次入站请求体，供重放分析（覆盖写）
     write_debug_files(&body, method, path, &user_agent);
+    drop(body);
 
     // ④ 模型路由走公共管道（默认模型回落 / 别名映射 / 目录校验，
     //    与另外两条协议入口逐条同源）。下游原始请求名在改写前取一次：
@@ -125,7 +130,8 @@ pub async fn chat_completions(
     // 下游等级与下游模型名同一时机采集（payload 被就地改写前；改写只动 model，
     // 两边前后一致，见 client_reasoning_of 的说明）
     let client_reasoning = pipeline::client_reasoning_of(&payload);
-    let requested_model = match pipeline::resolve_model(&state, &mut payload, scope.as_ref()) {
+    let compact_client = compact_routing::client_for_request(&request_source.behavior_client, &payload, RequestFormat::Chat);
+    let requested_model = match super::request_prepare::resolve_client_model(&state, &mut payload, scope.as_ref(), compact_client).await {
         Ok(model) => model,
         Err(error) => {
             record_early_failure(
@@ -144,14 +150,11 @@ pub async fn chat_completions(
         &format!(
             "← {method} {path} model={} stream={stream} msgs={message_count} bytes={} ua={user_agent}",
             if requested_model.is_empty() { "(未指定)" } else { &requested_model },
-            body.len(),
+            body_len,
         ),
     );
 
-    // ⑤ 转发：请求体原样交给转发层（内容处理在每家 provider 发送前按作用范围
-    // 逐家判定，见 `core::upstream::payload` 的 `send_body`）；去重键取**客户端
-    // 原始请求体**的哈希，与「某一家是否被处理」无关。
-    let dedupe_key = pipeline::sha256_hex(&body);
+    // 原始请求的去重键已在模型改写前计算。
     let telemetry = Arc::new(RequestTelemetry::with_id());
     // 「进行中」行：模型解析已成功、转发即将开始 —— 先插一条 status=0 的明细，
     // 让请求日志在响应还没跑完时就能看到这条请求（收尾时由 `record` 的 UPDATE
@@ -159,18 +162,16 @@ pub async fn chat_completions(
     // （record_early_failure）没有 id，不插。id 取 telemetry 里刚生成的那个
     // —— 它与调试报文、收尾记账用的是同一个。
     let telemetry_id = telemetry.snapshot().id;
-    state
-        .request_stats()
-        .record_started(
+    super::request_prepare::record_started(
+            state.request_stats(),
             &telemetry_id,
             started_at,
             &requested_model,
             &client_model,
             &client_reasoning,
             &request_source,
-            // 真实流量：不是模型测试（见 `RecordContext::is_test`）
             false,
-        );
+        ).await;
     // ── 手动终止的取消令牌（本次新增）────────────────────────────
     // 登记在进程级注册表里（键 = 上面这个 id），详情页的「终止请求」按它
     // 找到这条在途请求；转发链的每个等待点 select 它。注销见
@@ -182,7 +183,7 @@ pub async fn chat_completions(
     // 客户端在响应产生前断开时 axum 会直接取消 handler，收尾记账走不到 ——
     // 守卫的 Drop 补一条 408 终态（详见 `DisconnectGuard` 的说明）。
     // 正常路径必须显式调 `complete()` / `handoff()`，见下面的三个出口。
-    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry.clone(), started_at);
     // 在途回写：选路一定就把「谁在承载」、发送体一定稿就把「上游真名」写进这条
     // 进行中行（连同尝试链、首响、脱敏命中）—— 列表页 1 秒轮询，于是这些读数在
     // 转发期间就能看到，不必等收尾。接线在这里、core 只持有闭包，理由见
@@ -192,10 +193,6 @@ pub async fn chat_completions(
         telemetry_id,
         started_at,
     ));
-    // 下游原始请求体在此刻抄一份（request_raw 表的请求侧，见 `capture_raw_body`）：
-    // body 还是客户端发来的原值；送进转发层后 payload 会被就地改写（默认模型注入）。
-    // **仅调试模式开启时采集** —— 关着时这里是零开销的 None（预览对话没有正文）
-    let raw_request = pipeline::capture_raw_body(&body);
     // 自动续写的上下文（开关 `autoContinue` **默认关**）。关着时这里连一份 clone
     // 都不做 —— `plan()` 先问开关，再决定要不要复制请求体/请求头/白名单。
     // 判据、多轮拼接与用量合并口径都在 `core::upstream::continuation`。
@@ -444,6 +441,10 @@ fn anthropic_models_view(body: &Value) -> Value {
 /// 按「字符数 ÷ 3.5」估（中英混排的经验值，与 Anthropic 官方「约 3.5 字符
 /// 一个 token」的量级一致）。
 ///
+/// 估算系数与流式 `message_start` 的输入锚点**共用**同一个函数
+/// （`protocol::anthropic::estimate_tokens_for_text`）：客户端会拿这两个数字
+/// 互相印证，对不上反而引出新的疑问（见 issue #437）。
+///
 /// ── 为什么不直接 404 ────────────────────────────────────────
 /// Claude Code 在网关模式下会调它做上下文预算；404 会让它按「网关不支持」
 /// 处理（行为随版本变化，可能是降级也可能是报错）。给一个量级正确的估算，
@@ -460,8 +461,7 @@ pub async fn count_tokens(State(state): State<ServerState>, body: Bytes) -> Resp
         Ok(chat) => serde_json::to_string(&chat).unwrap_or_default(),
         Err(_) => serde_json::to_string(&payload).unwrap_or_default(),
     };
-    let characters = text.chars().count();
-    let tokens = ((characters as f64) / 3.5).ceil().max(1.0) as i64;
+    let tokens = crate::server::core::protocol::anthropic::estimate_tokens_for_text(&text);
     let _ = state;
     json_response(json!({
         "input_tokens": tokens,
@@ -485,6 +485,10 @@ pub fn spawn_catalog_refresh(state: &ServerState) {
     }
     let store = state.store().clone();
     crate::spawn_task(async move {
-        crate::server::core::providers::adapter::refresh_implemented(&store).await;
+        let mut request = crate::server::core::maintenance::Request::full(crate::server::core::maintenance::MODEL, false);
+        request.source = "passive";
+        if let Err(error) = crate::server::core::maintenance::execute(&store, request).await {
+            crate::server::logging::verbose("[Maintenance]", &error);
+        }
     });
 }

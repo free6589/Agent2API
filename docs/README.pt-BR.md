@@ -22,7 +22,7 @@ O Agent2API é um **gateway de roteamento de IA com gerenciamento de clientes Ag
 
 ## ✨ Principais recursos
 
-- 🔌 **APIs de modelos unificadas** — OpenAI Chat / Responses / Images, Anthropic Messages e catálogo unificado; Raccoon, Loomy, Antigravity e ModelScope geram imagens, e Loomy, Antigravity e ModelScope também editam imagens de referência. Ambos os recursos estão disponíveis como ferramentas do assistente de IA
+- 🔌 **APIs de modelos unificadas** — OpenAI Chat / Responses / Images, Anthropic Messages e catálogo unificado; Raccoon, Loomy, Antigravity, ModelScope, WorkBuddy e Doubao Work geram imagens, e Raccoon, Loomy, Antigravity, ModelScope e WorkBuddy também editam imagens de referência. Ambos os recursos estão disponíveis como ferramentas do assistente de IA
 - 🧭 **Roteamento de IA** — modelos, prioridade de contas, balanceamento, afinidade de sessão e failover
 - 🤖 **Gerenciamento de clientes Agent** — vários perfis, importação de configurações, prévia de gravação e alternância de serviços
 - 🧩 **Extensões por plugins** — provedores adicionais instalados e atualizados separadamente; provedores personalizados dispensam plugins
@@ -82,6 +82,8 @@ cd C:\agent2api-pkg; .\install-service.ps1
 ```bash
 docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/data aimodcc/agent2api:latest
 ```
+
+> Arch / Omarchy: o `scripts/` traz um conjunto de implantação reforçado para builds locais a partir do código (apenas loopback por padrão); veja [Instalação e implantação → Docker](install.pt-BR.md#docker).
 
 Em qualquer forma, abra o painel depois (`http://127.0.0.1:3065/`; use o IP do host nas formas servidor e Docker), registre o administrador e crie uma chave na página "Gateway Keys". Teste de conectividade: `curl http://127.0.0.1:3065/health`
 
