@@ -83,6 +83,8 @@ cd C:\agent2api-pkg; .\install-service.ps1
 docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/data aimodcc/agent2api:latest
 ```
 
+> On Arch / Omarchy, a source-build setup hardened for local use (loopback-only by default) ships in `scripts/`: see [Installation & deployment → Docker](./docs/install.en.md#docker).
+
 Whichever form you pick, open the panel afterwards (`http://127.0.0.1:3065/`; use the host IP for the server and Docker forms), register the admin account, then create a key on the "Gateway Keys" page. Connectivity check: `curl http://127.0.0.1:3065/health`
 
 **Mobile**: open `http://<gateway IP>:3065/m` in a browser (you can "Add to Home Screen" for a full-screen PWA). For a standalone icon, install `Agent2API-<version>.apk` (Android) or `Agent2API-<version>.ipa` (iOS, unsigned — re-sign it yourself) from the Release. Details: [Install & deploy → Mobile](./docs/install.en.md#mobile).

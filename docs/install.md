@@ -213,6 +213,55 @@ services:
 
 从源码构建：克隆本仓库后 `docker compose up -d --build`（镜像里只有网关与面板，不含 Rust 工具链）。
 
+### Arch / Omarchy：本机源码部署（Docker）
+
+`scripts/` 里带了一套 Arch 系（Omarchy / EndeavourOS / Manjaro 等通用）的本机部署配置，默认只把端口发布到本机回环：
+
+- `scripts/omarchy-compose.yml` —— 独立于根目录 `docker-compose.yml` 的加固版 compose：端口默认只发布到 `127.0.0.1`，宿主端口 / 容器名 / 镜像 / 容器 uid/gid 可用 `.env` 参数化，支持预置管理员与第一把网关 Key，构建阶段走宿主网络；
+- `scripts/omarchy-agent2api.sh` —— 日常操作脚本：`up` / `build` / `down` / `restart` / `status` / `logs` / `health` / `backup` / `restore` / `doctor` / `config`。
+
+前置依赖（Arch / Omarchy）：
+
+```bash
+sudo pacman -S --needed git docker docker-compose curl jq sqlite
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # 首次加入后需重新登录
+```
+
+需要换宿主端口、放开局域网或预置 Key 时，在仓库根建 `.env`（不要提交）：
+
+```ini
+AGENT2API_BIND_ADDRESS=127.0.0.1   # 要局域网访问才改成 0.0.0.0，并自行配防火墙
+AGENT2API_HOST_PORT=3065           # 宿主发布端口；被占用时换一个
+AGENT2API_UID=1000                 # 让 ./data 归当前用户；非 root 运行建议配合 AGENT2API_SELF_UPDATE=0
+AGENT2API_GID=1000
+# AGENT2API_CONTAINER_NAME=agent2api
+# AGENT2API_IMAGE=agent2api:local
+# AGENT2API_ADMIN_USER=…            # AGENT2API_ADMIN_PASSWORD=…（无人值守才预置）
+# AGENT2API_PROXY_API_KEY=sk-…      # 预置第一把网关 Key（可选）
+```
+
+启动与日常操作（脚本已自动带上 compose 文件与项目目录参数）：
+
+```bash
+scripts/omarchy-agent2api.sh up               # 构建并启动，等 /health 通过
+scripts/omarchy-agent2api.sh doctor           # 依赖 / 守护进程 / 端口占用 / 数据目录自检
+scripts/omarchy-agent2api.sh status           # 端口绑定、健康、镜像与数据目录一览
+scripts/omarchy-agent2api.sh backup           # 停服 → 打包 ./data → 起服（写到 ./backups）
+scripts/omarchy-agent2api.sh restore <归档>   # 恢复；旧数据自动改名保留
+```
+
+不想用脚本时，等价命令是 `docker compose --project-directory . -f scripts/omarchy-compose.yml up -d --build`（`--project-directory` 必须指向仓库根，否则 `.env` 与 `./data` 会落到 `scripts/` 下）。
+
+Arch 上的两个已知坑：
+
+- **构建阶段访问 GitHub 超时**：镜像构建要经 Cargo 拉取 `ProvidersPlugin/Agent2Providers` 的 git 依赖，Docker bridge 访问 GitHub 超时的机器直接构建会失败；用 `scripts/omarchy-agent2api.sh build` 先建镜像（走宿主网络 `--network host`），再 `up` 启动即可，运行时仍是普通 bridge 网络。
+- **容器内访问 GitHub 不通**（插件在线安装 / 更新失败）：已安装的插件从 `data/plugins` 加载，不影响现有账号与模型。要在线装 / 更新插件：在宿主下载插件包走面板「插件 → 上传安装」，或临时用 `--network host` 起容器完成安装。不要为此把端口发布到 `0.0.0.0`。
+
+数据都在 `./data`（SQLite 库与 `account.key` 必须成对备份；`backup` 会先停服保证一致性，`restore` 会把旧数据改名保留）。容器以 `.env` 的 uid/gid 运行时，建议同时设 `AGENT2API_SELF_UPDATE=0`（容器内自更新以 root 运行为前提，见下文「容器内更新」）。
+
+> 原生桌面与 systemd 服务端在 Arch / Omarchy 上同样可装（见上文对应章节）；但 systemd 服务以独立 `agent2api` 用户运行且 `ProtectHome=true`，依赖「导入本机登录态」的账号在这条路径上不可用 —— 需要这类账号时优先用 Docker，或在面板里粘贴凭证。
+
 ### 内存占用
 
 镜像里的网关（Linux 目标）已内置 jemalloc 内存分配器。长时间运行、多账号并发转发时，它比系统自带的分配器更不容易产生内存碎片、RSS 也不容易缓慢增长 —— 这正是小内存机器最常被拖垮或 OOM 的一环。
@@ -272,7 +321,7 @@ print(resp.choices[0].message.content)
 
 ## 局域网访问
 
-默认只监听 `127.0.0.1`。开启「设置 → 通用 → 局域网访问」后改听所有网卡，局域网设备把 API 地址指向本机 IP 即可共用（界面会给出完整地址）。出于安全，开启前必须注册面板管理员：管理接口要求管理员会话或网关 Key，无可用 Key 时转发接口同样拒绝服务（开启流程会自动补一把「默认」Key）；也可选择同时开放网页面板（默认关闭）。改动重启生效。
+默认只监听 `127.0.0.1`。开启「设置 → 通用 → 局域网访问」后改听所有网卡，局域网设备把 API 地址指向本机 IP 即可共用（界面会给出完整地址）。出于安全，开启前必须注册面板管理员：管理接口要求管理员会话或网关 Key，无可用 Key 时转发接口同样拒绝服务（开启流程会自动补一把「默认」Key）；也可选择同时开放网页面板（默认关闭）。改动重启生效。用 `scripts/omarchy-compose.yml` 部署的（见 [Docker](#docker) 的 Arch / Omarchy 一节）默认还把端口发布在回环上，要局域网访问需把 `.env` 的 `AGENT2API_BIND_ADDRESS` 设成 `0.0.0.0`。
 
 桌面端（Windows / macOS）装包里就带着网页面板那一份 `ui/`，打开「同时开放网页管理面板」后局域网设备用浏览器访问同一地址即是管理界面 —— 与 Docker 版是同一份界面；**桌面窗口自己不走网页登录**（没有登录页），它以本机第一把网关 Key 作为凭证，打开这个开关不需要你额外登录桌面端。网页登录页只在浏览器访问面板时出现。
 
