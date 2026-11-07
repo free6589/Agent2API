@@ -13,6 +13,9 @@
 
 import { shared } from './add-account-bridge'
 import { DOUBAOWORK } from './add-doubaowork-config'
+import { DEEPSEEK_WEB } from './add-provider-deepseek'
+import { MONKEYCODE, MONKEYCODE_INTL } from './add-provider-monkeycode'
+import { TABBIT, TABBIT_INTL } from './add-provider-tabbit'
 import { t } from '../i18n'
 
 /* ─── 类型 ───────────────────────────────── */
@@ -55,6 +58,8 @@ export type WebLoginConfig = {
   modes?: MethodMode[]
   /** 网页端那一条提示（缺省用通用的「将在新标签页中打开」） */
   webHint?: string
+  /** Cookie 捕获需要桌面窗口，网页面板不可发起。 */
+  desktopOnly?: boolean
   /** 这一家的网页登录只在某个地区可用（当前没有家用它，结构上保留） */
   region?: string
   /** 写死的变体选择器（传给壳侧 start_login 的第一个参数） */
@@ -328,6 +333,64 @@ const QODER = qoderForm({ provider: 'qoder', label: t('中国版'), siteNote: 'q
 const QODER_INTL = qoderForm({ provider: 'qoder-intl', label: t('国际版'), siteNote: 'qoder.com' })
 
 /**
+ * 千问办公两版（国内版 `qwenwork` / 国际版 `qwenwork-intl`）。
+ *
+ * ── 登录链路 2026-11-03 换过一次（先读插件 `providers/qoder/authorize.rs`）──
+ * 旧实现照社区参考实现抄的是**设备码授权**，上游已经把这个入口关了：那个地址
+ * 对任何请求都回 400。现在走**授权码 + 本机回调**（官方 CLI / IDE 那条路）：
+ * 浏览器打开官方登录页，登录完成后跳回本插件在本机开的随机端口，账号随即自动
+ * 加入列表。国内版可用；国际版上游只认它自己注册的回调地址，授权码回不到本机，
+ * 所以界面上直接写明「暂时无法登录」，而不是给一个点了必然报错的按钮。
+ *
+ * **只有网页登录这一条**：千问办公没有个人访问令牌（PAT）接口，
+ * 后端 `Site::supports_pat` 为假，登录方式也只申报了网页登录 —— 界面上给一个
+ * 点了必然报错的入口比不给更糟，所以这里不配 `manualTitle` / `fields`
+ * （Qoder 那一份才有 PAT 段）。
+ */
+function qwenworkForm(spec: {
+  provider: string
+  label: string
+  siteNote: string
+  loginable: boolean
+}): ProviderConfig {
+  const { provider, label, siteNote, loginable } = spec
+  return {
+    provider,
+    label,
+    desktop: false,
+    // 站点写死在 provider 身份里（后端按 provider id 反查）
+    webLogin: {
+      noteHtml: loginable
+        ? t('在打开的页面里登录千问办公{label}（{site}）的账号，登录完成后会自动加入列表。两版的账号与凭证不通用。', { label, site: siteNote })
+        : t('千问办公{label}暂时无法登录：上游只接受它自己的官方回调地址，不论证码到本机。', { label }),
+      button: loginable ? t('打开千问办公网页登录') : t('暂时无法登录'),
+      busyText: t('等待千问办公登录完成…'),
+      edition: provider === 'qwenwork' ? 'cn' : 'global',
+      modes: [
+        { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口用全新环境，多账号互不影响；关窗即取消等待') },
+        { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开（复用已登录账号）；完成后自动加入列表') },
+      ],
+    },
+    fields: [
+      { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空使用账号名或邮箱') },
+    ],
+  }
+}
+
+const QWENWORK = qwenworkForm({
+  provider: 'qwenwork',
+  label: t('国内版'),
+  siteNote: 'qwenwork.cn',
+  loginable: true,
+})
+const QWENWORK_INTL = qwenworkForm({
+  provider: 'qwenwork-intl',
+  label: t('国际版'),
+  siteNote: 'qwenwork.ai',
+  loginable: false,
+})
+
+/**
  * Cline 是两个提供商（Cline Free / Cline Pass）。
  *
  * 为什么不是一个配置带一个「额度池」下拉：上游模型带计费通道前缀
@@ -512,15 +575,11 @@ const CODEARTS: ProviderConfig = {
 }
 
 /**
- * Trae（字节 AI IDE 的 SOLO 通道）。
+ * Trae（国内账号，Agent / IDE 聊天通道按模型目录选择）。
  *
  * ── 为什么只有一张卡、没有「地区」下拉 ──────────────────────
- * AutoClaw / Accio / ZCode 的两地是**同一套协议换域名**，所以按地区参数化。
- * Trae 不是：国内 SOLO 走 `trae-api-cn.mchost.guru` 的 `llm_utils_chat`
- * （自定义信封 + 一套自己的 SSE 方言），国际版走 `chat_sessions` → `events`
- * 两步握手、另一个 Origin、流是累积式要还原增量 —— 那是**两套协议**而不是一个
- * 地区的两种拼法。把 `region` 做成这一家的字段，等于让"用哪套协议解释这个账号"
- * 变成账号属性（本仓反复拒绝的那类坑）。国际版将来接入时另立 provider id。
+ * 国内 Agent / IDE 共用 trae.cn 账号，历史 cn / solo 谱系继续保留。
+ * 国际版仍需独立 provider id 与目录，两地令牌不能混用；不将地区做成账号字段。
  *
  * ── 为什么回调必须落在本机 ────────────────────────────────
  * 上游对回调地址是**逐字正则校验**的（`^http://127.0.0.1:<port>/authorize$`），
@@ -534,7 +593,7 @@ const TRAE: ProviderConfig = {
   // 没有 auth.json 那种稳定可读的形态 —— 给了入口只会稳定失败。
   desktop: false,
   webLogin: {
-    noteHtml: t('打开 <b>Trae SOLO</b> 的官方授权页（<code>trae.cn</code>）并用你的 Trae 账号登录：授权完成后官方页面会跳回<b>本机</b>的一个临时端口；同机部署自动接收，Docker / 远程面板请按提示复制地址栏回调地址。'),
+    noteHtml: t('打开 <b>Trae</b> 的官方授权页（<code>trae.cn</code>）并用你的 Trae 账号登录：授权完成后官方页面会跳回<b>本机</b>的一个临时端口；同机部署自动接收，Docker / 远程面板请按提示复制地址栏回调地址。'),
     button: t('打开 Trae 授权页'),
     busyText: t('等待 Trae 授权完成…'),
     modes: [
@@ -650,63 +709,6 @@ const KUKU: ProviderConfig = {
     note: t('选择 KukuAI 客户端的 Cookies 文件（%APPDATA%\\baidugenflowpro\\Network\\Cookies）：它是**二进制** SQLite 数据库（无扩展名，不是 JSON）。导入时读的是你选中文件的副本、不和运行中的客户端抢占用，因此**无需先关闭客户端**。导入后凭证直接落在网关、可独立转发。'),
   },
 }
-
-/**
- * MonkeyCode（长亭科技）两个站点：国内版 `monkeycode-ai.com` / 国际版
- * `monkeycode-ai.net`。
- *
- * ── 为什么两个站点 = 两家 provider ─────────────────────────
- * 与 AutoClaw / Qoder / ZCode 同一思路：两站是同一套协议、同一个 session
- * cookie 名、同一套任务流，只有站点不同；地区是 **provider 身份**而不是账号
- * 属性（后端 `monkeycode::Region` 是「provider id → 站点」的唯一映射）。
- * 拆家后两站各自有独立的账号与启停、界面上各占一个分组 —— 因此两块用同一个
- * 工厂生成（表单相同、站点提示不同，照 `qoderForm` 的写法）。
- *
- * ── 粘贴 session、没有续期 ─────────────────────────────────
- * 粘贴浏览器里 `monkeycode_ai_session` cookie 的值（整段 Cookie 直接粘也行，
- * 网关会自己剥出值）。本家的密码登录要图形验证码、OAuth 要短信验证，两条都
- * 不适合网关代跑，粘贴 session 是唯一可靠的入口。上游**没有 refresh 接口**：
- * session 是约 30 天的硬限制，过期只能重新登录网页再粘贴（与 CatPaw /
- * KukuAI 同一处境，所以不渲染「刷新 Token」那一类控件）。
- *
- * ── imageId 为什么可以留空 ─────────────────────────────────
- * `imageId`（任务镜像 id）是发起对话的必需字段，但它不在登录响应里 —— 表单
- * 允许留空，由网关在添加时从该账号**已有任务**里 best-effort 自动发现（老
- * 用户一般能拿到）；新账号一个任务都没有、发现不到时**不阻断添加**，之后
- * 手动补即可。
- *
- * ── 没有「导入桌面端登录态」────────────────────────────────
- * 登录态就是浏览器 cookie，没有客户端 `auth.json` 那种稳定可读的文件形态
- * （与 Accio / ZCode 同一处境），给了入口只会稳定失败。
- */
-function monkeycodeForm(spec: { provider: string; label: string; siteNote: string }): ProviderConfig {
-  const { provider, label, siteNote } = spec
-  return {
-    provider,
-    label,
-    // 登录态是浏览器 cookie、没有可读的落盘文件（理由见上方注释）
-    desktop: false,
-    manualTitle: t('粘贴 session cookie'),
-    manualNoteHtml: t('粘贴网页登录态 cookie <code>monkeycode_ai_session</code> 的值（在浏览器里复制整段 Cookie 直接粘贴也行，网关会自己剥出值）。<br>{siteNote}<br>MonkeyCode <b>没有续期接口</b>：session 有效期约 30 天（硬限制），过期后重新登录网页、再粘贴一次即可。', { siteNote }),
-    fields: [
-      { key: 'session', label: 'session', rows: 3, placeholder: t('monkeycode_ai_session 的值（也可直接粘贴整段 Cookie）') },
-      { key: 'imageId', label: t('任务镜像 id'), optional: true, placeholder: t('可选：发起对话必需，留空则由网关从该账号已有任务里自动发现，发现不到时之后手动补') },
-      { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则用上游返回的账号名或账号 id') },
-    ],
-  }
-}
-
-const MONKEYCODE = monkeycodeForm({
-  provider: 'monkeycode',
-  label: t('MonkeyCode'),
-  siteNote: t('这里填国内站（monkeycode-ai.com）的账号：请粘贴国内站的 session。国际站（monkeycode-ai.net）是另一家 provider、另一套账号，两边的凭证不通用。'),
-})
-
-const MONKEYCODE_INTL = monkeycodeForm({
-  provider: 'monkeycode-intl',
-  label: t('MonkeyCode 国际版'),
-  siteNote: t('这里填国际站（monkeycode-ai.net）的账号：请粘贴国际站的 session。国内站（monkeycode-ai.com）是另一家 provider、另一套账号，两边的凭证不通用。'),
-})
 
 /**
  * Command Code（`api.commandcode.ai`）：一家一个 provider，没有地区之分
@@ -1103,6 +1105,10 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // 同一理由）：中国版在前，与存量账号的归属一致
   QODER,
   QODER_INTL,
+  // 千问办公两版紧随其后（同一套协议栈的另一家产品，两版相邻）：
+  // 国内版在前，与后端注册表 PROVIDERS 的排列一致
+  QWENWORK,
+  QWENWORK_INTL,
   // Cline 顺序即界面上「提供商」分段的顺序：免费池在前（无门槛，更常用）
   clineForm({ provider: 'cline-free', label: 'Cline Free', poolNote: t('（免费额度池，模型名带 cline-free/ 前缀）。') }),
   clineForm({ provider: 'cline-pass', label: 'Cline Pass', poolNote: t('（订阅池，模型名带 cline-pass/ 前缀，需要账号有对应订阅）。') }),
@@ -1115,7 +1121,7 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // CodeArts（华为云 AI 代码助手）：一家一个 provider，没有地区/额度池之分
   // （region 写死 cn-north-4，与 token 签发地必须一致）。
   CODEARTS,
-  // Trae 只有 SOLO 那一家（没有地区分叉，理由见 TRAE 上方那段）
+  // Trae 当前登记国内账号；国际版接入时使用独立身份。
   TRAE,
   // Loomy（讯飞）：单一入口（手机验证码登录），排在末尾 —— 与后端注册表
   // PROVIDERS 的排列一致（新增的一家加在表尾）
@@ -1149,6 +1155,10 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // （与后端注册表 PROVIDERS 的排列一致，后到居后）
   LOBSTERAI,
   DOUBAOWORK,
+  DEEPSEEK_WEB,
+  // Tabbit 浏览器（国内站 / 国际站）：两站账号不通用，成对相邻排列。
+  TABBIT,
+  TABBIT_INTL,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

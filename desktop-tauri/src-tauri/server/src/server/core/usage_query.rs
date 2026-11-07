@@ -163,7 +163,20 @@ async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
         Err(UsageFailure::NoCredentials)
     };
     let row = match outcome {
-        Ok(usage) => json!({ "id": id, "name": name, "usage": usage, "error": Value::Null }),
+        // 上游把「账号被临时限制」放在余额响应的 `raw.accountAccess` 里（LobsterAI
+        // 实测：`state: TEMP_RESTRICTED` + `restrictedUntil` + 一段中文说明）。
+        // 插件只把积分读数归一出来，这一段原样留在 `raw` 里；核心必须读它，否则
+        // 界面会显示「可用 300 积分」，而账号实际上一个请求都发不出去 —— 更糟的是
+        // 60 秒一次的自动查询会一直打同一个受限账号，正撞上游「勿反复异常使用」
+        // 的警告（可能导致永久停用）。识别到限制时把这次查询记成失败，并把下一次
+        // 自动查询推迟到 `restrictedUntil` 之后（见 `write_row_record` / `sweep_due`）。
+        Ok(usage) => match provider_restriction(&usage) {
+            Some((message, until)) => json!({
+                "id": id, "name": name, "usage": Value::Null,
+                "error": message, "code": "provider_restricted", "restrictedUntil": until,
+            }),
+            None => json!({ "id": id, "name": name, "usage": usage, "error": Value::Null }),
+        },
         // Node 的这条早退 `return` **不含 name 键**（只有 catch 分支才带）
         Err(UsageFailure::NoCredentials) => {
             json!({ "id": id, "usage": Value::Null, "error": "没有可用凭证" })
@@ -379,6 +392,62 @@ pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, 
 
 // ─── 记录表写入与「余额不足自动禁用」钩子 ────────────────────
 
+/// 受限账号 → 恢复时刻（毫秒）。只放内存：它是**调度提示**，不是账号事实；
+/// 进程重启后最多多查一次，代价可以忽略，换来的是不必给记录表加列 / 迁移。
+fn restricted_slot() -> &'static std::sync::Mutex<std::collections::HashMap<String, i64>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn mark_restricted(account_id: &str, until: i64) {
+    if let Ok(mut map) = restricted_slot().lock() {
+        map.insert(account_id.to_string(), until);
+    }
+}
+
+/// 这一家是否仍在受限窗口内（到期后顺手清掉，表不会无限长）。
+fn restricted_until(account_id: &str) -> Option<i64> {
+    let mut map = restricted_slot().lock().ok()?;
+    let until = *map.get(account_id)?;
+    if until <= logging::now_ms() {
+        map.remove(account_id);
+        return None;
+    }
+    Some(until)
+}
+
+/// 上游「账号被临时限制」的识别（当前只有 LobsterAI 申报了这一形态）。
+///
+/// 上游把限制状态附在余额响应的 `raw.accountAccess` 里（`state` + 可选
+/// `restrictedUntil` + 可选 `message`）；插件把整个上游响应原样放在
+/// `usage.raw`，所以这里读得到。判据取 `raw.accountAccess.state`：
+/// `ACTIVE`（或缺失）不算限制；任何其它状态且 `restrictedUntil` 在未来才拦。
+/// `restrictedUntil` 缺失或已过期时不拦 —— 那说明限制已经结束，读数可以照常
+/// 展示。
+fn provider_restriction(usage: &Value) -> Option<(String, i64)> {
+    let access = usage.pointer("/raw/accountAccess")?;
+    let state = access.get("state").and_then(Value::as_str).unwrap_or("ACTIVE");
+    if state.eq_ignore_ascii_case("ACTIVE") || state.is_empty() {
+        return None;
+    }
+    let until = access
+        .get("restrictedUntil")
+        .and_then(Value::as_str)
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|time| time.timestamp_millis())?;
+    if until <= logging::now_ms() {
+        return None;
+    }
+    let message = access
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("账号被上游临时限制，暂时无法使用");
+    Some((message.to_string(), until))
+}
+
 /// 一行查询结果 → 记录表（`core::usage_records`）。读不出 id 的行看不懂，跳过。
 fn write_row_record(row: &Value) {
     let Some(id) = row
@@ -394,6 +463,11 @@ fn write_row_record(row: &Value) {
         code: row.get("code").and_then(Value::as_str).map(str::to_string),
     };
     usage_records::write_result(id, &outcome);
+    // 受限账号：把下一次自动查询推迟到恢复时刻之后，别在限制期内反复打上游
+    // （上游的警告原文就是「勿反复异常使用」，持续轮询可能升级成永久停用）。
+    if let Some(until) = row.get("restrictedUntil").and_then(Value::as_i64) {
+        mark_restricted(id, until);
+    }
 }
 
 /// 「余额不足自动禁用」钩子：查询**成功**落记录后判定（失败行不动 —— 读数
@@ -565,6 +639,12 @@ async fn sweep_due(store: &AccountStore) {
     .filter_map(|account| {
         let interval = usage_records::query_interval_of(&account)?;
         let id = account.get("id").and_then(Value::as_str)?;
+        // 上游明确说了「限制到某个时刻」的账号：窗口内不再自动查询。
+        // 60 秒一轮的余额查询本身就是上游眼里的异常使用，限制期内继续打
+        // 只会把「临时限制」拖成永久停用。
+        if restricted_until(id).is_some() {
+            return None;
+        }
         let due_at = usage_records::load(id).last_attempt_at + interval * 1000;
         (due_at <= now).then_some((account, interval))
     })
@@ -606,17 +686,11 @@ async fn sweep_due(store: &AccountStore) {
 /// 的每个 Token 周期一项 `{period, windowStart, used}`（内存事实表投影，零
 /// SQL；事实由心跳 10 秒刷新 + 请求收尾增量记账兜着）。
 ///
-/// 出口过滤的两条（与旧 kv 快照的 `prune_stale_failures` 同语义）：
-///   - 账号已删除的行不端出（界面上没有那一行，留着只会对不上）；
-///   - 失败行只在「这次尝试不早于账号记录的最后改动」时端出 —— 重新登录 /
-///     重导入 / 刷过 token 之后，「当时查不到」那条断言就不再成立。成功读数
-///     不受影响：「可用 5147 积分」是一次读数的事实，凭证换了也不会变假话。
+/// 出口不返回已删除账号和访客账号的行。
+/// 修改代理、凭证或账号资料不代表余额查询成功，失败记录不能因此隐藏；
+/// 只有后续成功的余额查询才能清除失败状态，历史读数和成功时间保持原样。
 ///
-/// ── 第三条：访客账号的行整条丢掉（2026-10）──────────────────
-/// 访客没有积分体系（见 `supports_usage` 的说明），它名下的记录**只可能**是
-/// 历史失败行。留着就会在余额列上留一格红字，而那是「这条账号不该有读数」，
-/// 不是「这次没查到」。升级前写进记录表的那些行因此在这里一并滤掉，不必等
-/// 一次专门的迁移。
+/// 访客没有积分体系（见 `supports_usage` 的说明），其历史失败记录也不返回。
 pub fn snapshot(store: &AccountStore) -> Value {
     let records = usage_records::load_all();
     let accounts = store.list_accounts();
@@ -635,13 +709,7 @@ pub fn snapshot(store: &AccountStore) -> Value {
         }
         at = at.max(record.last_attempt_at);
         let name = account.get("name").cloned().unwrap_or(Value::Null);
-        let changed = account
-            .get("updatedAt")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            .max(account.get("addedAt").and_then(Value::as_i64).unwrap_or(0));
-        let error = record.error.as_deref().filter(|_| record.last_attempt_at >= changed);
-        if let Some(error) = error {
+        if let Some(error) = record.error.as_deref() {
             rows.push(json!({
                 "id": id,
                 "name": name,
@@ -707,5 +775,45 @@ pub fn snapshot(store: &AccountStore) -> Value {
             &visible_accounts, now,
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_restriction;
+    use serde_json::json;
+
+    #[test]
+    fn provider_restriction_reads_temp_restricted() {
+        let usage = json!({
+            "available": 300.0,
+            "raw": {
+                "accountAccess": {
+                    "state": "TEMP_RESTRICTED",
+                    "restrictedUntil": "2099-01-01T00:00:00Z",
+                    "message": "账号暂时无法使用相关服务"
+                }
+            }
+        });
+        let (message, until) = provider_restriction(&usage).expect("must detect restriction");
+        assert_eq!(message, "账号暂时无法使用相关服务");
+        assert!(until > crate::server::logging::now_ms());
+    }
+
+    #[test]
+    fn provider_restriction_ignores_active_and_expired() {
+        let active = json!({ "raw": { "accountAccess": { "state": "ACTIVE" } } });
+        assert!(provider_restriction(&active).is_none());
+        let expired = json!({
+            "raw": {
+                "accountAccess": {
+                    "state": "TEMP_RESTRICTED",
+                    "restrictedUntil": "2000-01-01T00:00:00Z"
+                }
+            }
+        });
+        assert!(provider_restriction(&expired).is_none());
+        let missing = json!({ "available": 1.0 });
+        assert!(provider_restriction(&missing).is_none());
+    }
 }
 

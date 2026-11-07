@@ -8,8 +8,9 @@
  * 手机端早先只发 messages、不带 tools，于是模型拿到的是一个没有身份设定的
  * 通用对话 —— 用户问「各账号余额」，它答成了银行账户余额。
  *
- * 原有九只操作/查询工具和共享的六只诊断工具都走**网关的管理 API**（手机端本来就
- * 在用那些接口），不经过桌面壳的桥。
+ * 原有九只操作/查询工具、共享的六只诊断工具、图片工具，以及附件读取 / 账号
+ * 文件导入工具都走**网关的管理 API**（手机端本来就在用那些接口），不经过桌面
+ * 壳的桥。
  *
  * ── 与桌面端的差异 ────────────────────────────────────────────
  *   · 执行层从 `window.workbuddyDesktop` 换成 `api/gateway` 的 HTTP 调用；
@@ -26,7 +27,6 @@ import {
   setAccountEnabled,
   setModelEnabled,
   type Account,
-  type ManageModel,
 } from '../api/gateway'
 import { apiCall } from '../api/client'
 import { accountName } from '../lib/format'
@@ -34,9 +34,15 @@ import { createBalanceTool } from '../../../ui-shared/assistant-read-balance'
 import { t } from '../i18n'
 import { ASSISTANT_READ_TOOLS } from './assistant-read-tools'
 import { ASSISTANT_IMAGE_TOOLS } from './assistant-image-tools'
+import {
+  createAccountImportTool,
+  createAttachmentReadTool,
+} from '../../../ui-shared/assistant-account-import-tools'
 import type { ImageAsset, ImageToolContext } from '../../../ui-shared/assistant-image-tools'
 import { checkToolSignal, providerGroups, runToolBatch } from '../../../ui-shared/assistant-tool-execution'
 import { safeText } from '../../../ui-shared/assistant-read-data'
+import { createModelListTool, type AssistantModelView } from '../../../ui-shared/assistant-read-models'
+import { CAPABILITY_KEYS } from '../../../ui-shared/model-capability'
 import { isCustomModelProvider, readCustomModelView, removeCustomMapping, setCustomBinding, setCustomCapabilities } from './assistant-custom-models'
 
 export type ToolResult = { text: string; summary: string; images?: ImageAsset[] }
@@ -48,6 +54,7 @@ export type AssistantTool = {
   desc: string
   params: Record<string, unknown>
   plan?: (args: Record<string, unknown>) => { lead: string; table?: { head: string[]; rows: string[][] }; note?: string }
+  redactArgs?: (args: Record<string, unknown>) => Record<string, unknown>
   run: (args: Record<string, unknown>, context?: ImageToolContext) => Promise<ToolResult>
 }
 
@@ -66,26 +73,6 @@ function rows(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value)
     ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
     : []
-}
-
-/** 分页：模型与映射共用（一页塞太多会撑爆上下文窗口） */
-const PAGE_DEFAULT = 100
-const PAGE_MAX = 500
-
-function paginate<T>(items: T[], offset: number, limit: number) {
-  const start = Math.min(offset, items.length)
-  const end = Math.min(start + limit, items.length)
-  return {
-    meta: {
-      total: items.length,
-      offset: start,
-      limit,
-      returned: end - start,
-      hasMore: end < items.length,
-      ...(end < items.length ? { nextOffset: end } : {}),
-    },
-    items: items.slice(start, end),
-  }
 }
 
 /** 账号点名：id 精确 > 名字精确 > 名字子串（唯一命中才算） */
@@ -116,79 +103,19 @@ async function readAccounts(): Promise<Account[]> {
     .sort((a, b) => Number(a.priority ?? 0) - Number(b.priority ?? 0))
 }
 
-async function readModels(): Promise<{ models: ManageModel[]; mappings: Record<string, unknown>[] }> {
+async function readModels(): Promise<AssistantModelView> {
   const [view, custom] = await Promise.all([fetchManage(), readCustomModelView()])
-  if (!Array.isArray(view.models)) throw new Error(t('读取模型清单失败'))
-  const mappings = (view as { mappings?: Record<string, unknown>[] }).mappings
-  return { models: [...view.models, ...custom.models] as ManageModel[], mappings: [...(mappings || []), ...custom.mappings] }
+  if (!Array.isArray(view.models) || !Array.isArray(view.mappings)) throw new Error(t('读取模型清单失败'))
+  return {
+    models: [...view.models, ...custom.models],
+    mappings: [...view.mappings, ...custom.mappings],
+    providers: [...(view.providers || []), ...custom.providers],
+  }
 }
 
 /* ─── 原有工具（诊断读取由 assistant-read-tools 共享）── */
 
-/** 1 · 获取模型列表（只读，分页） */
-const listModels: AssistantTool = {
-  id: 'list_models',
-  label: t('获取模型列表'),
-  kind: 'read',
-  desc: '分页读取各提供商的模型清单（模型 ID、所属提供商、是否启用、已挂的映射名）。回答「有哪些模型」「哪些模型在多家重复」「某个名字挂在哪」这类问题之前先调用它。\n\n结果分页：响应里带 total / offset / limit / returned / hasMore / nextOffset。hasMore 为 true 时用 nextOffset 继续取，直到取完；不要只看第一页就下结论。',
-  params: {
-    type: 'object',
-    properties: {
-      provider: { type: 'string', description: '只看某一家（提供商 id）；不填 = 全部' },
-      keyword: { type: 'string', description: '按模型 ID 或映射名做子串过滤；不填 = 不过滤' },
-      enabledOnly: { type: 'boolean', description: 'true = 只看已启用的模型' },
-      section: { type: 'string', enum: ['models', 'mappings', 'both'], description: '默认 both；模型与映射各自分页' },
-      offset: { type: 'number', description: '本页起点（从 0 开始）；翻页时传上一页的 nextOffset' },
-      limit: { type: 'number', description: `每页条数（默认 ${PAGE_DEFAULT}，最多 ${PAGE_MAX}）` },
-    },
-  },
-  run: async args => {
-    const provider = str(args.provider, 64).toLowerCase()
-    const keyword = str(args.keyword, 128).toLowerCase()
-    const enabledOnly = bool(args.enabledOnly) === true
-    const offset = Math.max(0, Math.round(num(args.offset) ?? 0))
-    const limit = Math.max(1, Math.min(PAGE_MAX, Math.round(num(args.limit) ?? PAGE_DEFAULT)))
-
-    const section = str(args.section) || 'both'
-    if (!['models', 'mappings', 'both'].includes(section)) throw new Error(t('section 只能是 models / mappings / both'))
-    const data = await readModels()
-    const filtered = data.models.filter(row => {
-      if (provider && str(row.provider).toLowerCase() !== provider) return false
-      if (enabledOnly && row.enabled !== true) return false
-      if (!keyword) return true
-      const hay = [str(row.id), str(row.name), ...(row.aliases || [])].join(' ').toLowerCase()
-      return hay.includes(keyword)
-    })
-    const page = paginate(
-      filtered.map(row => ({
-        provider: str(row.provider),
-        providerLabel: str(row.providerLabel) || str(row.provider),
-        id: str(row.id),
-        enabled: row.enabled === true,
-        kind: row.kind || 'chat',
-        supports_image_generation: row.supports_image_generation === true,
-        supports_image_editing: row.supports_image_editing === true,
-        aliases: Array.isArray(row.aliases) ? row.aliases : [],
-      })),
-      offset,
-      limit,
-    )
-    const mappings = data.mappings.filter(row => (!provider || str(row.provider).toLowerCase() === provider)
-      && (!enabledOnly || row.enabled === true)
-      && (!keyword || [str(row.alias), str(row.target)].join(' ').toLowerCase().includes(keyword)))
-    const mappingPage = paginate(mappings.map(row => ({
-      provider: str(row.provider), alias: str(row.alias), target: str(row.target),
-      enabled: row.enabled === true, isDefault: row.isDefault === true, dangling: row.dangling === true,
-    })), offset, limit)
-    return {
-      text: JSON.stringify({
-        ...(section !== 'mappings' ? { models: { ...page.meta, items: page.items } } : {}),
-        ...(section !== 'models' ? { mappings: { ...mappingPage.meta, items: mappingPage.items } } : {}),
-      }),
-      summary: section === 'mappings' ? t('{n} 条映射', { n: mappingPage.meta.total }) : t('{n} 个模型', { n: page.meta.total }),
-    }
-  },
-}
+const listModels: AssistantTool = createModelListTool(readModels, t)
 
 const listAccountBalance: AssistantTool = createBalanceTool({
   accounts: () => fetchAccounts(),
@@ -275,15 +202,6 @@ const setModelMapping: AssistantTool = {
 }
 
 /** 5 · 修改模型能力（改动） */
-const CAPABILITY_KEYS = [
-  'maxInputTokens',
-  'maxOutputTokens',
-  'supportsToolCall',
-  'supportsImages',
-  'supportsVideo',
-  'supportsReasoning',
-] as const
-
 const CAPABILITY_LABELS: Record<string, string> = {
   maxInputTokens: t('上下文窗口'),
   maxOutputTokens: t('最大输出 Token'),
@@ -522,9 +440,16 @@ const setAccountEnabledTool: AssistantTool = {
   },
 }
 
+/** 附件读取与账号文件导入：与桌面端共用同一份定义，注入手机端的 HTTP 调用。 */
+const readAttachment = createAttachmentReadTool(t)
+const importAccount = createAccountImportTool({
+  post: (path, body, signal) => apiCall(path, { method: 'POST', body, signal }),
+}, t)
+
 /** 全部工具（顺序 = 设置页清单顺序：只读在前，改动在后，高危最后） */
 export const ASSISTANT_TOOLS: AssistantTool[] = [
   ...ASSISTANT_READ_TOOLS,
+  readAttachment,
   listModels,
   listAccountBalance,
   setModelEnabledTool,
@@ -535,6 +460,7 @@ export const ASSISTANT_TOOLS: AssistantTool[] = [
   setProviderOrder,
   setAccountOrder,
   setAccountEnabledTool,
+  importAccount,
 ]
 
 export function toolById(id: string): AssistantTool | undefined {

@@ -129,10 +129,11 @@
    小注用同色弱化：它只解释口径，不该抢列名的注意力。 */
 .acct-table thead th .th-label { display: inline-flex; align-items: center; gap: 4px; }
 
-/* 表头的「隐藏账号名」眼睛（只在账号列出现）：一颗纯图标小按钮，贴在列名后面。
+/* 表头的「隐藏账号名」眼睛：一颗纯图标小按钮，贴在账号相关列名后面。
    默认继承表头小字的灰色、不抢注意力；隐藏生效时常亮主色（.on）——
    「整列此刻是打码状态」不用悬停就能看出来。 */
-.acct-table thead th .name-eye {
+.acct-table thead th .name-eye,
+.req-head .name-eye {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -145,9 +146,12 @@
   color: inherit;
   cursor: pointer;
 }
-.acct-table thead th .name-eye:hover { background: var(--surface-3); color: var(--text-2); }
+.acct-table thead th .name-eye:hover,
+.req-head .name-eye:hover { background: var(--surface-3); color: var(--text-2); }
 .acct-table thead th .name-eye.on,
-.acct-table thead th .name-eye.on:hover { color: var(--primary); }
+.acct-table thead th .name-eye.on:hover,
+.req-head .name-eye.on,
+.req-head .name-eye.on:hover { color: var(--primary); }
 
 /* ─── 列宽拖动把手 ───
    把手本身的样式（.col-grip / body.col-resizing）已挪到 components.css ——
@@ -524,6 +528,7 @@ body.queue-dragging * { cursor: grabbing; }
 .grp-balance .u { color: var(--text-3); }
 /* 「计入 8/10」比合计淡一档：它是脚注，不是第二个读数 */
 .grp-balance .n { color: var(--text-3); }
+.grp-balance .n.soon { color: var(--warn); }
 .grp-balance.warn .v { color: var(--warn); }
 .grp-balance.muted .v { color: var(--text-3); font-weight: 600; }
 .grp-balance .warn-mark { color: var(--warn); font-size: 10px; }
@@ -916,6 +921,45 @@ body.queue-dragging * { cursor: grabbing; }
 .usage-pop-view.bad { color: var(--danger); }
 .usage-pop-view.muted { color: var(--text-3); font-weight: 500; }
 
+.usage-toggle:has(.usage-toggle-soon) { padding-right: 18px; gap: 4px; }
+.usage-toggle:has(.usage-toggle-soon) .val { padding: 0 2px; text-align: left; }
+.usage-toggle-soon,
+.usage-pop-soon-tag {
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.usage-toggle-soon { max-width: 55%; overflow: hidden; text-overflow: ellipsis; }
+.usage-toggle.usage-pool-line:has(.usage-pool-soon) { height: auto; }
+.usage-pool-soon { display: block; margin-top: 3px; color: var(--warn); font-size: 10.5px; }
+.usage-pop-soon {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 2px 0 4px;
+  padding: 6px 8px;
+  border-radius: var(--r-xs);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-bd);
+  color: var(--warn);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.usage-pop-row:has(.usage-pop-soon-tag) .usage-pop-line { flex-wrap: wrap; gap: 4px 6px; }
+.usage-pop-row:has(.usage-pop-soon-tag) .usage-pop-name { min-width: 0; max-width: 100%; }
+
 /* 剩余细线：与余额格里那套 `.usage-meter-track` 同源同形（3px、hairline 轨道、
    语义色条体），弹层里只是上下留白宽一点。画的是**剩余**比例；超额走红 ——
    画不满的「剩余 0%」读起来像「没用过」，与事实相反。 */
@@ -1040,9 +1084,8 @@ body.queue-dragging * { cursor: grabbing; }
   line-height: 1.5;
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* ─── 操作列 ─── */

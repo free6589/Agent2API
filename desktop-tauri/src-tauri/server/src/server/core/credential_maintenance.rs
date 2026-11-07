@@ -41,6 +41,8 @@
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::providers::adapter::ProviderAdapter;
+use crate::server::errors::GatewayError;
 use crate::server::logging;
 
 /// 逐条结果的状态取值（**字符串本身就是给前端与日志看的契约**）
@@ -84,13 +86,77 @@ pub const STATUS_FAILED: &str = "failed";
 /// 只回 `id` / `provider` / 状态 / 文案，绝不回 token 内容。`GatewayError` 的
 /// 文案本来也由我们构造（不含凭证），与 `/api/accounts/refresh` 报给前端的是
 /// 同一份口径。
+/// 调一次刷新并**核对凭证是否真的推进**（issue #407）。
+///
+/// 适配器返回 Ok 只代表「这次调用没报错」：它可能什么都没刷到（上游原样回了
+/// 旧值、插件自己吞了失败），而账号记录一个字节没动。这里在刷新前后各取一次
+/// 指纹（`expiresAt` / `updatedAt`），两者都没推进就转成错误 —— 于是自动维护
+/// 记 ❌、手动刷新回非 2xx，静默失效第一次发生就会暴露。
+///
+/// `expiresAt` 或 `updatedAt` **任一**推进都算成功：有些家刷新后只换 token
+/// 不延长有效期（反过来也有），单看一个字段会误判。账号读不到时放行 ——
+/// 那是「记录不存在」的问题，由刷新本身报错，不该在这里编一个。
+///
+/// ── 「没写回」不等于失败：先复查一次还临不临期（PR #498 思路）──────
+/// 原判据（#407）把所有「指纹没推进」都记成失败，于是一类**正常**情形被打成
+/// 红字：上游在 access token 仍在有效期内时，刷新接口会原样回同一份凭证
+/// （实测 AutoClaw 的 `/userapi/v1/refresh` 就是这样 —— 它给的是「一份能用
+/// 的」，不是「换一份新的」）。适配器按设计「没变化就不落盘」，记录一个字节
+/// 不动，这里就报「请重新登录该账号」—— 而其实什么都不用做。
+///
+/// 因此没写回时**再问一次适配器**：凭证不在临期窗口里就视为「无需刷新」正常
+/// 返回；只有「确实临期/已过期、却还是没换发」才是真故障，报错并提示重新登录。
+pub async fn refresh_checked(
+    store: &AccountStore,
+    adapter: &dyn ProviderAdapter,
+    id: &str,
+) -> Result<String, GatewayError> {
+    let before = store.credential_stamp(id);
+    let token = adapter.refresh_access_token(store, id).await?;
+    let after = store.credential_stamp(id);
+    if let (Some((expires_before, updated_before)), Some((expires_after, updated_after))) =
+        (before, after)
+    {
+        if expires_after <= expires_before && updated_after <= updated_before {
+            // 复查必须在 `refresh_access_token` **之后**做：判断依据是刷新结果
+            // 落在记录上的现状，不是调用前的快照。
+            if !adapter.credentials_expiring_async(store, id).await {
+                logging::verbose(
+                    "[Accounts]",
+                    &format!("账号 {id} 的刷新未换发新凭证，但当前仍在有效期内 —— 视为无需刷新"),
+                );
+                return Ok(token);
+            }
+            return Err(GatewayError::with_status(
+                502,
+                format!(
+                    "账号 {id} 的凭证刷新未产生变化（适配器报成功但凭据未更新），请重新登录该账号"
+                ),
+            ));
+        }
+    }
+    Ok(token)
+}
+
 pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
+    refresh_selected_accounts(store, None).await
+}
+
+pub async fn refresh_selected_accounts(store: &AccountStore, selected: Option<&[String]>) -> Vec<Value> {
+    refresh_accounts(store, selected, &[]).await
+}
+
+pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>, forced: &[String]) -> Vec<Value> {
+    let before = crate::server::core::maintenance::types::accounts(store);
     let snapshot = store.list_accounts();
     let accounts: Vec<Value> = snapshot
         .get("accounts")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|account| selected.is_none_or(|ids| account.get("id").and_then(Value::as_str).is_some_and(|id| ids.iter().any(|allowed| allowed == id))))
+        .collect();
 
     // 第一遍：分拣出「待刷新」的清单，其余当场落 skipped 结果。
     // 插件临期判定通过异步 RPC 取回，下面那一遍只做网络刷新。
@@ -142,7 +208,7 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
             continue;
         }
         // 判不出来（没有过期信息 / 账号不存在 / 没有 refreshToken）一律 false
-        if !adapter.credentials_expiring_async(store, &id).await {
+        if !forced.iter().any(|account_id| account_id == &id) && !adapter.credentials_expiring_async(store, &id).await {
             slots[index] = Some(skipped(&id, provider, "凭证未过期或临期"));
             continue;
         }
@@ -175,7 +241,8 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
         // 逐个 await（不并发）：刷新是低频维护动作、单个账号要打一次上游，
         // 串行既避开风控也保证日志顺序稳定；失败被 match 收敛成一条结果，
         // 不会中断循环（见模块头的失败隔离）。
-        slots[index] = Some(match adapter.refresh_access_token(store, &id).await {
+        let started = std::time::Instant::now();
+        slots[index] = Some(match refresh_checked(store, adapter.as_ref(), &id).await {
             Ok(_) => {
                 // 成功也打一条：用户在日志页能看到「网关自动刷新了谁的凭证」，
                 // 否则「token 怎么自己变新了」是个无法追溯的问题
@@ -199,9 +266,20 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
                 })
             }
         });
+        if let Some(row) = &mut slots[index] {
+            row["durationMs"] = json!(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+        }
     }
 
-    let results: Vec<Value> = slots.into_iter().flatten().collect();
+    let mut results: Vec<Value> = slots.into_iter().flatten().collect();
+    let after = crate::server::core::maintenance::types::accounts(store);
+    for row in &mut results {
+        let id = row.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        row["expiresBefore"] = json!(before.get(&id).and_then(|account| account.expires_at));
+        row["expiresAfter"] = json!(after.get(&id).and_then(|account| account.expires_at));
+        row["forced"] = json!(forced.iter().any(|account_id| account_id == &id));
+        if row["status"] == STATUS_REFRESHED { row["credentialChanged"] = json!(true); }
+    }
     let (refreshed, skipped_count, failed) = summarize(&results);
     // 汇总级别跟结果走：「失败 0 个」是正常收尾，不能因文案带「失败」被抬成 error
     logging::log_with_level(

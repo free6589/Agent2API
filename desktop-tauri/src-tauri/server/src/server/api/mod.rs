@@ -37,6 +37,7 @@
 pub mod agents;
 pub mod agent_resources;
 pub mod accounts;
+mod account_import_setup;
 pub mod accounts_batch;
 mod accounts_export;
 mod accounts_sort;
@@ -47,8 +48,17 @@ pub mod accounts_usage;
 // 设置读写与流式对话转发。工具定义与执行都在前端，后端不认识任何工具，
 // 见该文件模块头
 pub mod assistant;
+pub mod assistant_coding;
 pub mod assistant_history;
 pub mod assistant_images;
+// 工具服务（「工具服务」页）：列表 / 开关 / 超时 / 上游提供商 / 视觉配置 /
+// 本机接入的管理面，以及对外运行时端点（Skill / MCP / REST）。上游配置与
+// 编排在 `core::tool_services`，见那两个文件模块头
+pub mod tools;
+pub mod tool_runtime;
+pub mod tool_image_admin;
+pub mod tool_images;
+mod tool_image_results;
 mod image_input;
 // 整库备份 / 恢复（设置页「整库备份 / 恢复」，SQL 文本形态；核心在
 // `db::backup`，替换语义与账号 JSON 导入的 merge 是两条独立通道）
@@ -64,6 +74,7 @@ pub mod chat;
 // 签到中心的聚合快照（GET /api/checkin-center）：分组口径在后端唯一化，
 // 资格类状态由前端按需惰性查询，见该文件模块头
 pub mod checkin_center;
+pub mod campaign_rewards;
 // 云同步（设置页「数据 → 云同步」）：WebDAV / S3 兼容存储上的业务数据快照。
 // 范围与密钥封装见 `core::cloud_sync` 的模块头
 pub mod cloud_sync;
@@ -75,6 +86,8 @@ pub mod checkin_records;
 pub mod checkin_schedules;
 pub mod cline_headers;
 pub mod codearts_welfare;
+pub mod compact_routes;
+pub mod client_identification;
 pub mod config_api;
 // WorkBuddy 成长任务（查询 / 执行 / 开学季 / 猫猫旅行）：从参考项目
 // workbuddy2api 的 task_runner.py 移植，见该文件模块头
@@ -105,6 +118,7 @@ pub mod keys_api;
 /// 同形的单开关端点，独立成文件而不是塞进 config_api —— 理由见该模块头。
 pub mod keepalive;
 pub mod logs_api;
+pub mod maintenance;
 pub mod model_manage;
 pub(crate) mod model_access;
 // models.dev 模型元数据（开关 / 状态 / 立即刷新）：与「逐家上游目录」的
@@ -116,8 +130,11 @@ pub mod model_test;
 pub mod models;
 // Loomy 新手任务的查询 / 一键领取（签到后在界面弹窗），见该文件模块头
 pub mod onboarding;
+mod officeace_subscription;
 pub mod panel;
 pub mod pipeline;
+mod live_progress;
+mod record_persist;
 // 提供商插件包的管理面（列表 / 安装 / 卸载 / 启停）：插件是用户安装的，
 // 这一组端点就是「装插件」的唯一入口，见该文件模块头
 pub mod plugins;
@@ -132,12 +149,25 @@ pub mod protocol;
 pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
+// 会话图片压缩设置（GET/PUT /api/image-compress）：开关 + 长边 / 质量 / 阈值三项，
+// 实施点在 `core::upstream::payload` 的 send_body（只作用在对话链路，生图不经过），
+// 见该文件模块头
+pub mod image_compress;
+pub mod vision_compat;
+mod vision_compat_record;
 pub mod retry_api;
+pub(crate) mod request_prepare;
 // 开发者角色兼容开关（GET/PUT /api/developer-role-compat）：与 /api/sanitize
 // 同形的单开关端点，转换实施点在 `core::upstream::payload` 的 send_body，
 // 见该文件模块头
 pub mod role_compat;
+// 第三方模型回答完自动折叠过程开关（GET/PUT /api/reasoning-collapse）：与
+// /api/developer-role-compat 同形的单开关端点，实施点在
+// `core::protocol::responses` 的 Responses 事件重建层，见该文件模块头
+pub mod reasoning_collapse;
 pub mod routing_api;
+pub mod routing_flow;
+pub mod routing_groups;
 pub mod routing_trace;
 pub mod routing_workspace;
 pub mod sanitize;
@@ -156,6 +186,7 @@ pub mod zcode_captcha;
 // 令牌池的**补货节奏**设置（目标 / 轮询间隔 / 单轮上限），见该文件模块头
 pub mod zcode_captcha_pool;
 pub mod zcode_claim;
+pub mod zcode_claim_verification;
 // ZCode 客户端版本号（设置页可改）：上游按它决定活动套餐下不下发，
 // 落后时的症状是**静默空列表**，见该文件模块头
 pub mod zcode_version;

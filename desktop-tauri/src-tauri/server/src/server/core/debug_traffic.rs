@@ -180,6 +180,10 @@ pub fn count() -> usize {
 
 /// 落一条完整报文；同 id 覆盖，失败只打日志，不影响转发。
 pub fn record(entry: TrafficEntry) {
+    super::blocking::in_place(|| record_sync(entry));
+}
+
+fn record_sync(entry: TrafficEntry) {
     let Some(db) = db() else {
         // 库不可用：静默丢弃（与改造前「STORE 未初始化」同一处理）。
         // 这里连日志都不打 —— 每个请求都会走到这一步，刷屏反而掩盖真问题。
@@ -446,11 +450,9 @@ fn blank_entry(
 /// 下游正文（`api::pipeline::capture_raw_body` / `capture_raw_json`）都问它；
 /// 请求日志的「预览对话」与「原始报文」两块数据因此同进同退。
 ///
-/// 每次调用都读配置快照（`config::current()` 是 RwLock 读 + 结构体克隆）：
-/// 开关改完下一个请求就生效，不必重启。转发热路径上多一次读锁是可接受的
-/// —— 与「每次重试判定都读重试设置」同一取向（见 `config::RetrySettings`）。
+/// 每次只读取调试开关，不复制配置；修改后下一个请求生效。
 pub fn enabled() -> bool {
-    crate::server::config::current().debug_mode()
+    crate::server::config::debug_mode_enabled()
 }
 
 /// 迁移项用：把一批旧文件条目写进 `debug_traffic` 表（**一个事务**，含导入后的裁剪）。

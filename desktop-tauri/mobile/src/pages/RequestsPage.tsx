@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { PageIntro, IconButton, Empty, ErrorNote, SkeletonList } from '../components/ui'
+import { Empty, ErrorNote, SkeletonList } from '../components/ui'
 import { ProviderLogo } from '../components/ProviderLogo'
 import { Icon } from '../components/Icon'
 import { Alert, Sheet, SheetContent, SheetHeader, SheetBody, SheetTitle, SheetFooter, Button, Card, SegmentedControl } from '@ui'
@@ -7,12 +7,16 @@ import { store, useStore } from '../state/store'
 import { fetchRequests, type RequestPage, type RequestRow } from '../api/gateway'
 import { ellipsisMiddle, formatClock, formatDuration, formatInt } from '../lib/format'
 import { providerLabel } from '../lib/providers'
-import { usePolling } from '../lib/usePolling'
+import { PageAutoRefresh, usePageAutoRefresh } from '../components/PageAutoRefresh'
+import { usePageRefreshTimer } from '../../../ui-shared/page-auto-refresh-timer'
 import { usePullToRefresh, PullIndicator } from '../components/PullToRefresh'
 import { t } from '../i18n'
 import { MetricGrid, MetricCard } from '@ui'
 import { DateRangeFilter } from '../components/DateRangeFilter'
 import { requestApiKeyLabel, requestClientLabel } from '../../../ui-shared/model-api-key'
+import { ClientIdentificationDetail } from '../../../ui-shared/client-identification-detail'
+import { VisionRequestDetail, visionDetail } from '../../../ui-shared/request-vision-detail'
+import { clientIdentificationApi } from '../api/client-identification'
 import { dateRangeQuery, readCustomRange, saveCustomRange, validCustomRange, type CustomDates, type DateRange } from '../../../ui-shared/date-range'
 
 /**
@@ -35,6 +39,7 @@ const CUSTOM_RANGE_KEY = 'agent2api-mobile-requests-custom-range'
 const EMPTY_SOURCE_QUERY: Record<string, string> = {}
 
 export function RequestsPage() {
+  const auto = usePageAutoRefresh('requestsAutoRefresh')
   const { route } = useStore()
   const sourceQuery = route.params || EMPTY_SOURCE_QUERY
   const routeDates = validCustomRange({ start: sourceQuery.startDate, end: sourceQuery.endDate })
@@ -49,6 +54,8 @@ export function RequestsPage() {
   const routeParamsRef = useRef(route.params)
   const queryKeyRef = useRef('')
   const seqRef = useRef(0)
+  const loadingRef = useRef(0)
+  const bodyRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     if (routeParamsRef.current === route.params) return
@@ -79,6 +86,7 @@ export function RequestsPage() {
 
   const load = useCallback(async () => {
     const seq = ++seqRef.current
+    loadingRef.current += 1
     const requested = queryKeyRef.current
     try {
       const next = await fetchRequests({ ...queryRef.current, limit: PAGE_SIZE })
@@ -90,6 +98,8 @@ export function RequestsPage() {
       if (seq === seqRef.current && requested === queryKeyRef.current) {
         setError(failure instanceof Error ? failure.message : String(failure))
       }
+    } finally {
+      loadingRef.current -= 1
     }
   }, [])
 
@@ -100,9 +110,12 @@ export function RequestsPage() {
     void load()
     return () => { ++seqRef.current }
   }, [queryKey, load])
-  usePolling(load, 30_000)
+  usePageRefreshTimer(async () => {
+    if (loadingRef.current || loadingMore || extra.length || detail || (bodyRef.current?.scrollTop || 0) > 20) return
+    await load()
+  }, auto.enabled, auto.ms)
 
-  const pull = usePullToRefresh({ onRefresh: load })
+  const pull = usePullToRefresh({ onRefresh: load, scrollRef: bodyRef })
 
   const rows = [...(page?.entries || []), ...extra]
   const filtered = rows.filter(row => {
@@ -137,8 +150,7 @@ export function RequestsPage() {
     <div className='m-page m-fixed' ref={pull.bindRef}>
       <PullIndicator pull={pull.pull} refreshing={pull.refreshing} />
       <div className='m-sticky'>
-        <PageIntro actions={<IconButton name='refresh' label={t('刷新')} onClick={() => void load()} />}
-        />
+        <PageAutoRefresh settings={auto} onRefresh={load} disabled={loadingMore} />
 
       <div className='m-section' style={{ marginTop: 0 }}>
         <SegmentedControl value={filter} className='w-full' aria-label={t('请求筛选')}
@@ -153,10 +165,10 @@ export function RequestsPage() {
         onDatesChange={next => { setDates(next); saveCustomRange(CUSTOM_RANGE_KEY, next) }} />
       </div>
 
-      <div className='m-body'>
+      <div className='m-body' ref={bodyRef}>
       {Object.keys(sourceQuery).length ? <div className='m-section text-xs text-muted-foreground'>
         {requestQuery.startDate && requestQuery.endDate ? `${requestQuery.startDate} ～ ${requestQuery.endDate}` : t('全部')}
-        {sourceQuery.client !== undefined ? ` · ${requestClientLabel({ client: sourceQuery.client }, t)}` : ''}
+        {sourceQuery.client !== undefined ? ` · ${requestClientLabel({ client: sourceQuery.client, clientLabel: sourceQuery.clientLabel || rows.find(row => row.client === sourceQuery.client)?.clientLabel }, t)}` : ''}
         {sourceQuery.apiKey ? ` · ${t('API Key')} ${sourceQuery.apiKey}` : ''}
         <Button variant='ghost' size='sm' onClick={() => store.push('requests')}>{t('清除筛选')}</Button>
       </div> : null}
@@ -201,7 +213,7 @@ function RequestCard({ row, onClick }: { row: RequestRow; onClick: () => void })
   const tone = !status ? 'warn' : status >= 200 && status < 400 ? 'ok' : 'bad'
   const note = buildNote(row)
   return (
-    <Button size='default' variant='ghost'
+    <Button size='default' variant='ghost' className='h-auto min-w-0 whitespace-normal [overflow-wrap:anywhere]'
       type='button'
       onClick={onClick}
       style={{
@@ -245,11 +257,11 @@ function RequestCard({ row, onClick }: { row: RequestRow; onClick: () => void })
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 11.5, color: 'var(--m-text-3)', minWidth: 0 }}>
         <ProviderLogo id={row.provider} />
-        <span style={{ flex: 'none' }}>{providerLabel(row.provider, row.providerLabel)}</span>
+        <span className='min-w-0 flex-1 truncate'>{providerLabel(row.provider, row.providerLabel)}</span>
         {row.accountName ? (
           <>
-            <span style={{ opacity: 0.45 }}>·</span>
-            <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <span className='shrink-0' style={{ opacity: 0.45 }}>·</span>
+            <span className='min-w-0 flex-1 truncate'>
               {row.accountName}
             </span>
           </>
@@ -364,6 +376,10 @@ function RequestSheet({ row, onClose }: { row: RequestRow | null; onClose: () =>
                 </MetricCard>
               </MetricGrid>
 
+              {visionDetail(row.route) ? <div className='rounded-lg border border-hairline p-3'><VisionRequestDetail route={row.route} t={t} /></div> : null}
+              <div className='rounded-lg border border-hairline p-3'>
+                <ClientIdentificationDetail key={row.id || row.ts} entry={row} api={clientIdentificationApi} t={t} />
+              </div>
               <div className='m-rows'>
                 <div className='m-row'><span className='m-k'>{t('客户端')}</span><span className='m-v'>{requestClientLabel(row, t)}</span></div>
                 <div className='m-row'><span className='m-k'>{t('API Key')}</span><span className='m-v'>{requestKeyName(row)}</span></div>

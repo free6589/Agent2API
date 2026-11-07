@@ -36,8 +36,8 @@
  * 假读数（后端 module 头那条纪律，前端这边是它的最后一站）。
  *
  * ── 时间显示分两级 ──────────────────────────────────────────
- * 行上一律 `MM-DD HH:mm`（弹层要一眼扫完，年份是噪音），完整时刻（含年）只在悬停
- * 的 title 里 —— 与 `pendingPlansTitle` 同一处置。已过期的包不给"到期倒计时"，
+ * 行上统一 `YYYY-MM-DD HH:mm`，保留年份以区分跨年度积分包；精确到秒的完整时刻
+ * 放在悬停的 title 里。已过期的包不给"到期倒计时"，
  * 直接标「已过期」并压成灰字：一个负数天数和一句「已过期」是同一件事，后者好读。
  *
  * ── 花不出去的收在末尾，且默认折叠 ──────────────────────────
@@ -53,6 +53,7 @@ import { Meter, Popover, PopoverContent, PopoverTrigger, Button } from '@ui'
 import { t } from '../i18n'
 import { formatTime, numberText, type UsageEntry } from './accounts-shared'
 import { creditPacksOf, snapshotReadingOf, usageUnitLabel, type UsageAggregate } from '../../../ui-shared/usage-readings'
+import { creditExpiryLabel, creditExpirySummaryOf, creditExpiryText, creditExpiryUnitOf, expiringCreditOf, type ExpiringCredit } from '../../../ui-shared/credit-expiry'
 
 /** 明细里的一行（`creditRowsOf` 的产物；渲染输入与 `usageDetailOf` 的行同形） */
 export type CreditRow = {
@@ -89,6 +90,7 @@ export type CreditRow = {
    * 只有产出它的那一端知道它是哪一种。
    */
   amount: number | null
+  expiry: ExpiringCredit | null
 }
 
 /**
@@ -104,12 +106,11 @@ function numberOrNull(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-/** 毫秒时间戳 → `MM-DD HH:mm`（年份在悬停的完整时刻里；取不出来给空串） */
-function shortTime(value: number): string {
+function detailTime(value: number): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return ''
   const pad = (part: number): string => String(part).padStart(2, '0')
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
 /**
@@ -132,9 +133,9 @@ function unitLabel(unit: string): string {
  * 按套餐优先级 + 到期升序；排序口径与各自的聚合读数同源）。前端再排一次只会让两处
  * 的口径分叉。
  */
-export function creditRowsOf(entry: UsageEntry): CreditRow[] {
+export function creditRowsOf(entry: UsageEntry, now = Date.now()): CreditRow[] {
   const packs = creditPacksOf(entry)
-  const now = Date.now()
+  const defaultUnit = creditExpiryUnitOf(entry)
   return packs.map(pack => {
     const snapshot = snapshotReadingOf(pack, t, numberText)
     if (snapshot) {
@@ -149,6 +150,7 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
         spent: false,
         snapshot: true,
         amount: null,
+        expiry: null,
       }
     }
     const name = String(pack?.name || '').trim() || t('积分包')
@@ -165,9 +167,9 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
       const value = amount === null ? '—' : `${amount > 0 ? '+' : ''}${numberText(amount)}`
       const view = unit && value !== '—' ? `${value} ${unitLabel(unit)}` : value
       const parts: string[] = []
-      if (at !== null && at > 0) parts.push(shortTime(at))
+      if (at !== null && at > 0) parts.push(detailTime(at))
       if (expireAt !== null && expireAt > 0) {
-        parts.push(expireAt <= now ? t('已过期') : t('{time} 到期', { time: shortTime(expireAt) }))
+        parts.push(expireAt <= now ? t('已过期') : t('{time} 到期', { time: detailTime(expireAt) }))
       }
       const remark = String(pack?.remark || '').trim()
       return {
@@ -189,6 +191,7 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
         // 流水恒不进「已用完 / 已过期」那组（见 CreditRow.spent）
         spent: false,
         amount,
+        expiry: null,
       }
     }
 
@@ -244,18 +247,18 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
     // 缺了发放时刻就标成「领取」等于替上游编一个到手时间。
     const parts: string[] = []
     if (grantAt !== null && grantAt > 0) {
-      parts.push(t('{time} 领取', { time: shortTime(grantAt) }))
+      parts.push(t('{time} 领取', { time: detailTime(grantAt) }))
     } else if (startAt !== null && startAt > 0) {
-      parts.push(t('{time} 生效', { time: shortTime(startAt) }))
+      parts.push(t('{time} 生效', { time: detailTime(startAt) }))
     }
     if (daily) {
       // 日额度包的「到期」是今天 24 点（周期边界），不是这笔钱作废 ——
       // 照「到期」写会让人以为额度明天就没了（实际是重置回满）
       parts.push(t('每日重置'))
     } else if (rolling && resetAt !== null && resetAt > 0) {
-      parts.push(t('重置 {date}', { date: shortTime(resetAt) }))
+      parts.push(t('重置 {date}', { date: detailTime(resetAt) }))
     } else if (expireAt !== null && expireAt > 0) {
-      parts.push(expired ? t('已过期') : t('{time} 到期', { time: shortTime(expireAt) }))
+      parts.push(expired ? t('已过期') : t('{time} 到期', { time: detailTime(expireAt) }))
     }
     if (reason) parts.push(reason)
 
@@ -285,16 +288,20 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
       percent === null && remain !== null ? t('上游未给总量，画不出剩余比例') : '',
       used !== null && total !== null ? t('已用 {used} / 共 {total}', { used: numberText(used), total: numberText(total) }) : '',
     ].filter(Boolean).join(' · ')
-    return { name, view, tone, percent, window: parts.length ? parts.join(' · ') : null, title, spent, amount: null }
+    return {
+      name, view, tone, percent, window: parts.length ? parts.join(' · ') : null, title, spent, amount: null,
+      expiry: expiringCreditOf(pack, defaultUnit, now),
+    }
   })
 }
 
 /** 明细弹层里的一行（视觉与 CodeArts 那份明细同一套类名，观感一致） */
-function CreditRowView({ row }: { row: CreditRow }) {
+function CreditRowView({ row, now }: { row: CreditRow; now: number }) {
   return (
     <div className='usage-pop-row' title={row.title}>
       <div className='usage-pop-line'>
         <span className='usage-pop-name'>{row.name}</span>
+        {row.expiry ? <span className='usage-pop-soon-tag'>{creditExpiryLabel(row.expiry.expireAt, t, now)}</span> : null}
         <span className={`usage-pop-view ${row.tone}`}>{row.view}</span>
       </div>
       {row.window ? <div className='usage-pop-window'>{row.window}</div> : null}
@@ -318,8 +325,10 @@ function CreditRowView({ row }: { row: CreditRow }) {
  * `subscriptionLine` 由调用方用 `subscriptionText` 拼好递进来（套餐 / 到期 /
  * 余量那一行）：那份措辞是悬停提示的既有产物，两处各写一份迟早会漂。
  */
-export function CreditDetailButton({ rows, subscriptionLine, aggregate, variant, kind, title, children }: {
+export function CreditDetailButton({ rows, now, expiryUnit, subscriptionLine, aggregate, variant, kind, title, children }: {
   rows: CreditRow[]
+  now: number
+  expiryUnit: string
   subscriptionLine: string
   aggregate: UsageAggregate | null
   variant: 'sum' | 'pool'
@@ -340,6 +349,10 @@ export function CreditDetailButton({ rows, subscriptionLine, aggregate, variant,
   const liveRows = rows.filter(row => !row.spent)
   const spentRows = rows.filter(row => row.spent)
   const detailLabel = rows.length > 0 && rows.every(row => row.snapshot) ? t('余额详情') : t('积分明细')
+  const soonRows = liveRows.filter(row => row.expiry !== null)
+  const restRows = liveRows.filter(row => row.expiry === null)
+  const expiring = creditExpirySummaryOf(soonRows.flatMap(row => row.expiry ? [row.expiry] : []), now)
+  const expiryText = creditExpiryText(expiring, t, numberText, expiryUnit)
   const className = variant === 'pool' ? `usage-toggle usage-pool-line ${kind}` : `usage-toggle ${kind}`
 
   /**
@@ -395,6 +408,7 @@ export function CreditDetailButton({ rows, subscriptionLine, aggregate, variant,
           aria-label={detailLabel} />}
       >
         {variant === 'pool' ? children : <span className='val'>{children}</span>}
+        {variant === 'sum' && expiryText.badge ? <span className='usage-toggle-soon'>{expiryText.badge}</span> : null}
         <span className='caret' aria-hidden>▾</span>
       </PopoverTrigger>
       {/* `align='center'`：浮层以读数按钮为中心展开。原来是 'end'（右缘对齐），
@@ -411,7 +425,16 @@ export function CreditDetailButton({ rows, subscriptionLine, aggregate, variant,
             </span>
           </div> : null}
           <div className='usage-pop-group'>{detailLabel}</div>
-          {liveRows.map((row, index) => <CreditRowView key={`${row.name}-${index}`} row={row} />)}
+          {expiring.count > 0 ? (
+            <>
+              <div className='usage-pop-soon'>
+                <span>{expiryText.summary}</span>
+                {expiryText.today ? <span>{expiryText.today}</span> : null}
+              </div>
+              {soonRows.map((row, index) => <CreditRowView key={`soon-${row.name}-${index}`} row={row} now={now} />)}
+            </>
+          ) : null}
+          {restRows.map((row, index) => <CreditRowView key={`${row.name}-${index}`} row={row} now={now} />)}
           {spentRows.length > 0 ? (
             <div className='usage-pop-spent'>
               <Button size='default' variant='ghost'
@@ -431,7 +454,7 @@ export function CreditDetailButton({ rows, subscriptionLine, aggregate, variant,
               </Button>
               {spentOpen
                 ? spentRows.map((row, index) => (
-                  <CreditRowView key={`spent-${row.name}-${index}`} row={row} />
+                  <CreditRowView key={`spent-${row.name}-${index}`} row={row} now={now} />
                 ))
                 : null}
             </div>

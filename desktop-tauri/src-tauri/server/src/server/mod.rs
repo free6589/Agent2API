@@ -140,6 +140,7 @@ pub mod access;
 pub mod altcha;
 pub mod config;
 pub mod config_migration;
+mod compression;
 pub mod core;
 pub mod db;
 pub mod errors;
@@ -246,6 +247,14 @@ pub struct ServerState {
     /// 不会被感知**（要下次启动才发现）—— 这是可接受的：手工放回文件的人
     /// 本来就知道自己在做什么。
     upgrade_pending: Arc<AtomicBool>,
+    /// 启动期的历史统计整理（模型维度回填 / 来源维度回填 / 保留期裁剪）是否
+    /// 还在后台跑。
+    ///
+    /// 这三件事都可能扫描整张 `requests` 表：库大时几十秒起步，而它们的结果
+    /// 只影响报表与历史清理，不影响面板能不能打开、账号能不能用。所以从
+    /// `bootstrap` 里挪到监听端口成功之后（见 [`Self::start_background_maintenance`]）。
+    /// 字段对外只读，供 `/api/session` 告诉界面「历史数据还在整理」。
+    startup_maintenance: Arc<AtomicBool>,
 }
 
 impl ServerState {
@@ -354,6 +363,7 @@ impl ServerState {
         // 下面日志裁剪天数与旧文件候选目录才不会用错值。
         let snapshot = config::init(db.clone());
         core::task_state::install(db.clone());
+        core::maintenance::storage::install(db.clone());
         // 每账号的余额查询记录（余额不足跳过 / 自动禁用的底座）：装库句柄时
         // 顺带做旧 kv 快照的一次性迁移与内存事实表的装载（见 usage_records 模块头）。
         core::usage_records::install(db.clone());
@@ -385,13 +395,8 @@ impl ServerState {
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
         core::proxy_pool::install(db.clone());
         core::proxy_settings::install(db.clone());
-        // 云同步（设置页「数据 → 云同步」）：设置与状态落在 kv 的保留键
-        // `cloudSync`，装库句柄即可。自动同步的工作线程在下面 spawn ——
-        // 必须先装句柄再起线程，否则第一轮读设置会拿到默认值。
+        // 先装云同步设置；自动同步须等账号迁移完成后启动，不能上传半份启动状态。
         core::cloud_sync::install(db.clone());
-        if let Some(db) = db.clone() {
-            core::cloud_sync::auto_sync::spawn_worker(db);
-        }
         // 模型清单的持久化缓存：把**同一个 `Db`** 传进去（与配置 / 日志库 /
         // 账号库同一形态）。各家的远程清单在进程重启后由它读回，不再回落到
         // 内置清单（见 `core::providers::catalog_cache` 的模块头）。
@@ -556,13 +561,11 @@ impl ServerState {
         // 值得一个能被直接找到的位置，所以整组搬到了那个文件。
         if !upgrade_pending {
             account_bootstrap::run(&store);
-            // 统计侧的一次性口径订正：模型维度从「请求名（映射别名）」重算成
-            // 「上游真名」（见 `RequestStats::remap_model_dimension_once`）。
-            // 与 account_bootstrap 同一模式：待迁移旧数据没导入时跳过 ——
-            // 跑了会把幂等标记打早，升级完成后由 `api::upgrade_api` 补调。
-            request_stats.remap_model_dimension_once();
-            request_stats.backfill_source_dimensions();
-            request_stats.prune();
+            // 统计侧的三件历史整理**不在这里**：它们可能扫描整张 requests 表
+            // （模型维度回填 / 来源维度回填 / 保留期裁剪），库大时会把「面板
+            // 打开」一起拖慢。改由 `start()` 在监听端口成功之后调
+            // `start_background_maintenance` 放进阻塞线程池跑；待迁移数据导入
+            // 之后的那一次仍由 `api::upgrade_api` 补调，顺序不变。
         }
 
         let state = Self {
@@ -582,6 +585,7 @@ impl ServerState {
             request_stats,
             db,
             upgrade_pending: Arc::new(AtomicBool::new(upgrade_pending)),
+            startup_maintenance: Arc::new(AtomicBool::new(false)),
         };
         logging::log("[Server]", "Agent2API 多提供商本地网关（Rust 进程内服务）启动中…");
         logging::log("[Config]", &format!("API 端口: {}", port));
@@ -847,6 +851,11 @@ impl ServerState {
     pub fn refresh_upgrade_pending(&self) -> bool {
         let pending = self.db.is_some() && db::migrate::has_pending(&self.config_dir);
         self.upgrade_pending.store(pending, Ordering::Relaxed);
+        if !pending {
+            if let Some(db) = self.db().cloned() {
+                core::cloud_sync::auto_sync::spawn_worker(db);
+            }
+        }
         pending
     }
 
@@ -856,6 +865,72 @@ impl ServerState {
             return Vec::new();
         }
         db::migrate::pending_items(&self.config_dir)
+    }
+
+    /// 启动期的历史统计整理是否还在后台跑（`/api/session` 的
+    /// `maintenance.running`；界面可据此提示「历史数据整理中」）。
+    pub fn startup_maintenance_running(&self) -> bool {
+        self.startup_maintenance.load(Ordering::Relaxed)
+    }
+
+    /// 在监听端口成功之后启动历史统计整理（由 [`start`] 调用，只生效一次）。
+    ///
+    /// ── 为什么放在这里而不是 `bootstrap` ────────────────────────
+    /// `bootstrap` 返回之前不能 bind 端口，而这三件事（模型维度回填 / 来源
+    /// 维度回填 / 保留期裁剪）都可能扫描整张 `requests` 表。库大的升级场景里，
+    /// 它们会让「程序启动了、网页却打不开」持续几十秒 —— 用户看到的就是转圈。
+    /// 现在先让 HTTP 服务可用，这三件事在阻塞线程池里慢慢跑。
+    ///
+    /// ── 为什么不跟账号迁移一起挪 ────────────────────────────────
+    /// `account_bootstrap` 的结果直接被账号页与选路读取，且量级小（账号通常
+    /// 几十条）；统计整理只影响报表数字与历史清理，允许短暂落后。两者对
+    /// 「能不能立刻看到正确账号」的敏感度不同，所以只挪后者。
+    ///
+    /// ── 待迁移数据还没导入时 ────────────────────────────────────
+    /// 与 `bootstrap` 的判据一致：整块跳过。用户点完升级后，`api::upgrade_api`
+    /// 会按原顺序补调这三件事（那时 HTTP 早已在跑，慢也不会挡住面板）。
+    pub fn start_background_maintenance(&self) {
+        if self.upgrade_pending() {
+            logging::log(
+                "[Stats]",
+                "⏳ 待迁移旧数据尚未导入，历史统计整理跳过（升级完成后补做）",
+            );
+            return;
+        }
+        if let Some(db) = self.db().cloned() {
+            core::cloud_sync::auto_sync::spawn_worker(db);
+        }
+        // swap 保证重复调用（桌面壳重启后端时 start 可能被再次调用）只跑一轮。
+        if self.startup_maintenance.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let state = self.clone();
+        crate::spawn_task(async move {
+            logging::log("[Stats]", "历史统计整理已在后台开始（不阻塞面板打开）");
+            let started = std::time::Instant::now();
+            let stats = state.request_stats();
+            let outcome = tokio::task::spawn_blocking(move || {
+                stats.remap_model_dimension_once();
+                stats.backfill_source_dimensions();
+                stats.prune();
+            })
+            .await;
+            state.startup_maintenance.store(false, Ordering::SeqCst);
+            match outcome {
+                Ok(()) => logging::log(
+                    "[Stats]",
+                    &format!(
+                        "✅ 历史统计整理完成（用时 {} 秒）",
+                        started.elapsed().as_secs()
+                    ),
+                ),
+                Err(error) => logging::log(
+                    "[Stats]",
+                    &format!("⚠️  历史统计整理任务异常退出: {error}"),
+                ),
+            }
+        });
     }
 
     /// 打开 headless 形态的管理界面托管：`ui_dir` 指向 `ui/` 静态目录，
@@ -972,6 +1047,7 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
         None => None,
     };
 
+    let codex_owner = core::assistant_coding::client::allow_start();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     // 停机广播：oneshot 只有一个 receiver，而分端口形态有两个 serve 都要
     // 收到停机信号。协调任务把 oneshot 信号（send 或发送端被 drop）转成
@@ -986,6 +1062,7 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
             _ = stop_requested.wait_for(|stop| *stop) => {}
         }
         stop_from_signal.send_replace(true);
+        core::assistant_coding::client::shutdown(codex_owner).await;
     });
 
     // 停机收尾要用的统计句柄：先克隆出来再移进任务（`state` 是借用，不能
@@ -1061,6 +1138,11 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
             }
         });
     }
+
+    // 端口都已 bind、两个 serve 任务都已派出：此时面板已经可以打开，再开始
+    // 跑可能很慢的历史统计整理（整表扫描 / 保留期裁剪）。放在 serve 之前会让
+    // 大库升级后的第一次打开一直转圈（见 start_background_maintenance 的说明）。
+    state.start_background_maintenance();
 
     Ok(shutdown_tx)
 }

@@ -59,7 +59,8 @@ use rusqlite::{params, params_from_iter, Connection};
 use serde_json::Value;
 
 use super::record::{AttemptDetail, RequestEntry, RequestQuery, RunningProgress, SensitiveHit};
-use super::report::{normalize_status_filter, SummaryRow};
+use super::report::normalize_status_filter;
+pub(super) use super::cache_report::{select_summary_rows, sum_cache_windows};
 
 mod raw;
 pub(super) use raw::{
@@ -70,32 +71,16 @@ pub(super) use raw::{
 /// `requests` 的列顺序（所有 SELECT 都按这个顺序取，`decode_request` 依赖它；
 /// 不写 `SELECT *` 是为了「加列时读侧要显式跟上」这件事在 diff 里可见）
 ///
-/// 末尾两列（`attempt_details` / `sensitive_hits`）是 schema v2 新增的 JSON 文本列
-/// （见 `db/schema.rs` 的 `V2_SCHEMA`）。它们必须排在**最后**：`decode_request`
-/// 按序号取值，而「加列」这件事只有在末尾才不牵动前面的序号 —— 中间插一列会让
-/// 所有后续字段的序号整体挪一位，那种改动在整个文件里看不出错，只会静默取错值。
+/// **新列一律追加在末尾**：`decode_request` 按序号取值，只有追加才不会牵动
+/// 前面字段的序号（中间插一列会让所有后续字段整体挪一位，那种改动在整个文件里
+/// 看不出错，只会静默取错值）。因此后加的列都在最后：
+///   - `attempt_details` / `sensitive_hits`（schema v2 的 JSON 文本列）；
+///   - `credit`（schema v23 的积分消耗，可空 REAL）。
 pub(super) const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
      client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, client, \
-     api_key_id, api_key_name, api_key_source";
-
-/// 报表窄列查询的列顺序 —— **与 `db::schema` 的 `idx_requests_summary` 列序一致**
-/// （索引是 `ts, is_test` 前缀 + 这里的后 5 列），改任一侧都要回来对一眼。
-///
-/// 报表侧的明细只服务两件事：近 24 小时逐小时趋势（本文件的
-/// [`select_summary_rows`]）与四档命中率（已由 [`sum_cache_windows`] 在 SQL 侧
-/// 算完，不再搬行）。两件事合起来只碰这 6 列，而 `requests` 一行里另外那些列
-/// （`route` 在实测库里平均 1.5 KB、`attempt_details` / `sensitive_hits` 各是
-/// JSON 数组文本…）报表一个都用不上 —— 按 [`REQUEST_COLUMNS`] 全列读，等于把
-/// 「读 24 小时的统计口径」变成「读 24 小时里躺在行内的十几 MB 无关字节」，
-/// 这正是本次改造要消掉的主要开销（同一份数据实测：全列读 273 ms、窄列读
-/// 98 ms，Rust 侧比例相同）。
-///
-/// `is_test` 只在 WHERE 里出现（报表恒排除测试流量），不进结构体，所以不在这
-/// 份列清单里 —— 它在索引中排在 `ts` 之后、这 5 列之前。
-const SUMMARY_COLUMNS: &str =
-    "ts, model, upstream_model, total_tokens, cache_read_tokens, prompt_tokens";
+     api_key_id, api_key_name, api_key_source, credit, client_evidence";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -164,7 +149,13 @@ pub(super) fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
                 name: row.get(27)?,
                 source: row.get(28)?,
             },
+            evidence: serde_json::from_str::<crate::server::core::client::ClientEvidence>(&row.get::<_, String>(30)?).ok()
+                .filter(|evidence| !evidence.method.is_empty()),
+            behavior_client: String::new(),
         },
+        // 末列是 schema v23 加的（积分消耗）；旧行 / 没上报的行是 NULL ——
+        // 读成 None，与「上报了 0」分开（前端前者显示「—」）。
+        credit: row.get(29)?,
     })
 }
 
@@ -334,21 +325,41 @@ pub(super) fn count_matching(
     Ok(count.max(0) as usize)
 }
 
-/// 命中筛选条件的**进行中**行数（`QueryResult.running`）。
+/// 列表页一次要的三个计数（总条数 / 命中条数 / 其中进行中）—— **一次扫描**。
 ///
-/// 一条 COUNT：在筛选计划上追加 `status = 0` —— 与列表共用同一份 WHERE，
-/// 「这批筛选里还有几条没跑完」才是列表页徽标要的口径。
-pub(super) fn count_running(
+/// 原先三条独立 `COUNT(*)`：每条都在自己的 WHERE 上扫一遍表，而列表页每秒
+/// 轮询一次，明细上百万行时等于每秒三遍全表。这里把三个计数写成同一个
+/// `SELECT` 里的 `COUNT(*)` 与两个 `SUM(CASE ...)`，扫描次数从三降到一。
+///
+/// 每个 `CASE` 都要各自一组绑定参数（SQLite 不保证跨表达式复用），所以绑定
+/// 值按「命中」与「命中且 status=0」各复制一份。
+pub(super) fn counts(
     conn: &Connection,
     plan: &FilterPlan,
-) -> rusqlite::Result<usize> {
-    let sql = if plan.where_sql.is_empty() {
-        "SELECT COUNT(*) FROM requests WHERE status = 0".to_string()
-    } else {
-        format!("SELECT COUNT(*) FROM requests{} AND status = 0", plan.where_sql)
-    };
-    let count: i64 = conn.query_row(&sql, params_from_iter(plan.binds.iter()), |row| row.get(0))?;
-    Ok(count.max(0) as usize)
+) -> rusqlite::Result<(usize, usize, usize)> {
+    let filter = plan
+        .where_sql
+        .strip_prefix(" WHERE ")
+        .unwrap_or("1");
+    let sql = format!(
+        "SELECT COUNT(*), \
+         COALESCE(SUM(CASE WHEN ({filter}) THEN 1 ELSE 0 END), 0), \
+         COALESCE(SUM(CASE WHEN ({filter}) AND status = 0 THEN 1 ELSE 0 END), 0) \
+         FROM requests"
+    );
+    let mut binds = Vec::with_capacity(plan.binds.len() * 2);
+    binds.extend(plan.binds.iter().cloned());
+    binds.extend(plan.binds.iter().cloned());
+    let (total, matched, running): (i64, i64, i64) = conn.query_row(
+        &sql,
+        params_from_iter(binds.iter()),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok((
+        total.max(0) as usize,
+        matched.max(0) as usize,
+        running.max(0) as usize,
+    ))
 }
 
 /// 筛选下拉的候选清单：明细里出现过的模型名与 provider id（各按出现次数降序）。
@@ -427,7 +438,16 @@ fn select_distinct_ordered(
 }
 
 pub(super) fn source_filter_options(conn: &Connection, max: usize) -> rusqlite::Result<Value> {
-    let clients = select_distinct_ordered(conn, "client", max)?;
+    let mut client_stmt = conn.prepare(
+        "SELECT grouped.client, CASE WHEN json_valid(r.client_evidence) \
+         THEN COALESCE(json_extract(r.client_evidence, '$.clientName'), '') ELSE '' END \
+         FROM (SELECT client, MAX(row_id) AS latest, COUNT(*) AS n FROM requests \
+         GROUP BY client ORDER BY n DESC, client LIMIT ?1) grouped \
+         JOIN requests r ON r.row_id = grouped.latest ORDER BY grouped.n DESC, grouped.client",
+    )?;
+    let clients = client_stmt.query_map(params![max as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut stmt = conn.prepare(
         "SELECT api_key_id, api_key_source, \
          (SELECT r.api_key_name FROM requests r WHERE r.api_key_id = requests.api_key_id \
@@ -441,8 +461,8 @@ pub(super) fn source_filter_options(conn: &Connection, max: usize) -> rusqlite::
         };
         Ok(serde_json::json!({ "value": identity.filter_value(), "label": super::source_report::key_label(&identity) }))
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut clients: Vec<Value> = clients.into_iter().map(|client| serde_json::json!({
-        "value": client, "label": super::source_report::client_label(&client),
+    let mut clients: Vec<Value> = clients.into_iter().filter(|(client, _)| !client.is_empty()).map(|(client, label)| serde_json::json!({
+        "value": client, "label": if label.is_empty() { super::source_report::client_label(&client).to_string() } else { label },
     })).collect();
     clients.push(serde_json::json!({ "value": "", "label": "未记录客户端" }));
     Ok(serde_json::json!({ "clients": clients, "apiKeys": keys }))
@@ -490,7 +510,7 @@ pub(super) fn select_page_desc(
 ///
 /// 现在只剩一个用途：`aggregate::rebuild_day` 重算某天聚合时取那一天的明细
 /// （报表读明细的两条路都已改窄 —— 命中率走 [`sum_cache_windows`] 的 SQL 聚合、
-/// 趋势走 [`select_summary_rows`] 的 6 列，见各自的说明；它们正是拿掉了这里
+/// 趋势走 [`select_summary_rows`] 的用量与结果窄列；它们正是拿掉了这里
 /// 那 25 列里「报表一个字段都用不到」的大字段）。
 /// 顺序取升序是为了让重算与 `record` 的累加次序一致 —— 三个维度数组里条目的
 /// 先后只影响视觉，但没必要制造差异。
@@ -517,117 +537,6 @@ pub(super) fn select_between(
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         out.push(decode_request(row)?);
-    }
-    Ok(out)
-}
-
-/// 取区间内的**报表窄列**（[`SUMMARY_COLUMNS`] 那 6 列），给近 24 小时趋势用。
-///
-/// 与 [`select_between`] 的分工：那个返回完整 `RequestEntry`（按天重算与别处
-/// 需要逐条看的场景都要），本函数只服务报表 —— 列集就是索引
-/// `idx_requests_summary` 覆盖的那几列，于是这条查询是**纯索引扫描**，一行明细
-/// 里的大字段（`route` 等）根本不会被读出来（列集与索引列序的对应关系见
-/// [`SUMMARY_COLUMNS`]）。
-///
-/// 恒排除测试流量（`is_test = 0`）：报表回答的是「真实流量长什么样」，模型测试
-/// 是人工反复发起的样本（与 `select_between` 的 `exclude_tests` 同一口径）。
-/// 因此调用方不必再传那个开关 —— 报表是这里唯一的用途。
-///
-/// 不写 `ORDER BY`：调用方按整点归桶，跨桶与桶内都不依赖行序
-/// （`report::cache_trend_24h` 的桶序由 24 个整点键决定，模型明细由
-/// `model_breakdown_json` 显式排序）。省掉排序也让 SQLite 能自由选扫描方向。
-pub(super) fn select_summary_rows(
-    conn: &Connection,
-    from_ms: i64,
-    to_ms: i64,
-) -> rusqlite::Result<Vec<SummaryRow>> {
-    let sql = format!(
-        "SELECT {SUMMARY_COLUMNS} FROM requests \
-         WHERE ts >= ?1 AND ts <= ?2 AND is_test = 0"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params![from_ms, to_ms])?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        out.push(SummaryRow {
-            ts: row.get(0)?,
-            model: row.get(1)?,
-            upstream_model: row.get(2)?,
-            total_tokens: row.get(3)?,
-            cache_read_tokens: row.get(4)?,
-            prompt_tokens: row.get(5)?,
-        });
-    }
-    Ok(out)
-}
-
-/// 各命中率窗口的 `(hitTokens, inputTokens)` 合计，**一次索引扫描算完**。
-///
-/// ── 为什么下推给 SQL ────────────────────────────────────────
-/// 改造前四档窗口是「把 7 天明细全读回 Rust，再对同一个数组遍历四遍」——
-/// 搬那次（含 `route` 等无关列）比算这次贵两个数量级。而报表页默认每秒轮询
-/// 一次（`config::DEFAULT_REPORT_AUTO_REFRESH_SECONDS`），这笔开销是**持续**的。
-/// 一次范围扫描就能同时算出四组 `CASE WHEN` 合计。
-///
-/// ── 扫描下界必须是**最长**的那个窗口（踩过一次的坑）──────────
-/// 初版写成「取最短窗口当下界」，看着像省了扫描量，实则**算错**：`WHERE`
-/// 已经把结果集限制在最近 10 分钟内了，后面 `CASE WHEN ts >= (now-24h)` 的
-/// 条件对这批行**恒为真**，于是四档算出同一个数（全等于 10 分钟窗口）。
-/// 这个错不会报错、不会抛异常，只会让报表上四档命中率长得一模一样 ——
-/// 实测数据里前三个窗口刚好同值时尤其难发现。正确形态是「扫描范围覆盖最长
-/// 窗口，各档在 `CASE WHEN` 里自己收窄」。
-///
-/// 代价上这也划算：`WHERE ts >= ?1`（最长窗口）配 `idx_requests_summary`
-/// 是**纯索引扫描**（命中的列全在索引里，不回表），实测同一份数据上
-/// 3 万行库、7 天窗口 68 ms → 3.4 ms。
-///
-/// `windows_ms` 由调用方给出（`report::CACHE_WINDOWS`，窗口值与 JSON 键名在
-/// 那里一处定义），返回顺序与入参一一对应 —— 本函数只做「按窗口求和」，不含
-/// 任何口径判断（`safe_rate` 的零除与越界处理仍在 `report` 层）。
-///
-/// 每个窗口给 `SUM(CASE WHEN ... END)` 而不是 `SUM(...) FILTER`：SQLite 到
-/// 3.30 才支持 `FILTER` 子句，而 `CASE WHEN` 在所有版本上语义相同。`COALESCE`
-/// 兜住「一个窗口都没有行」时的 NULL —— 返回 0 与「没有数据」在展示层是同一
-/// 种读数（命中率 0%），不必让调用方区分。
-pub(super) fn sum_cache_windows(
-    conn: &Connection,
-    now_ms: i64,
-    windows_ms: &[i64],
-) -> rusqlite::Result<Vec<(i64, i64)>> {
-    let Some(longest) = windows_ms.iter().copied().max() else {
-        return Ok(Vec::new());
-    };
-    // 参数位：?1 = 扫描下界（**最长**窗口，见上面那段）、?2..?n = 各窗口下界、
-    // 最后一位 = now（闭区间上界，与原来的 `ts <= now` 判定一致）
-    let mut sql = String::from("SELECT ");
-    for index in 0..windows_ms.len() {
-        if index > 0 {
-            sql.push_str(", ");
-        }
-        let slot = index + 2;
-        sql.push_str(&format!(
-            "COALESCE(SUM(CASE WHEN ts >= ?{slot} THEN cache_read_tokens END), 0), \
-             COALESCE(SUM(CASE WHEN ts >= ?{slot} THEN prompt_tokens END), 0)"
-        ));
-    }
-    let last = windows_ms.len() + 2;
-    sql.push_str(&format!(
-        " FROM requests WHERE ts >= ?1 AND ts <= ?{last} AND is_test = 0"
-    ));
-    let mut binds: Vec<i64> = Vec::with_capacity(windows_ms.len() + 2);
-    binds.push(now_ms - longest);
-    binds.extend(windows_ms.iter().map(|window| now_ms - window));
-    binds.push(now_ms);
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params_from_iter(binds.iter()))?;
-    // 无 GROUP BY 的聚合查询恒返回一行；真出现空结果（不该发生）时按「各窗口
-    // 都没有数据」降级 —— 与 `safe_rate` 的零除口径一致，比 panic 合适
-    let Some(row) = rows.next()? else {
-        return Ok(vec![(0, 0); windows_ms.len()]);
-    };
-    let mut out = Vec::with_capacity(windows_ms.len());
-    for index in 0..windows_ms.len() {
-        out.push((row.get::<_, i64>(index * 2)?, row.get::<_, i64>(index * 2 + 1)?));
     }
     Ok(out)
 }
@@ -678,10 +587,10 @@ pub(super) fn insert_started_request(
     // 进行中行也应带上 —— 等收尾再补会让列表里「客户端」列在转发期间空一格
     conn.execute(
         "INSERT INTO requests (id, ts, model, client_model, client_reasoning, status, \
-         phase, phase_started_at, is_test, client, api_key_id, api_key_name, api_key_source) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6, ?7, ?8, ?9, ?10)",
+         phase, phase_started_at, is_test, client, api_key_id, api_key_name, api_key_source, client_evidence) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![id, ts, model, client_model, client_reasoning, is_test as i64,
-            source.client, source.api_key.id, source.api_key.name, source.api_key.source],
+            source.client, source.api_key.id, source.api_key.name, source.api_key.source, source.evidence_json()],
     )?;
     Ok(true)
 }
@@ -814,7 +723,7 @@ pub(super) fn update_running_request(
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
          is_test = ?22, route = ?23, client = ?24, \
-         api_key_id = ?25, api_key_name = ?26, api_key_source = ?27 \
+         api_key_id = ?25, api_key_name = ?26, api_key_source = ?27, credit = ?28, client_evidence = ?29 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -848,6 +757,8 @@ pub(super) fn update_running_request(
             entry.source.api_key.id,
             entry.source.api_key.name,
             entry.source.api_key.source,
+            entry.credit,
+            entry.source.evidence_json(),
         ],
     )
 }
@@ -874,9 +785,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
          sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, client, \
-         api_key_id, api_key_name, api_key_source) \
+         api_key_id, api_key_name, api_key_source, credit, client_evidence) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         params![
             entry.id,
             entry.ts,
@@ -905,6 +816,8 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.source.api_key.id,
             entry.source.api_key.name,
             entry.source.api_key.source,
+            entry.credit,
+            entry.source.evidence_json(),
         ],
     )?;
     Ok(())

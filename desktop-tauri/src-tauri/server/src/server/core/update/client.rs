@@ -42,7 +42,7 @@ pub fn github_headers() -> Vec<(String, String)> {
 ///
 /// 对应 Node 版 resolveEgressCandidates —— Clash 配置不可读时只有一个候选，
 /// 行为与纯直连一致（这里不吞掉整条链路：探测失败只在 verbose 里留痕）。
-fn resolve_egress_candidates() -> Result<Vec<(String, Option<ResolvedProxy>)>, String> {
+pub(super) fn resolve_egress_candidates() -> Result<Vec<(String, Option<ResolvedProxy>)>, String> {
     // 设置里指定了更新出口：只用它（理由见模块头「候选顺序」）
     if let Some(configured) = config::update_proxy() {
         match resolve_account_proxy(Some(&configured)) {
@@ -89,10 +89,19 @@ fn resolve_egress_candidates() -> Result<Vec<(String, Option<ResolvedProxy>)>, S
     Ok(candidates)
 }
 
+pub(super) fn egress_identity() -> Value {
+    match resolve_egress_candidates() {
+        Ok(candidates) => json!(candidates.into_iter().map(|(_, proxy)| proxy.map(|proxy| {
+            json!([proxy.source, proxy.protocol, proxy.host, proxy.port, proxy.username, proxy.password])
+        })).collect::<Vec<_>>()),
+        Err(message) => json!({ "error": message }),
+    }
+}
+
+#[derive(Clone)]
 pub struct JsonResponse {
     pub value: Value,
     pub status: reqwest::StatusCode,
-    pub headers: reqwest::header::HeaderMap,
     pub official: bool,
 }
 
@@ -100,64 +109,9 @@ pub async fn fetch_json(
     url: &str,
     headers: &[(String, String)],
     timeout_ms: u64,
-    validate: impl Fn(&Value) -> bool,
+    validate: impl Fn(&Value) -> bool + Sync,
 ) -> Result<JsonResponse, UpdateError> {
-    let candidates = source::candidates(url, true);
-    let mut last_error = UpdateError::new("没有可用的 GitHub 源");
-    for candidate in &candidates {
-        if let Some(message) = candidate.cooling_message(headers) {
-            return Err(UpdateError::new(message));
-        }
-        let response = match fetch_candidate(candidate, headers, Some(timeout_ms)).await {
-            Ok(response) => response,
-            Err(error) => {
-                candidate.forget();
-                last_error = UpdateError::new(error);
-                continue;
-            }
-        };
-        let status = response.status();
-        let response_headers = response.headers().clone();
-        let official = candidate.source == Source::Official && source::is_resource(url);
-        if source::should_switch(candidate, status) {
-            candidate.forget();
-            last_error = UpdateError::new(format!(
-                "{}返回 HTTP {}",
-                candidate.label(),
-                status.as_u16()
-            ));
-            continue;
-        }
-        if !status.is_success() {
-            return Ok(JsonResponse {
-                value: Value::Null,
-                status,
-                headers: response_headers,
-                official,
-            });
-        }
-        match response.json::<Value>().await {
-            Ok(value) if validate(&value) => {
-                candidate.remember();
-                return Ok(JsonResponse {
-                    value,
-                    status,
-                    headers: response_headers,
-                    official,
-                });
-            }
-            Ok(_) => {
-                candidate.forget();
-                last_error = UpdateError::new(format!("{}返回的数据格式无效", candidate.label()));
-            }
-            Err(error) => {
-                candidate.forget();
-                last_error =
-                    UpdateError::new(format!("{}返回的 JSON 无效：{error}", candidate.label()));
-            }
-        }
-    }
-    Err(last_error)
+    super::selection::fetch_json(url, headers, timeout_ms, &validate).await
 }
 
 pub async fn fetch_official(
@@ -165,9 +119,7 @@ pub async fn fetch_official(
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
 ) -> Result<reqwest::Response, UpdateError> {
-    fetch_github(url, headers, timeout_ms, false)
-        .await
-        .map_err(UpdateError::new)
+    fetch_github(url, headers, timeout_ms, false).await
 }
 
 async fn fetch_github(
@@ -175,49 +127,54 @@ async fn fetch_github(
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
     allow_mirror: bool,
-) -> Result<reqwest::Response, String> {
-    let candidates = source::candidates(url, allow_mirror);
-    let mut last_error = String::new();
+) -> Result<reqwest::Response, UpdateError> {
+    let mut candidates = source::candidates(url, allow_mirror);
+    source::ensure_available(&candidates, headers)?;
+    if allow_mirror && candidates.len() > 1 && config::github_access().mode == config::GithubAccessMode::Auto {
+        candidates = super::probe::rank(url, true, headers).await?;
+    }
+    let mut failures = super::rate_limit::Failures::default();
     for (index, candidate) in candidates.iter().enumerate() {
-        if let Some(message) = candidate.cooling_message(headers) {
-            return Err(message);
+        if let Some(error) = candidate.cooling_error(headers) {
+            failures.push(error);
+            continue;
         }
+        let started = std::time::Instant::now();
         let response = match fetch_candidate(candidate, headers, timeout_ms).await {
             Ok(response) => response,
             Err(error) => {
-                candidate.forget();
-                last_error = error;
+                candidate.observe(source::failed_state(&error.message), started.elapsed().as_millis() as u64, false);
+                failures.push(error);
                 continue;
             }
         };
         if source::should_switch(candidate, response.status()) && index + 1 < candidates.len() {
-            candidate.forget();
-            last_error = format!(
-                "{}返回 HTTP {}",
-                candidate.label(),
-                response.status().as_u16()
-            );
+            candidate.observe("failed", started.elapsed().as_millis() as u64, false);
+            failures.push(UpdateError::new(format!("{}返回 HTTP {}", candidate.label(), response.status().as_u16())));
             continue;
         }
         if response.status().is_success() {
-            candidate.remember();
+            candidate.observe("ok", started.elapsed().as_millis() as u64, allow_mirror);
         }
         return Ok(response);
     }
-    Err(last_error)
+    Err(failures.error())
 }
 
 pub async fn fetch_candidate(
     candidate: &Candidate,
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
-) -> Result<reqwest::Response, String> {
-    if let Some(message) = candidate.cooling_message(headers) {
-        return Err(message);
+) -> Result<reqwest::Response, UpdateError> {
+    if candidate.proxy != config::update_proxy() || candidate.egress != super::rate_limit::egress_key() {
+        return Err(UpdateError::new("更新通道已改变，请重新检查更新。"));
+    }
+    if let Some(error) = candidate.cooling_error(headers) {
+        return Err(error);
     }
     let mut last_error = String::new();
-    for (label, proxy) in resolve_egress_candidates()? {
-        let client = egress::client_for_github(proxy.as_ref())?;
+    for (label, proxy) in resolve_egress_candidates().map_err(UpdateError::new)? {
+        let client = egress::client_for_github(proxy.as_ref()).map_err(UpdateError::new)?;
         let request = async {
             let mut current = url::Url::parse(&candidate.url).map_err(|error| error.to_string())?;
             for _ in 0..10 {
@@ -244,7 +201,6 @@ pub async fn fetch_candidate(
                     return Ok(response);
                 }
                 if !response.status().is_redirection() {
-                    candidate.record_rate_limit(headers, &response);
                     return Ok(response);
                 }
                 let location = response
@@ -270,7 +226,10 @@ pub async fn fetch_candidate(
                 .unwrap_or_else(|_| Err("连接 GitHub 源超时".to_string()))
         };
         match outcome {
-            Ok(response) => return Ok(response),
+            Ok(response) => return tokio::time::timeout(
+                Duration::from_millis(timeout_ms.unwrap_or(12_000)),
+                candidate.inspect_response(headers, response),
+            ).await.unwrap_or_else(|_| Err(UpdateError::new("读取 GitHub 源响应超时"))),
             Err(error) => {
                 logging::verbose(
                     "[Update]",
@@ -280,7 +239,7 @@ pub async fn fetch_candidate(
             }
         }
     }
-    Err(last_error)
+    Err(UpdateError::new(last_error))
 }
 
 /// 非 GitHub 公网端点只复用出网代理，不改写地址或发送 GitHub 凭证。
@@ -290,7 +249,7 @@ pub async fn fetch_public(
     timeout_ms: Option<u64>,
 ) -> Result<reqwest::Response, String> {
     if source::is_resource(url) {
-        return fetch_github(url, headers, timeout_ms, true).await;
+        return fetch_github(url, headers, timeout_ms, true).await.map_err(|error| error.message);
     }
     let host = url::Url::parse(url)
         .ok()
@@ -322,6 +281,9 @@ async fn fetch_via_candidates(
             builder = builder.timeout(Duration::from_millis(timeout_ms));
         }
         for (name, value) in headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
             builder = builder.header(name.as_str(), value.as_str());
         }
         match builder.send().await {

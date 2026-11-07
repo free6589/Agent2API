@@ -83,7 +83,11 @@ Stop-Service Agent2API
 .\install-service.ps1 -Uninstall
 ```
 
-**Upgrading**: unpack the new version and run `install-service.ps1` again (it stops the service, overwrites program and UI, then starts it again; data and config are untouched).
+**One-click updates**: standard Windows service installations offer “One-click update” under Settings → Updates. After confirmation, the server package is downloaded and independently verified against the official digest. A temporary updater stops the service, waits for file handles to close, backs up and replaces files, and starts it again. The page refreshes after confirming the new service version; accounts, settings and data are preserved.
+
+**Existing installations / manual upgrade**: extract the new server package into a new directory and run `install-service.ps1` once as administrator. It preserves registered install and data paths, ports, environment settings and the service account by default. Only explicit options such as the port override existing values; directory migration is separate. Subsequent upgrades can use the panel.
+
+Only SYSTEM and administrators can write program files. Update work files are under `<install directory>\.service-update`; no persistent service is added. Set `AGENT2API_WINDOWS_UPDATE=0` in the service environment to disable the entry. Custom service accounts, directory links, network paths and external job-managed deployments remain manual without automatic elevation. Replacement failures restore old files; startup failures retain logs and backups without rolling back the database.
 
 > **Two Windows-specific traps that the script already handles**:
 > a service process's working directory is `C:\Windows\system32`, not the folder the exe lives in — the UI directory is located from the exe path, so it is unaffected; the data directory is written explicitly into the service's registry entry as `AGENT2API_PROXY_HOME` (without it, data would land under LocalSystem's `C:\Windows\system32\config\systemprofile`, where nobody would ever find it).
@@ -114,7 +118,11 @@ journalctl -u agent2api -f
 
 Launch at boot, automatic restart after a crash (`Restart=always`) and graceful shutdown on SIGTERM (it waits for in-flight requests, so long-lived SSE connections are not cut off) are all preconfigured. After editing `/etc/agent2api/agent2api.env`, run `systemctl restart agent2api` to apply it.
 
-> **Do not enable `AGENT2API_SELF_UPDATE` on bare metal**: that is the in-container mechanism (replace files, exit, let the container's restart policy bring it back). On a bare-metal host the program files belong to root and the service account cannot replace them; the unit sets it to `0` explicitly. Upgrade with `install.sh --upgrade` instead.
+> **systemd one-click updates**: standard installations include a restricted update helper. Click “One-click update” and confirm to download, independently verify official checksums, back up and replace files, restart and confirm the new service. Accounts and settings are preserved; the gateway remains unprivileged and program files stay root-owned.
+>
+> For an older installation, download a new server package containing this feature and run `sudo bash install.sh --upgrade` from that package once. This installs the update helper. Custom service accounts or paths are not overwritten; keep using your existing deployment procedure. Set `AGENT2API_SYSTEMD_UPDATE=0` to hide the panel entry, or disable `agent2api-updater.socket` to disable the helper. `AGENT2API_SELF_UPDATE` remains Docker-only; do not enable it on bare metal.
+>
+> The helper uses a local socket, not a network port. It verifies the release repository through the official index by default. Administrators may set `AGENT2API_UPDATER_REPO=owner/repo` or `HTTPS_PROXY` in `/etc/agent2api/updater.env` to pin a repository or configure a proxy for independent verification. Replacement failures restore the old files. If the new service cannot be confirmed ready, recovery files remain in `/opt/agent2api/.before-update-*` and failure is reported; the database is never rolled back automatically.
 
 ### After installing
 
@@ -145,9 +153,11 @@ Both the administrator and the gateway key can be preset with environment variab
 | `AGENT2API_LOG_FILE` | Log file path, default `{data directory}/logs/server.log` |
 | `AGENT2API_VERBOSE` | Set to `1` for debug logging |
 
-On Linux put them in `/etc/agent2api/agent2api.env`; on Windows edit the service registry key `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment` (`install-service.ps1` already writes the basics there; rerunning the script overwrites it).
+On Linux put them in `/etc/agent2api/agent2api.env`; on Windows edit the service registry key `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment` (`install-service.ps1` writes the basic settings and preserves existing configuration on reruns, changing only settings explicitly supplied as parameters).
 
 > **Accounts cannot be preset**: they need a QR scan / SMS code / pasted credentials, which the upstream protocols decide, so there is no way around it. For bulk deployment, copy a fully configured **data directory** over (the SQLite database and `account.key` live side by side), and the accounts move with it.
+
+**Trae response completeness check (desktop / server / Docker)**: enabled by default. Only when investigating compatibility false positives, set `AGENT2API_TRAE_NO_REQUIRE_TERMINAL=1` in the gateway process environment (`true`, `yes` and `on` are also accepted), then restart the gateway so the plugin inherits the new environment. Disabling it may once again accept partial replies without an upstream completion signal as successful; remove the variable and restart to restore the check. This switch requires the provider plugin package containing this fix.
 
 ## Docker
 
@@ -185,9 +195,30 @@ Environment variables (all optional):
 | `AGENT2API_ALLOW_NO_KEY` | Set to `1` to serve `/v1` without any key — private networks only |
 | `AGENT2API_CAPTCHA_ENABLED` | Login-page human verification widget: `1` enabled (default), `0` disabled |
 | `AGENT2API_SELF_UPDATE` | In-container update entry: `1` enabled by default (the panel offers "Download and update"); set `0` to upgrade manually only |
+| `AGENT2API_IMAGE_CACHE_MB` | Upper bound of the in-memory download cache for generated images (MiB, default `128`, range 8–4096). Invalid or out-of-range values fall back to the default |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | Upper bound of the in-memory cache for compressed session images (MiB, default `128`, range 8–4096, same rules) |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Advanced: point update checks/downloads at your own source. The first swaps the repository (defaults to the upstream `aimod-cc/Agent2API`; forks should override it), the second swaps the API root (default `https://api.github.com`, must return a GitHub-shaped release JSON). With a custom source set, the download allowlist additionally admits only **that source's own host** (scheme follows the source: an `http://` source also allows plaintext downloads — for local drills / internal mirrors only) |
 
 Build from source: clone the repo and run `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
+
+### Memory usage
+
+The gateway in the image (Linux targets) ships with the jemalloc allocator built in. Over long uptimes and under concurrent multi-account forwarding it fragments far less than the system allocator, so RSS no longer creeps upward — the single most common way a small machine gets dragged down or OOM-killed.
+
+On small machines, cap the container's memory: when it goes over, the kernel kills the process and `restart: unless-stopped` brings it back, which shows up as one restart instead of taking the host (or other services on it) down.
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+For compose, add `mem_limit: 1g` to the service (a commented example is in `docker-compose.yml`); on swarm or `docker compose --compatibility`, use `deploy.resources.limits.memory`. Treat 1g as a starting point and tune it to your concurrency.
+
+Both in-memory image caches can be shrunk with environment variables (128 MiB each by default): `AGENT2API_IMAGE_CACHE_MB` (download cache for generated images) and `AGENT2API_IMAGE_COMPRESS_CACHE_MB` (cache of compressed session images). Invalid or out-of-range values fall back to the default and never prevent startup.
+
+glibc allocator tuning such as `MALLOC_ARENA_MAX=2` only matters for builds **without** jemalloc (older images, a self-compiled server, desktop); this image no longer needs it.
 
 **Web panel capability notes** (these stem from having no local desktop client): web login (WorkBuddy / Qoder / Cline), SMS codes and pasted credentials work fully; web logins that need a callback on this machine (AutoClaw / CatPaw / Accio / CodeArts / Trae) and "import desktop login state" are unavailable — use pasted credentials instead. A desktop app with "expose the web management panel" turned on shows the same differences in a browser: one interface, one set of rules.
 

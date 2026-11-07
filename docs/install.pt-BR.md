@@ -83,7 +83,11 @@ Stop-Service Agent2API
 .\install-service.ps1 -Uninstall
 ```
 
-**Atualização**: extraia a versão nova e rode `install-service.ps1` de novo (ele para o serviço, sobrescreve programa e UI e inicia outra vez; dados e configuração ficam intactos).
+**Atualização com um clique**: instalações padrão como serviço Windows oferecem essa opção em Configurações → Atualizações. Após confirmar, o pacote Windows x64 é baixado e validado independentemente pelo hash oficial. Um processo temporário para o serviço, aguarda a liberação dos arquivos, faz backup, substitui e reinicia. A página é recarregada após confirmar a nova versão; contas, configurações e dados são preservados.
+
+**Instalações antigas / atualização manual**: extraia o pacote novo em outra pasta e execute `install-service.ps1` uma vez como administrador. Caminhos de instalação e dados, portas, variáveis e conta de serviço são preservados por padrão. Somente opções explícitas, como a porta, substituem os valores existentes; migração de diretórios é separada. Depois disso, use o painel para atualizar.
+
+Somente SYSTEM e administradores podem gravar os arquivos do programa. A pasta de trabalho é `<pasta de instalação>\.service-update`; nenhum serviço permanente é adicionado. Use `AGENT2API_WINDOWS_UPDATE=0` no ambiente do serviço para desativar a opção. Contas personalizadas, links de diretório, caminhos de rede e ambientes gerenciados por jobs externos continuam com atualização manual, sem elevação automática. Falhas na substituição restauram os arquivos antigos; falhas na inicialização preservam logs e backups sem reverter o banco de dados.
 
 > **Duas armadilhas específicas do Windows que o script já resolve**:
 > o diretório de trabalho de um processo de serviço é `C:\Windows\system32`, não a pasta do exe — o diretório da UI é localizado a partir do caminho do exe, então nada muda; o diretório de dados é gravado explicitamente na entrada de registro do serviço como `AGENT2API_PROXY_HOME` (sem isso os dados cairiam em `C:\Windows\system32\config\systemprofile` do LocalSystem, onde ninguém acharia).
@@ -114,7 +118,11 @@ journalctl -u agent2api -f
 
 Início no boot, reinício automático após travamento (`Restart=always`) e desligamento gracioso no SIGTERM (espera as requisições em andamento, então conexões SSE longas não são cortadas) já vêm configurados. Depois de editar `/etc/agent2api/agent2api.env`, rode `systemctl restart agent2api`.
 
-> **Não ative `AGENT2API_SELF_UPDATE` em máquina física**: aquele é o mecanismo de dentro do contêiner (troca arquivos, encerra e deixa a política de restart do contêiner subir de novo). Em máquina física os arquivos do programa pertencem ao root e a conta do serviço não pode substituí-los; a unidade já o define como `0` explicitamente. Atualize com `install.sh --upgrade`.
+> **Atualização systemd com um clique**: instalações padrão incluem um programa de atualização restrito. Após confirmar no painel, ele baixa, valida independentemente o checksum oficial, faz backup e substitui os arquivos, reinicia e confirma o novo serviço. Contas e configurações são preservadas; o gateway continua sem privilégios e os arquivos do programa permanecem protegidos pelo root.
+>
+> Em instalações antigas, baixe um novo pacote do servidor que inclua esse recurso e execute `sudo bash install.sh --upgrade` uma vez na pasta extraída para instalar o componente. Contas de serviço ou caminhos personalizados não são sobrescritos; mantenha seu procedimento de implantação. Use `AGENT2API_SYSTEMD_UPDATE=0` para desativar a opção no painel, ou desative `agent2api-updater.socket` para desativar o componente. `AGENT2API_SELF_UPDATE` continua exclusivo do Docker.
+>
+> O componente usa um socket local, sem abrir portas de rede. Por padrão, valida o repositório de releases pelo índice oficial. Para fixar um repositório ou configurar um proxy para a validação independente, configure `AGENT2API_UPDATER_REPO=owner/repo` ou `HTTPS_PROXY` em `/etc/agent2api/updater.env`. Falhas na substituição restauram os arquivos antigos. Se a nova inicialização não for confirmada, os arquivos de recuperação ficam em `/opt/agent2api/.before-update-*` e a falha é informada; o banco de dados nunca é revertido automaticamente.
 
 ### Depois de instalar
 
@@ -145,9 +153,11 @@ Tanto o administrador quanto a chave de gateway podem ser predefinidos por vari�
 | `AGENT2API_LOG_FILE` | Caminho do arquivo de log; padrão `{diretório de dados}/logs/server.log` |
 | `AGENT2API_VERBOSE` | `1` ativa o log de debug |
 
-No Linux coloque-as em `/etc/agent2api/agent2api.env`; no Windows edite a chave de registro do serviço `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment` (o `install-service.ps1` já grava o básico ali; rodar o script de novo sobrescreve).
+No Linux coloque-as em `/etc/agent2api/agent2api.env`; no Windows edite a chave de registro do serviço `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment` (o `install-service.ps1` grava as configurações básicas e, nas execuções seguintes, preserva as existentes, alterando apenas as opções informadas explicitamente como parâmetros).
 
 > **Contas não podem ser predefinidas**: elas exigem leitura de QR code / código por SMS / credenciais coladas, o que é decidido pelos protocolos do upstream — não há como contornar. Para implantação em massa, copie um **diretório de dados** já configurado (o banco SQLite e o `account.key` ficam lado a lado) e as contas vão junto.
+
+**Verificação de integridade da resposta do Trae (desktop / servidor / Docker)**: ativada por padrão. Somente ao investigar falsos positivos de compatibilidade, defina `AGENT2API_TRAE_NO_REQUIRE_TERMINAL=1` no ambiente do processo do gateway (`true`, `yes` e `on` também são aceitos) e reinicie o gateway para que o plugin herde o novo ambiente. Desativá-la pode voltar a aceitar respostas parciais sem o sinal de conclusão do upstream como bem-sucedidas; remova a variável e reinicie para restaurar a verificação. Essa opção exige o pacote de provedores que contém esta correção.
 
 ## Docker
 
@@ -185,9 +195,30 @@ Variáveis de ambiente (todas opcionais):
 | `AGENT2API_ALLOW_NO_KEY` | `1` desativa o fail-closed (serve `/v1` mesmo sem chave configurada — só para redes internas) |
 | `AGENT2API_CAPTCHA_ENABLED` | Widget de verificação humana na tela de login: `1` ativado (padrão), `0` desativado |
 | `AGENT2API_SELF_UPDATE` | Ponto de atualização dentro do contêiner: `1` ativado por padrão (o painel oferece "Baixar e atualizar"); `0` desativa e deixa apenas a atualização manual |
+| `AGENT2API_IMAGE_CACHE_MB` | Limite do cache em memória de download das imagens geradas (MiB, padrão `128`, faixa 8–4096). Valores inválidos ou fora da faixa voltam ao padrão |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | Limite do cache em memória do resultado da compactação de imagens de sessão (MiB, padrão `128`, faixa 8–4096, mesmas regras) |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Avançado: aponte "verificar atualizações / baixar atualizações" para a sua própria fonte. O primeiro troca o repositório (por padrão segue o upstream `aimod-cc/Agent2API`; em fork, sobrescreva), o segundo troca a raiz da API (padrão `https://api.github.com`; deve devolver um JSON de release no formato do GitHub). Com uma fonte própria configurada, a lista de permissões de download passa a aceitar, além disso, apenas **o próprio host dessa fonte** (o esquema segue a fonte: uma fonte `http://` também permite download em texto puro — só para ensaios locais / espelhos internos) |
 
 Compilar a partir do código: clone o repositório e rode `docker compose up -d --build` (a imagem contém apenas o gateway e o painel, sem toolchain Rust).
+
+### Uso de memória
+
+O gateway da imagem (alvos Linux) já vem com o alocador jemalloc embutido. Em execuções longas e com vários encaminhamentos de contas em paralelo ele fragmenta bem menos que o alocador do sistema, e o RSS deixa de subir aos poucos — que é justamente onde máquinas com pouca memória costumam travar ou ser mortas por OOM.
+
+Em máquinas com pouca memória, vale limitar a memória do contêiner: ao ultrapassar, o kernel mata o processo e o `restart: unless-stopped` o levanta de novo — o resultado é "um reinício" em vez de derrubar o host (ou outros serviços na mesma máquina).
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+No compose, adicione `mem_limit: 1g` ao serviço (há um exemplo comentado no `docker-compose.yml`); em swarm ou `docker compose --compatibility`, use `deploy.resources.limits.memory`. Encare o 1g como ponto de partida e ajuste à sua concorrência.
+
+Os dois caches de imagem mantidos em memória podem ser reduzidos por variável de ambiente (128 MiB cada por padrão): `AGENT2API_IMAGE_CACHE_MB` (cache de download das imagens geradas) e `AGENT2API_IMAGE_COMPRESS_CACHE_MB` (cache do resultado da compactação de imagens de sessão). Valores inválidos ou fora da faixa voltam ao padrão e nunca impedem a inicialização.
+
+Ajustes de alocador glibc como `MALLOC_ARENA_MAX=2` só fazem sentido em builds **sem** jemalloc (imagens antigas, servidor compilado por você, desktop); esta imagem não precisa disso.
 
 **Diferenças de recursos no painel web** (decorrem de "não haver cliente de desktop local"): login pela web (WorkBuddy / Qoder / Cline), código por SMS e credenciais coladas funcionam plenamente; logins pela web que exigem callback nesta máquina (AutoClaw / CatPaw / Accio / CodeArts / Trae) e a "importação do estado de login local" não estão disponíveis — use credenciais coladas. Com o desktop e a opção de expor o painel ativadas, abrir no navegador mostra as mesmas diferenças: uma interface, um conjunto de regras.
 

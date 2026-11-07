@@ -41,7 +41,7 @@ pub(super) fn parameter_supported(field: &str) -> bool {
     )
 }
 
-fn validate(
+pub(super) fn validate(
     payload: &mut Value,
     operation: image_models::ImageOperation,
 ) -> Result<(), GatewayError> {
@@ -332,9 +332,20 @@ pub(super) struct ImageExecution {
 
 pub(super) async fn execute(
     state: &ServerState,
-    mut payload: Value,
+    payload: Value,
     input: ImageExecution,
 ) -> Result<Value, GatewayError> {
+    execute_with_telemetry(state, payload, input, Arc::new(RequestTelemetry::with_id()), None).await
+}
+
+pub(super) async fn execute_with_telemetry(
+    state: &ServerState,
+    mut payload: Value,
+    input: ImageExecution,
+    telemetry: Arc<RequestTelemetry>,
+    timeout: Option<std::time::Duration>,
+) -> Result<Value, GatewayError> {
+    let deadline = timeout.map(|budget| tokio::time::Instant::now() + budget);
     let ImageExecution {
         operation,
         headers,
@@ -344,8 +355,14 @@ pub(super) async fn execute(
         is_assistant,
     } = input;
     let client_model = pipeline::model_field_text(&payload);
-    let resolved = validate(&mut payload, operation)
-        .and_then(|()| resolve_model(state, &mut payload, scope.as_ref(), operation));
+    let state_copy = state.clone();
+    let scope_copy = scope.clone();
+    let (prepared, resolved) = crate::server::core::blocking::run(move || {
+        let resolved = validate(&mut payload, operation)
+            .and_then(|()| resolve_model(&state_copy, &mut payload, scope_copy.as_ref(), operation));
+        (payload, resolved)
+    }).await?;
+    payload = prepared;
     let model = match resolved {
         Ok(model) => model,
         Err(error) => {
@@ -367,9 +384,9 @@ pub(super) async fn execute(
         operation.path(),
         &pipeline::user_agent_of(&headers),
     );
-    let telemetry = Arc::new(RequestTelemetry::with_id());
     let id = telemetry.id();
-    state.request_stats().record_started(
+    super::request_prepare::record_started(
+        state.request_stats(),
         &id,
         started_at,
         &model,
@@ -377,11 +394,11 @@ pub(super) async fn execute(
         "",
         &source,
         is_assistant,
-    );
+    ).await;
     if let Some(token) = cancellation::register(&id) {
         telemetry.set_cancel_token(token);
     }
-    let mut guard = DisconnectGuard::new(state.request_stats(), id.clone());
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry.clone(), started_at);
     telemetry.set_live_sink(pipeline::live_row_sink(
         state.request_stats(),
         id,
@@ -403,20 +420,31 @@ pub(super) async fn execute(
         ignore_model_gate: false,
         proxy_override: None,
     };
-    let result = match operation {
-        image_models::ImageOperation::Generate => state.upstream().generate_images(request).await,
-        image_models::ImageOperation::Edit => state.upstream().edit_images(request).await,
-    };
-    let outcome = match result {
-        Ok(ForwardOutcome::Completion { body }) => {
-            super::image_output::normalize(state, &payload, body, &headers, &telemetry).await
+    let work = async {
+        let result = match operation {
+            image_models::ImageOperation::Generate => state.upstream().generate_images(request).await,
+            image_models::ImageOperation::Edit => state.upstream().edit_images(request).await,
+        };
+        match result {
+            Ok(ForwardOutcome::Completion { body }) => {
+                super::image_output::normalize(state, &payload, body, &headers, &telemetry).await
+            }
+            Ok(ForwardOutcome::Stream { .. }) => Err(GatewayError::with_status(
+                502, "插件错误地把图片响应当作对话流",
+            )),
+            Err(error) => Err(error),
         }
-        Ok(ForwardOutcome::Stream { .. }) => Err(GatewayError::with_status(
-            502,
-            "插件错误地把图片响应当作对话流",
-        )),
-        Err(error) => Err(error),
     };
+    let outcome = if let Some(deadline) = deadline {
+        match tokio::time::timeout_at(deadline, work).await {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(token) = telemetry.cancel_token() { token.cancel(); }
+                Err(GatewayError::with_status(504, "图片任务超时，上游可能已消耗额度，未重新提交")
+                    .with_code("image_result_uncertain"))
+            }
+        }
+    } else { work.await };
     let (status, raw_response, error) = match &outcome {
         Ok(body) => (200, pipeline::capture_raw_json(body), None),
         Err(error) => (

@@ -15,6 +15,10 @@ pub struct AttemptDetail {
     pub account: String,
     #[serde(rename = "accountId", default)]
     pub account_id: String,
+    #[serde(rename = "candidateId", default)]
+    pub candidate_id: String,
+    #[serde(rename = "memberId", default)]
+    pub member_id: String,
     #[serde(default)]
     pub model: String,
     #[serde(default)]
@@ -71,8 +75,11 @@ impl TelemetrySnapshot {
 }
 
 impl RequestTelemetry {
-    pub fn set_route_decision(&self, decision: Value) {
+    pub fn set_route_decision(&self, mut decision: Value) {
         let mut guard = self.lock();
+        if let Some(vision) = guard.route.as_ref().and_then(|route| route.get("visionCompatibility")).cloned() {
+            if let Some(object) = decision.as_object_mut() { object.insert("visionCompatibility".into(), vision); }
+        }
         if guard.route.as_ref() == Some(&decision) { return; }
         guard.route = Some(decision);
         guard.route_revision = guard.route_revision.wrapping_add(1);
@@ -96,15 +103,17 @@ impl RequestTelemetry {
         let mut guard = self.lock();
         if guard.attempts_detail.len() >= MAX_ATTEMPT_DETAILS { return; }
         let account_id = guard.account_id.clone();
+        let candidate_id = guard.route.as_ref().and_then(|route| route.get("pickedCandidate")).and_then(Value::as_str).unwrap_or(&account_id).to_string();
+        let member_id = crate::server::core::routing_groups::member_key(&candidate_id).unwrap_or("").to_string();
         let reason = guard.route.as_ref()
             .and_then(|route| route.get("ordered")).and_then(Value::as_array)
-            .and_then(|entries| entries.iter().find(|entry| entry.get("id").and_then(Value::as_str) == Some(account_id.as_str())))
+            .and_then(|entries| entries.iter().find(|entry| entry.get("candidateId").and_then(Value::as_str).unwrap_or_else(|| entry.get("id").and_then(Value::as_str).unwrap_or("")) == candidate_id))
             .and_then(|entry| entry.get("reason")).and_then(Value::as_str).unwrap_or("");
         let reason = truncate_chars(reason, MAX_ATTEMPT_NOTICE_CHARS);
         let sticky_hit = guard.route.as_ref().and_then(|route| route.get("stickyHit")).and_then(Value::as_bool).unwrap_or(false);
         guard.attempts_detail.push(AttemptDetail {
             provider: provider.to_string(), account: truncate_chars(account, MAX_ATTEMPT_ACCOUNT_CHARS),
-            account_id, model: String::new(), reasoning: String::new(), reason, sticky_hit,
+            account_id, candidate_id, member_id, model: String::new(), reasoning: String::new(), reason, sticky_hit,
             started_at: Some(crate::server::logging::now_ms()), response_at: None, finished_at: None,
             status: None, error: None, retries: Vec::new(), notice: None, body_bytes: None,
         });

@@ -158,6 +158,7 @@ pub async fn get_system_info(
             "exePath": exe.as_deref().map(show).unwrap_or_default(),
             "installerKind": update::installer_kind(),
             "selfUpdate": selfupdate::supported(),
+            "updateCapability": update::capabilities::current(),
         },
         "security": {
             "adminRegistered": access::admin_registered(),
@@ -176,6 +177,7 @@ pub async fn get_system_info(
             "sanitizeFingerprints": snapshot.sanitize_fingerprints(),
             "cors": snapshot.cors_enabled(),
             "developerRoleCompat": snapshot.developer_role_compat(),
+            "thirdPartyReasoningCollapse": snapshot.third_party_reasoning_collapse(),
             "keepaliveStrip": config::strip_newline_keepalive(),
             "autoContinue": config::auto_continue(),
             "autoContinueMaxRounds": config::auto_continue_max_rounds(),

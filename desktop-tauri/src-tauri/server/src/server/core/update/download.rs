@@ -42,6 +42,13 @@ impl UpdateManager {
     }
 
     pub fn start_download(&self, url: &str, name: &str) -> Result<Value, UpdateError> {
+        self.start_download_inner(url, name, false)
+    }
+
+    pub(super) fn start_download_inner(&self, url: &str, name: &str, systemd: bool) -> Result<Value, UpdateError> {
+        if !systemd && self.lock().service_update_active {
+            return Err(UpdateError::with_status(409, "服务端一键更新正在进行，不能另起下载"));
+        }
         if let Some(task) = self.lock().task.clone().filter(|task| task.active) {
             return Ok(task.to_json());
         }
@@ -58,6 +65,9 @@ impl UpdateManager {
         let cancel = Arc::new(AtomicBool::new(false));
         let snapshot = {
             let mut guard = self.lock();
+            if !systemd && guard.service_update_active {
+                return Err(UpdateError::with_status(409, "服务端一键更新正在进行，不能另起下载"));
+            }
             if let Some(task) = guard.task.as_ref().filter(|task| task.active) {
                 return Ok(task.to_json());
             }
@@ -70,6 +80,8 @@ impl UpdateManager {
                 path: None,
                 received: 0,
                 total: 0,
+                selecting: true,
+                source: None,
             };
             let snapshot = task.to_json();
             guard.task = Some(task);
@@ -108,6 +120,7 @@ impl UpdateManager {
             let mut guard = self.lock();
             if let Some(task) = guard.task.as_mut() {
                 task.active = false;
+                task.selecting = false;
                 task.path = None;
                 if !canceled {
                     match &outcome {
@@ -146,39 +159,56 @@ impl UpdateManager {
         cancel: &Arc<AtomicBool>,
     ) -> Result<u64, UpdateError> {
         let expected = integrity::trusted_digest(target.as_str()).await;
-        // 镜像不可同时提供程序与信任依据；只有官方 HTTPS API 的摘要才能放行。
-        let candidates = source::candidates(target.as_str(), expected.is_some());
-        if expected.is_none() && candidates.len() == 1 {
-            logging::verbose("[Update]", "未取得官方校验值，安装包仅使用原始源下载");
-        }
         let headers = vec![
             ("User-Agent".to_string(), USER_AGENT.to_string()),
             ("Accept".to_string(), "application/octet-stream".to_string()),
         ];
-        let mut last_error = UpdateError::new("没有可用的下载源");
+        // 镜像不可同时提供程序与信任依据；只有官方 HTTPS API 的摘要才能放行。
+        let candidates = source::download_candidates(target.as_str(), expected.is_some(), &headers).await?;
+        if expected.is_none() && candidates.len() == 1 {
+            logging::verbose("[Update]", "未取得官方校验值，安装包仅使用原始源下载");
+        }
+        let mut failures = super::rate_limit::Failures::default();
         for candidate in &candidates {
+            if let Some(error) = candidate.cooling_error(&headers) {
+                failures.push(error);
+                continue;
+            }
             if cancel.load(Ordering::SeqCst) {
                 return Ok(0);
             }
+            if let Some(task) = self.lock().task.as_mut() {
+                task.selecting = false;
+                task.source = Some(candidate.label());
+                task.received = 0;
+                task.total = 0;
+            }
+            let started = std::time::Instant::now();
             let response = match client::fetch_candidate(candidate, &headers, None).await {
                 Ok(response) => response,
                 Err(error) => {
-                    candidate.forget();
-                    last_error = UpdateError::new(error);
+                    candidate.observe(source::failed_state(&error.message), started.elapsed().as_millis() as u64, false);
+                    failures.push(error);
                     continue;
                 }
             };
-            if !response.status().is_success() {
-                last_error = UpdateError::new(format!(
+            if response.status().as_u16() != 200 {
+                let error = UpdateError::new(format!(
                     "下载失败：{}返回 HTTP {}",
                     candidate.label(),
                     response.status().as_u16()
                 ));
-                if source::should_switch(candidate, response.status()) {
+                if source::should_switch(candidate, response.status())
+                    || candidate.source == source::Source::Mirror
+                {
                     candidate.forget();
+                    failures.push(error);
                     continue;
                 }
-                return Err(last_error);
+                return Err(error);
+            }
+            if super::source_state::state(candidate).is_none_or(|state| state.state != "ok") {
+                candidate.observe("ok", started.elapsed().as_millis() as u64, false);
             }
             logging::log(
                 "[Update]",
@@ -198,12 +228,12 @@ impl UpdateManager {
                 }
                 Err(error) => {
                     candidate.forget();
-                    last_error = error;
+                    failures.push(error);
                     let _ = tokio::fs::remove_file(path).await;
                 }
             }
         }
-        Err(last_error)
+        Err(failures.error())
     }
 
     async fn write_response(

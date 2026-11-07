@@ -555,8 +555,7 @@ fn anthropic_effort(body: &Value) -> Option<String> {
     );
     let explicit = explicit.trim().to_lowercase();
     if !explicit.is_empty() {
-        // Anthropic 的 "max" 对应本项目的 "xhigh"（各家的最高档命名不一）
-        return Some(if explicit == "max" { "xhigh".to_string() } else { explicit });
+        return Some(explicit);
     }
     // thinking.enabled 但没给档位：按 budget 反推一个
     if thinking_type == "enabled" || thinking_type == "adaptive" {
@@ -581,8 +580,10 @@ fn effort_from_budget(budget: i64) -> &'static str {
         "medium"
     } else if budget <= 10240 {
         "high"
-    } else {
+    } else if budget <= 32768 {
         "xhigh"
+    } else {
+        "max"
     }
 }
 
@@ -677,23 +678,26 @@ pub(super) fn parse_json_object(value: &Value) -> Value {
 
 /// Chat 的 usage → Anthropic 的 usage
 pub fn usage_to_anthropic(usage: Option<&Value>) -> Value {
-    let Some(usage) = usage.filter(|value| value.is_object()) else {
-        return json!({ "input_tokens": 0, "output_tokens": 0 });
-    };
-    let number = |key: &str| -> i64 {
-        usage.get(key).and_then(Value::as_i64).unwrap_or(0)
-    };
-    let cached = usage
-        .pointer("/prompt_tokens_details/cached_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let input = number("prompt_tokens");
-    json!({
-        // Anthropic 的 input_tokens **不含**缓存命中部分，所以这里减掉
-        "input_tokens": (input - cached).max(0),
-        "output_tokens": number("completion_tokens"),
-        "cache_read_input_tokens": cached,
-    })
+    usage.and_then(super::usage::TokenUsage::from_chat).unwrap_or_default().anthropic()
+}
+
+/// 输入 token 估算：字符数 ÷ 3.5（中英混排的经验值，与 Anthropic 官方
+/// 「约 3.5 字符一个 token」同量级）。空文本给 1。
+///
+/// 与 `/v1/messages/count_tokens`（`api::chat::count_tokens`）**共用这一个口径**：
+/// 客户端会拿两个数字互相印证，对不上反而引出新的疑问。要「不估算」的调用方
+/// 请传 `None` / 先判空，而不是靠这个函数返回 0。
+pub fn estimate_tokens_for_text(text: &str) -> i64 {
+    let characters = text.chars().count();
+    ((characters as f64) / 3.5).ceil().max(1.0) as i64
+}
+
+/// 按请求体估算输入 token（对象走 JSON 文本，见 [`json_text`]）。
+///
+/// Anthropic 原始体与翻译后的 chat 体都能喂：两者都是对象、字符数量级一致，
+/// 差一个 `model` 字段的值不影响估算用途。
+pub fn estimate_tokens_for_body(body: &Value) -> i64 {
+    estimate_tokens_for_text(&json_text(body))
 }
 
 // ─── 流式：Chat SSE → Anthropic SSE ─────────────────────────
@@ -726,10 +730,19 @@ pub struct AnthropicStream {
     has_tool: bool,
     stop_reason: Option<String>,
     usage: Option<Value>,
+    /// 下游请求体的输入 token 估算（`estimate_tokens_for_body`）。
+    ///
+    /// 只在 `message_start` 用得上：上游 usage 要等流末尾那帧才到，而客户端
+    /// （Claude Code / Anthropic SDK）在发出 content block 的那一刻就把
+    /// `message_start` 的 usage 快照走了，等不到 `message_delta`。开头填 0
+    /// 会让它退回本地估算并逐轮累加（issue #437：面板 2.6M / 1M 虚高 50 倍）。
+    input_estimate: Option<i64>,
 }
 
 impl AnthropicStream {
-    pub fn new(model: &str) -> Self {
+    /// `input_estimate`：`message_start` 用的输入估算，`None` 表示调用方没有
+    /// 请求体可估（保持 0，与修复前一致）。取真实 usage 时始终以流末尾那帧为准。
+    pub fn new(model: &str, input_estimate: Option<i64>) -> Self {
         Self {
             buffer: SseLineBuffer::new(),
             message_id: random_id("msg"),
@@ -747,6 +760,7 @@ impl AnthropicStream {
             has_tool: false,
             stop_reason: None,
             usage: None,
+            input_estimate,
         }
     }
 
@@ -824,7 +838,7 @@ impl AnthropicStream {
             }
         }
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
-            self.usage = Some(usage.clone());
+            super::usage::merge_chat(&mut self.usage, usage);
         }
         let choice = chunk.pointer("/choices/0");
         if let Some(finish) = choice
@@ -1000,8 +1014,12 @@ impl AnthropicStream {
             return Vec::new();
         }
         self.started = true;
-        let mut usage = usage_to_anthropic(self.usage.as_ref());
-        usage["output_tokens"] = json!(0);
+        let mut tokens = self.usage.as_ref()
+            .and_then(super::usage::TokenUsage::from_chat).unwrap_or_default();
+        // 估算的是输入总量；已知的缓存读写仍须从普通输入中扣除。
+        tokens.prompt = tokens.prompt.or(self.input_estimate);
+        tokens.completion = Some(0);
+        let usage = tokens.anthropic();
         vec![self.event(
             "message_start",
             json!({
@@ -1085,7 +1103,7 @@ impl AnthropicCollector {
             }
         }
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
-            self.usage = Some(usage.clone());
+            super::usage::merge_chat(&mut self.usage, usage);
         }
         let choice = chunk.pointer("/choices/0");
         if let Some(finish) = choice

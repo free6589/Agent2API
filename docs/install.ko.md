@@ -83,7 +83,11 @@ Stop-Service Agent2API
 .\install-service.ps1 -Uninstall
 ```
 
-**업그레이드**: 새 버전의 압축을 풀고 `install-service.ps1` 를 다시 실행하면 됩니다(서비스 중지 → 프로그램과 UI 덮어쓰기 → 재시작. 데이터와 설정은 그대로입니다).
+**원클릭 업데이트**: 표준 Windows 서비스는 설정 → 업데이트에서 원클릭 업데이트를 제공합니다. 확인 후 Windows x64 서버 패키지를 다운로드하고 공식 해시를 독립적으로 검증합니다. 임시 업데이트 프로세스가 서비스를 중지하고 파일 점유가 풀릴 때까지 기다린 후 백업·교체·재시작합니다. 새 버전 실행 확인 후 페이지가 새로 고쳐지며 계정, 설정 및 데이터는 유지됩니다.
+
+**이전 설치 연결 / 수동 업그레이드**: 새 패키지를 새로운 폴더에 풀고 관리자 권한으로 `install-service.ps1`을 한 번 실행하세요. 등록된 설치·데이터 경로, 포트, 환경 설정 및 서비스 계정을 기본적으로 보존합니다. 포트처럼 명시한 옵션만 변경하며 디렉터리 이전은 별도로 진행합니다. 이후에는 패널에서 업데이트할 수 있습니다.
+
+프로그램은 SYSTEM과 관리자만 쓸 수 있으며 작업 폴더는 `<설치 폴더>\.service-update`입니다. 상주 서비스는 추가하지 않습니다. 서비스 환경의 `AGENT2API_WINDOWS_UPDATE=0`으로 기능을 끌 수 있습니다. 사용자 지정 계정, 디렉터리 링크, 네트워크 경로 및 외부 작업 그룹 관리 환경은 자동 권한 상승 없이 수동으로 업그레이드합니다. 교체 실패 시 이전 파일을 복원하고 새 버전 시작 실패 시 로그와 백업을 남기며 데이터베이스를 자동으로 되돌리지 않습니다.
 
 > **Windows 특유의 함정 두 가지는 스크립트가 이미 처리합니다**:
 > 서비스 프로세스의 작업 디렉터리는 exe 가 있는 폴더가 아니라 `C:\Windows\system32` 입니다 —— UI 디렉터리는 exe 경로로 찾으므로 영향이 없습니다. 데이터 디렉터리는 서비스 레지스트리의 `AGENT2API_PROXY_HOME` 에 명시적으로 기록합니다(설정하지 않으면 LocalSystem 의 `C:\Windows\system32\config\systemprofile` 아래로 떨어져 찾기 어렵습니다).
@@ -114,7 +118,11 @@ journalctl -u agent2api -f
 
 부팅 시 자동 시작, 크래시 후 자동 재시작(`Restart=always`), SIGTERM 우아한 종료(처리 중인 요청을 기다린 뒤 끝나므로 SSE 장기 연결이 끊기지 않습니다)가 모두 설정되어 있습니다. `/etc/agent2api/agent2api.env` 를 수정했다면 `systemctl restart agent2api` 로 반영합니다.
 
-> **베어메탈에서는 `AGENT2API_SELF_UPDATE` 를 켜지 마세요**: 그건 컨테이너 안의 방식입니다(파일을 바꾸고 종료한 뒤 컨테이너 restart 정책이 되살림). 베어메탈에서는 프로그램 파일 소유자가 root 이고 서비스 계정에는 교체 권한이 없어 유닛에서 명시적으로 `0` 으로 설정해 두었습니다. 업그레이드는 `install.sh --upgrade` 로 하세요.
+> **systemd 원클릭 업데이트**: 표준 설치에는 제한된 업데이트 프로그램이 포함됩니다. 패널에서 업데이트를 확인하면 다운로드, 공식 체크섬 독립 검증, 백업 및 교체, 재시작과 새 서비스 확인까지 수행합니다. 계정과 설정은 유지되며 게이트웨이는 일반 계정으로 실행되고 프로그램 파일은 root 소유로 보호됩니다.
+>
+> 이전 설치는 이 기능을 포함한 새 서버 패키지를 받아 해당 폴더에서 `sudo bash install.sh --upgrade`를 한 번 실행해 구성 요소를 설치하세요. 사용자 지정 서비스 계정이나 경로는 덮어쓰지 않으므로 기존 배포 절차를 사용하세요. `AGENT2API_SYSTEMD_UPDATE=0`으로 패널 기능을 끄거나 `agent2api-updater.socket`을 비활성화해 업데이트 구성 요소를 끌 수 있습니다. `AGENT2API_SELF_UPDATE`는 여전히 Docker 전용입니다.
+>
+> 업데이트 프로그램은 로컬 socket을 사용하며 네트워크 포트를 열지 않습니다. 기본적으로 공식 인덱스로 릴리스 저장소를 검증합니다. 관리자는 `/etc/agent2api/updater.env`에 `AGENT2API_UPDATER_REPO=owner/repo` 또는 `HTTPS_PROXY`를 설정해 저장소를 고정하거나 독립 검증용 프록시를 지정할 수 있습니다. 교체 실패 시 이전 파일을 복구합니다. 새 서비스 시작을 확인하지 못하면 `/opt/agent2api/.before-update-*`에 복구 파일을 남기고 실패를 알리며 데이터베이스를 자동으로 되돌리지 않습니다.
 
 ### 설치 후
 
@@ -145,9 +153,11 @@ http://<서버IP>:3065/
 | `AGENT2API_LOG_FILE` | 로그 파일 경로, 기본 `{데이터 디렉터리}/logs/server.log` |
 | `AGENT2API_VERBOSE` | `1`이면 debug 로그 활성화 |
 
-Linux 에서는 `/etc/agent2api/agent2api.env` 에, Windows 에서는 서비스 레지스트리 키 `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment` 에 적습니다(`install-service.ps1` 이 기본 항목을 이미 써 두었고, 스크립트를 다시 실행하면 덮어씁니다).
+Linux 에서는 `/etc/agent2api/agent2api.env` 에, Windows 에서는 서비스 레지스트리 키 `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment` 에 적습니다(`install-service.ps1` 이 기본 항목을 기록하며, 다시 실행할 때는 기존 설정을 유지하고 매개변수로 명시한 항목만 변경합니다).
 
 > **계정은 미리 설정할 수 없습니다**: 계정에는 QR 스캔 / SMS 코드 / 자격 증명 붙여넣기가 필요하고 이는 업스트림 프로토콜이 정하는 부분이라 우회할 수 없습니다. 대량 배포에서는 이미 설정한 **데이터 디렉터리를 통째로 복사**하세요(SQLite 데이터베이스와 `account.key` 가 같은 디렉터리에 있어 계정도 함께 옮겨집니다).
+
+**Trae 응답 완전성 검사(데스크톱 / 서버 / Docker)**: 기본적으로 켜져 있습니다. 호환성으로 인한 오탐을 조사할 때만 게이트웨이 프로세스 환경에 `AGENT2API_TRAE_NO_REQUIRE_TERMINAL=1`을 설정하고(`true` / `yes` / `on`도 허용), 게이트웨이를 재시작해 플러그인이 새 환경을 상속하게 하세요. 끄면 업스트림의 완료 신호가 없는 불완전한 응답을 다시 성공으로 처리할 수 있습니다. 변수를 제거하고 재시작하면 검사가 복원됩니다. 이 설정은 해당 수정이 포함된 제공자 플러그인이 필요합니다.
 
 ## Docker
 
@@ -185,9 +195,30 @@ services:
 | `AGENT2API_ALLOW_NO_KEY` | `1`이면 fail-closed 해제(키 미설정이어도 `/v1` 허용, 순수 내부망 한정) |
 | `AGENT2API_CAPTCHA_ENABLED` | 로그인 페이지 사람 확인 위젯: 기본 `1`(켜짐), `0`은 끔 |
 | `AGENT2API_SELF_UPDATE` | 컨테이너 안의 업데이트 창구: 기본 `1`(켜짐. 패널에서 "다운로드 후 업데이트" 가능). `0`이면 꺼지고 수동 업그레이드만 가능 |
+| `AGENT2API_IMAGE_CACHE_MB` | 생성 이미지의 다운로드 메모리 캐시 상한(MiB, 기본 `128`, 범위 8~4096). 잘못된 값 / 범위 밖은 기본값으로 폴백 |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | 세션 이미지 압축 결과의 메모리 캐시 상한(MiB, 기본 `128`, 범위 8~4096, 기준 동일) |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 심화: "업데이트 확인 / 업데이트 다운로드"를 자체 소스로 교체합니다. 전자는 저장소를 바꾸고(기본값은 업스트림 `aimod-cc/Agent2API`, fork 후 변경 가능), 후자는 API 루트를 바꿉니다(기본 `https://api.github.com`, GitHub와 같은 형태의 release JSON을 반환해야 함). 자체 소스 설정 후 다운로드 허용 목록은 **그 소스 자신의 호스트**만 추가로 허용합니다(스킴은 소스를 따름: `http://`를 설정하면 평문 다운로드도 허용. 로컬 연습 / 내부 미러용) |
 
 소스에서 빌드하려면: 이 저장소를 클론한 뒤 `docker compose up -d --build`(이미지에는 게이트웨이와 패널만 들어가며 Rust 도구 체인은 포함되지 않습니다).
+
+### 메모리 사용량
+
+이미지 안의 게이트웨이(Linux 대상)에는 jemalloc 할당자가 내장되어 있습니다. 장시간 실행과 다계정 동시 포워딩에서 시스템 기본 할당자보다 메모리 단편화가 덜 생기고 RSS도 천천히 늘어나는 일이 줄어듭니다 —— 소형 메모리 머신이 가장 자주 눌리거나 OOM 으로 죽는 지점이 바로 여기입니다.
+
+소형 머신에서는 컨테이너에 메모리 상한을 두는 것을 권합니다. 초과하면 커널이 프로세스를 종료하고 `restart: unless-stopped` 가 다시 띄웁니다. 호스트(또는 같은 머신의 다른 서비스)를 끌어내리는 대신 "한 번 재시작"으로 끝납니다.
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+compose 사용자는 서비스에 `mem_limit: 1g` 한 줄을 추가하세요(`docker-compose.yml` 에 주석 예시가 있습니다). swarm 또는 `docker compose --compatibility` 에서는 `deploy.resources.limits.memory` 를 씁니다. 1g 는 출발점일 뿐이며 실제 동시 처리량에 맞춰 조정하세요.
+
+메모리에 상주하는 두 이미지 캐시 상한은 모두 환경 변수로 줄일 수 있습니다(기본 각 `128` MiB): `AGENT2API_IMAGE_CACHE_MB`(생성 이미지 다운로드 캐시), `AGENT2API_IMAGE_COMPRESS_CACHE_MB`(세션 이미지 압축 결과 캐시). 잘못된 값이나 범위 밖 값은 기본값으로 폴백하며 서비스 시작을 막지 않습니다.
+
+`MALLOC_ARENA_MAX=2` 같은 glibc 할당자 튜닝은 **jemalloc 을 내장하지 않은 형태**(구버전 이미지, 직접 빌드한 서버, 데스크톱)에만 의미가 있습니다. 이 이미지에는 설정할 필요가 없습니다.
 
 **웹 패널 기능 차이**( 이 PC에 데스크톱 클라이언트가 없음에서 비롯됩니다): 웹 로그인(WorkBuddy / Qoder / Cline), SMS 인증 코드, 자격 증명 붙여넣기는 완전히 사용 가능합니다. 이 PC 콜백이 필요한 웹 로그인(AutoClaw / CatPaw / Accio / CodeArts / Trae)과 "이 PC 로그인 상태 가져오기"는 사용할 수 없으니 자격 증명 붙여넣기를 쓰세요. 데스크톱에서 "웹 관리 패널도 공개"를 켠 뒤 브라우저로 열어도 같은 차이가 적용됩니다 —— 동일한 화면, 동일한 판정입니다.
 

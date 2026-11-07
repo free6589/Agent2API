@@ -19,11 +19,12 @@ pub(super) fn request_usage(item: &RequestEntry) -> UsageAccum {
     }
 }
 
-pub(super) fn merge_client(list: &mut Vec<ClientAccum>, client: &str, usage: &UsageAccum) {
+pub(super) fn merge_client(list: &mut Vec<ClientAccum>, client: &str, label: &str, usage: &UsageAccum) {
     if let Some(item) = list.iter_mut().find(|item| item.client == client) {
+        if !label.is_empty() && usage.last_used_at >= item.usage.last_used_at { item.label = label.into(); }
         item.usage.merge(usage);
     } else {
-        list.push(ClientAccum { client: client.to_string(), usage: usage.clone() });
+        list.push(ClientAccum { client: client.to_string(), label: label.into(), usage: usage.clone() });
     }
 }
 
@@ -36,7 +37,7 @@ fn merge_key(list: &mut Vec<ApiKeyAccum>, incoming: &ApiKeyAccum) {
         }
         item.usage.merge(&incoming.usage);
         for client in &incoming.clients {
-            merge_client(&mut item.clients, &client.client, &client.usage);
+            merge_client(&mut item.clients, &client.client, &client.label, &client.usage);
         }
         for model in &incoming.models {
             push_model_accum(&mut item.models, &model.model, model.tokens, model.requests);
@@ -48,11 +49,12 @@ fn merge_key(list: &mut Vec<ApiKeyAccum>, incoming: &ApiKeyAccum) {
 
 pub(super) fn fold_sources(day: &mut DailyEntry, item: &RequestEntry) {
     let usage = request_usage(item);
-    merge_client(&mut day.client_stats, &item.source.client, &usage);
+    let label = item.source.recorded_client_name();
+    merge_client(&mut day.client_stats, &item.source.client, label, &usage);
     merge_key(&mut day.api_key_stats, &ApiKeyAccum {
         identity: item.source.api_key.clone(),
         usage: usage.clone(),
-        clients: vec![ClientAccum { client: item.source.client.clone(), usage }],
+        clients: vec![ClientAccum { client: item.source.client.clone(), label: label.into(), usage }],
         models: vec![ModelAccum {
             model: model_stat_key(&item.model, &item.upstream_model).to_string(),
             requests: 1, tokens: item.total_tokens,
@@ -69,6 +71,7 @@ pub(super) fn client_label(client: &str) -> &str {
         "assistant_images" => "助手图片工具",
         "assistant_title" => "助手标题总结",
         "checkin_keepalive" => "日活保活",
+        "image-generation" => "图片生成 MCP",
         _ => client,
     }
 }
@@ -83,7 +86,7 @@ pub(super) fn key_label(identity: &ApiKeyIdentity) -> String {
     }
 }
 
-fn usage_json(usage: &UsageAccum) -> Value {
+pub(super) fn usage_json(usage: &UsageAccum) -> Value {
     let details = usage.token_details_requests >= usage.requests
         && (usage.tokens == 0 || usage.token_details_requests > 0);
     json!({
@@ -109,7 +112,9 @@ pub(super) fn build_clients(list: &[ClientAccum]) -> Vec<Value> {
         let mut row = usage_json(&item.usage);
         if let Some(object) = row.as_object_mut() {
             object.insert("id".to_string(), json!(item.client));
-            object.insert("label".to_string(), json!(client_label(&item.client)));
+            object.insert("label".to_string(), json!(crate::server::core::client::display_name(
+                &item.client, if item.label.is_empty() { client_label(&item.client) } else { &item.label },
+            )));
         }
         row
     }).collect()
@@ -146,7 +151,7 @@ fn remainder(day: &DailyEntry, usages: impl Iterator<Item = UsageAccum>) -> Usag
 pub(super) fn day_sources(day: &DailyEntry) -> (Vec<ClientAccum>, Vec<ApiKeyAccum>) {
     let mut clients = day.client_stats.clone();
     let missing = remainder(day, clients.iter().map(|item| item.usage.clone()));
-    merge_client(&mut clients, "", &missing);
+    merge_client(&mut clients, "", "", &missing);
     let mut keys = day.api_key_stats.clone();
     let missing = remainder(day, keys.iter().map(|item| item.usage.clone()));
     merge_key(&mut keys, &ApiKeyAccum { usage: missing, ..Default::default() });
@@ -160,7 +165,7 @@ pub(super) fn source_totals(
     let mut keys = Vec::new();
     for (_, day) in daily.range(start.to_string()..=end.to_string()) {
         let (day_clients, day_keys) = day_sources(day);
-        for client in day_clients { merge_client(&mut clients, &client.client, &client.usage); }
+        for client in day_clients { merge_client(&mut clients, &client.client, &client.label, &client.usage); }
         for key in day_keys { merge_key(&mut keys, &key); }
     }
     (clients, keys)
@@ -195,13 +200,26 @@ fn model_rows(models: &[ModelAccum]) -> Vec<Value> {
 
 pub(super) fn source_breakdown(day: &DailyEntry) -> (Vec<Value>, Vec<Value>) {
     let (clients, keys) = day_sources(day);
-    let clients = build_clients(&clients).into_iter().map(|row| json!({
-        "id": row["id"], "label": row["label"], "tokens": row["totalTokens"], "requests": row["requests"],
-    })).collect();
-    let keys = build_keys(&keys).into_iter().map(|row| json!({
-        "id": row["filterValue"], "label": row["label"], "tokens": row["totalTokens"], "requests": row["requests"],
-    })).collect();
+    let clients = build_clients(&clients).into_iter().map(|mut row| {
+        row["tokens"] = row["totalTokens"].clone();
+        row
+    }).collect();
+    let keys = build_keys(&keys).into_iter().map(|mut row| {
+        row["id"] = row["filterValue"].clone();
+        row["tokens"] = row["totalTokens"].clone();
+        row
+    }).collect();
     (clients, keys)
+}
+
+pub(super) fn day_usage(day: &DailyEntry) -> UsageAccum {
+    let (clients, _) = day_sources(day);
+    let mut usage = UsageAccum::default();
+    for client in clients { usage.merge(&client.usage); }
+    usage.requests = day.requests;
+    usage.successful = day.successful;
+    usage.tokens = day.tokens;
+    usage
 }
 
 pub(super) fn all_model_rows(models: &[ModelAccum]) -> Vec<Value> {

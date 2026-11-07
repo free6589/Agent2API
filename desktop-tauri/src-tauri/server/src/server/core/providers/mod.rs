@@ -92,6 +92,7 @@ pub mod onboarding_memory;
 /// （当前唯一的用户是 ZCode 活动套餐的令牌池，判据与取舍见模块头）。
 /// 不进身份体系：它是各家的共用设施，只按 provider id 记状态。
 pub mod readiness;
+pub mod policy;
 /// **未安装插件**时的占位适配器（如实报错 + 指路去装插件）。
 ///
 /// 本项目把「怎么伪装成官方客户端打某个上游」的全部实现搬到了独立的提供商
@@ -405,6 +406,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
 /// 必须另问 `is_executable_provider`。
 pub fn is_known_provider_id(id: &str) -> bool {
     kind_from_id(id).is_some() || availability::is_suspended(id) || is_executable_provider(id)
+        || crate::server::core::plugin_host::script::known_provider(id)
 }
 
 /// 使用独立 FULL-auth 边界的稳定身份；停用不改变存量账号与错误分类语义。
@@ -457,6 +459,7 @@ pub fn label_of(id: &str) -> String {
         // runtime id 不靠占位 kind 取名：插件登记优先，最后回显原 ID。
         None => crate::server::core::plugin_host::lookup(id)
             .map(|adapter| adapter.label().to_string())
+            .or_else(|| crate::server::core::plugin_host::provider_label(id))
             .unwrap_or_else(|| id.to_string()),
     }
 }
@@ -521,6 +524,9 @@ where
                     json!(crate::server::core::plugin_host::provider_category(detail.id))
                 } else { json!("agent") },
                 "source": if plugin { "plugin" } else { "builtin" },
+                // 握手时申报的静态登录方式：动态 `auth.methods` 回 501 时界面用它
+                // 渲染旧版表单（见 `plugin_host::login_methods_of` 的说明）。
+                "loginMethods": crate::server::core::plugin_host::login_methods_of(detail.id),
             })
         })
         .collect();
@@ -542,6 +548,7 @@ where
             "count": count(&id),
             "category": crate::server::core::plugin_host::provider_category(&id),
             "source": "plugin",
+            "loginMethods": crate::server::core::plugin_host::login_methods_of(&id),
         }));
     }
     // 缺插件的残留账号仍不列，记录留在账号库里等待执行体恢复。

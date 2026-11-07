@@ -2,19 +2,30 @@
 
 pub mod apply;
 mod backups;
+pub mod catalog;
 mod clients;
 pub mod discover;
+mod dsh_installation;
+pub mod dsh_paths;
+mod dsh_patch;
+mod dsh_document;
+#[cfg(windows)]
+mod dsh_windows;
 pub mod files;
 mod json_edit;
+pub mod model_config;
 pub mod native;
 pub mod paths;
 pub mod preview;
+pub mod quick_connect;
+mod quick_profiles;
 pub mod registry;
 pub mod resources;
 pub mod store;
 mod toml_editing;
 pub mod types;
 pub mod validate;
+mod yaml_editing;
 
 pub use registry::{find, ClientDef, ConfigFormat, CLIENTS};
 pub use types::{active_profile, Model, Profile};
@@ -62,7 +73,8 @@ fn client_view(def: &ClientDef, gateway: &str) -> Value {
         "ready"
     };
     let writable = def.writable && !detection.unsupported && read_error.is_none();
-    let (profiles, revision) = saved.as_ref().cloned().unwrap_or_default();
+    let (mut profiles, revision) = saved.as_ref().cloned().unwrap_or_default();
+    for profile in &mut profiles { model_config::normalize(def, profile); }
     let applied = apply::applied_status(def.id, &detection.path).unwrap_or_else(
         |error| json!({ "canUndo": false, "canDisconnect": false, "error": error }),
     );
@@ -72,7 +84,7 @@ fn client_view(def: &ClientDef, gateway: &str) -> Value {
             let mut view = profile.view();
             let in_file = live
                 .iter()
-                .any(|current| clients::equivalent(def, profile, current));
+                .any(|current| clients::equivalent(def, &detection.path, profile, current));
             if let Some(object) = view.as_object_mut() {
                 object.insert("inFile".into(), json!(in_file));
                 object.insert(
@@ -83,7 +95,7 @@ fn client_view(def: &ClientDef, gateway: &str) -> Value {
             view
         })
         .collect::<Vec<_>>();
-    json!({
+    let mut view = json!({
         "id": def.id, "name": def.name, "vendor": def.vendor,
         "hue": def.hue, "letter": def.letter,
         "icon": format!("assets/agents/{}", def.icon), "iconFull": def.icon_full,
@@ -112,7 +124,13 @@ fn client_view(def: &ClientDef, gateway: &str) -> Value {
         "storeError": saved.err(), "revision": revision,
         "viaGateway": live.iter().any(|p| p.enabled && is_gateway(&p.base_url, gateway)),
         "activeId": active_profile(&live).map(|p| &p.id), "applied": applied,
-    })
+    });
+    view["modelFields"] = model_config::declared_fields(def, &detection.path);
+    view["supportsEffort"] = json!(def.effort && !(def.id == "kimi-code" && paths::kimi_legacy(&detection.path)));
+    view["quickProfiles"] = json!(quick_profiles::profiles(def, &live, gateway).iter().map(Profile::view).collect::<Vec<_>>());
+    view["configTargets"] = json!(detection.config_targets);
+    view["configLayout"] = json!(if def.id == "dsh" { if dsh_paths::is_patch(&detection.path) { "profile" } else { "legacy" } } else { "" });
+    view
 }
 
 pub fn is_gateway(base: &str, gateway: &str) -> bool {

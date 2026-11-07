@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { providerPromptRows } from './settings-prompt-rows'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
@@ -31,6 +32,7 @@ import {
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
+  IMAGE_COMPRESS_FIELDS,
   modelsDevStateText,
   NOTES,
   PROMPT_MODES,
@@ -69,6 +71,8 @@ import {
   panelLogout,
   refreshDebug,
   refreshDeveloperRoleCompat,
+  refreshReasoningCollapse,
+  refreshImageCompress,
   refreshClineHeaders,
   refreshZcodeVersion,
   refreshCors,
@@ -99,6 +103,8 @@ import {
   saveCors,
   saveCaptchaPoolField,
   saveDebug,
+  saveImageCompressEnabled,
+  saveImageCompressField,
   saveModelsDev,
   savePromptFile,
   savePromptMode,
@@ -109,6 +115,7 @@ import {
   saveRetentionField,
   saveRetryField,
   saveDeveloperRoleCompat,
+  saveReasoningCollapse,
   saveTimeoutField,
   saveToggle,
   selectCategory,
@@ -147,6 +154,9 @@ import { CloudSyncPanel } from './settings-cloud-sync'
 import { DbRestoreDialog } from './settings-db-restore'
 import { DatabaseBackupDialogs, DatabaseBackupPanel } from './settings-database-backup'
 import { SanitizePanel } from './settings-sanitize'
+import { ClientIdentificationPanel } from '../../../ui-shared/client-identification-panel'
+import { clientIdentificationApi } from './settings-client-identification'
+import { VisionCompatibilitySettings } from './settings-vision-compat'
 // 侧边栏菜单面板（设置 → 显示）：显隐 / 顺序 / 分组。布局模型在
 // ui/sidebar-layout.js（经典脚本，主侧边栏渲染与这里共用同一份），见该文件的模块头
 import { SidebarPane } from './sidebar-pane'
@@ -1251,6 +1261,43 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
         </CardContent>
       </Card>
 
+      <Card render={<section />} className='panel'>
+        <PanelHead
+          title={t('图片压缩')}
+          tip={TIPS.imageCompress}
+          badge={snap.imageCompress.status === 'unavailable'
+            ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
+            : <StatusBadge tone={snap.imageCompress.enabled ? 'ok' : 'idle'}>
+                {snap.imageCompress.enabled ? t('已开启') : t('已关闭')}
+              </StatusBadge>}
+          actions={<RefreshButton id='btn-image-compress-refresh' onClick={() => void refreshImageCompress()} />}
+        />
+        <CardContent className='panel-body'>
+          <div className='settings-switches'>
+            <SwitchRow
+              id='settings-image-compress'
+              label={t('转发前压缩对话里内嵌的大图（只改发给上游的副本，生图与图片编辑不受影响）')}
+              checked={snap.imageCompress.enabled}
+              // 读到后端值之前不许切（与 developerRoleCompat 同一取舍）
+              disabled={snap.imageCompress.status !== 'ready' || snap.busy === 'imageCompress'}
+              onCheckedChange={next => void saveImageCompressEnabled(next)}
+            />
+          </div>
+          <div className='retention-list'>
+            {IMAGE_COMPRESS_FIELDS.map(field => (
+              <NumberRow
+                key={field.key}
+                field={field}
+                value={snap.imageCompress.values?.[field.key] ?? null}
+                disabled={snap.busy === 'imageCompress'}
+                onCommit={raw => saveImageCompressField(field, raw)}
+              />
+            ))}
+          </div>
+          <div className='hint retention-note'>{NOTES.imageCompress}</div>
+        </CardContent>
+      </Card>
+
       {/* 验证码令牌池：池子本体在 ZCode 插件里，网关只有节奏设置。
           插件没申报（没装 / 没装 ZCode）时这块不出现。 */}
       {panels.has('captcha_pool') ? (
@@ -1340,6 +1387,41 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
                 : snap.developerRoleCompat.on ? STATES.roleCompatOn : STATES.roleCompatOff}
           </div>
           <div className='hint retention-note'>{NOTES.developerRoleCompat}</div>
+        </CardContent>
+      </Card>
+
+      <Card render={<section />} className='panel'>
+        <PanelHead
+          title={t('第三方模型回答完自动折叠过程')}
+          tip={TIPS.reasoningCollapse}
+          badge={snap.reasoningCollapse.status === 'ready'
+            ? <StatusBadge tone='ok'>{t('已生效')}</StatusBadge>
+            : snap.reasoningCollapse.status === 'unavailable'
+              ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
+              : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
+          actions={
+            <RefreshButton id='btn-reasoning-collapse-refresh' onClick={() => void refreshReasoningCollapse()} />
+          }
+        />
+        <CardContent className='panel-body'>
+          <div className='settings-switches'>
+            <SwitchRow
+              id='settings-reasoning-collapse'
+              label={t('给 Codex 的响应补阶段标记，回答完后像官方模型一样把推理与命令过程折叠起来')}
+              checked={snap.reasoningCollapse.on}
+              // 读到后端值之前不许切（与 developerRoleCompat 同一取舍）
+              disabled={snap.reasoningCollapse.status !== 'ready' || snap.busy === 'reasoningCollapse'}
+              onCheckedChange={next => void saveReasoningCollapse(next)}
+            />
+          </div>
+          <div className='settings-state'>
+            {snap.reasoningCollapse.status === 'loading'
+              ? STATES.appLoading
+              : snap.reasoningCollapse.status === 'unavailable'
+                ? STATES.reasoningCollapseUnavailable
+                : snap.reasoningCollapse.on ? STATES.reasoningCollapseOn : STATES.reasoningCollapseOff}
+          </div>
+          <div className='hint retention-note'>{NOTES.reasoningCollapse}</div>
         </CardContent>
       </Card>
 
@@ -2395,6 +2477,8 @@ function SettingsPage() {
           <DisplayPane />
         </div>
         <div className={paneClass('gateway')} data-cat='gateway'>
+          <VisionCompatibilitySettings active={snap.category === 'gateway'} />
+          <ClientIdentificationPanel api={clientIdentificationApi} t={t} active={snap.category === 'gateway'} />
           <GatewayPane snap={snap} panels={adminPanels} />
         </div>
         <div className={paneClass('retry')} data-cat='retry'>
@@ -2477,10 +2561,8 @@ function mount(): void {
 // load() 里还会再校准一次，覆盖「页面切回来时状态被重置」的情况。
 restoreCategory()
 
-// 脚本排在页面骨架之后（index.html 里 islands/ui.js 在各 section 之后），正常直接挂；
-// 万一将来被挪到前面，退化成等 DOM 解析完再挂。
-if (document.querySelector(PAGE_SELECTOR)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+// 首次切到本页时才挂载（见 island-lazy）：隐藏页不在首屏渲染，也不拉数据。
+mountOnPage('settings', PAGE_SELECTOR, mount)
 
 /* ─── 注册：对外契约 ─────────────────────────── */
 
@@ -2492,7 +2574,7 @@ declare global {
      * update-panel.tsx:972 的「去更新」showCategory('about')。
      */
     wbSettingsPanel?: {
-      load(): Promise<void>
+      load: typeof load
       /** 铺启动与托盘设置（旧实现叫 renderSettings，对外名字是 render） */
       render(data?: unknown): void
       renderRetention(data?: unknown): void

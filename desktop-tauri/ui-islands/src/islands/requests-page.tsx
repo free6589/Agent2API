@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
 import {
@@ -20,7 +21,9 @@ import { Empty } from '@ui'
 import { ALL_CLIENTS, clientFilterValue, LogDateFilters, SourceLogFilters, sourceParams,
   type LogDates, type LogDrilldown, type SourceOption } from './requests/source-filters'
 import { RequestCell, headRow, isOk, isRunning, uniqueRowKeys, providerLabelOf, type RequestEntry, type VisibleColumn } from './requests/request-cells'
+import { getStore as getAccountsStore, subscribe as subscribeAccounts } from './accounts-store'
 import { phaseOf, phaseLabelOf, phaseElapsedText, phaseBadgeHtml, phaseElapsedLineHtml } from './requests/request-phase'
+import { PageAutoRefresh, pageRefreshStore, usePageAutoRefresh } from './page-auto-refresh'
 
 type RequestQueryResult = {
   entries?: RequestEntry[]; total?: number; matched?: number
@@ -39,7 +42,6 @@ type RequestsBridge = {
 
   getStatsRequests(query: string): Promise<RequestQueryResult | null | undefined>
   getStatsRequestFilters(): Promise<FilterOptionsResult | null | undefined>
-  getScheduledTasks(): Promise<{ tasks?: IntervalTask[] } | null | undefined>
 }
 
 type Align = 'left' | 'center' | 'right'
@@ -105,12 +107,11 @@ const COLUMNS: Column[] = [
   { key: 'apiKey', label: t('API Key'), sel: '.req-api-key', track: '140px' },
   { key: 'dur', label: t('用时'), sel: '.req-dur', track: '96px', align: 'right' },
   { key: 'speed', label: t('速度'), sel: '.req-speed', track: '96px', align: 'center', legacyAlign: 'right' },
+  { key: 'credit', label: t('积分'), sel: '.req-credit', track: '72px', align: 'center' },
   { key: 'usage', label: t('用量'), sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
   { key: 'error', label: t('错误'), sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
   { key: 'detail', label: t('详情'), sel: '.req-detail', track: '60px', align: 'right' },
 ]
-
-const DEFAULT_AUTO_REFRESH_MS = 1_000
 
 const PAGE_SIZES = SERVER_PAGE_SIZES
 
@@ -172,12 +173,6 @@ let filtersTouched = false
 
 let entriesValue: RequestEntry[] = []
 
-let autoRefreshMs = DEFAULT_AUTO_REFRESH_MS
-
-let autoEnabled = true
-
-let autoSynced = false
-
 let polling = false
 
 let seq = 0
@@ -189,7 +184,6 @@ let colTried = false
 
 type PanelHandle = {
   load(options?: LoadOptions): Promise<void>
-  setAuto(next: { ms: number; enabled: boolean }): void
   setFilterOptions(providers: ProviderOption[], models: string[], clients: SourceOption[], apiKeys: SourceOption[]): void
   openFiltered(query: LogDrilldown): void
 
@@ -271,34 +265,8 @@ async function refreshFilterOptions(): Promise<void> {
   }
 }
 
-async function syncAutoRefresh(): Promise<void> {
-  if (autoSynced) return
-  try {
-    const list = await shared().workbuddyDesktop?.getScheduledTasks()
-    const task = (list?.tasks || []).find(item => item.id === 'requestsAutoRefresh')
-    applyAutoRefresh(task || null)
-    autoSynced = Array.isArray(list?.tasks)
-  } catch (error) {
-    console.warn('读取请求日志自动刷新间隔失败，按默认 1 秒:', errorMessage(error))
-    applyAutoRefresh(null)
-  }
-}
-
 function applyAutoRefresh(task: IntervalTask | null): void {
-  autoSynced = true
-  const interval = Number(task?.interval)
-  const unit = task?.unit
-  const valid = !!task && typeof task === 'object'
-    && Number.isFinite(interval) && interval > 0
-    && (unit === 'seconds' || unit === 'minutes')
-  if (!valid) {
-    autoEnabled = true
-    autoRefreshMs = DEFAULT_AUTO_REFRESH_MS
-  } else {
-    autoEnabled = task.enabled !== false
-    autoRefreshMs = unit === 'minutes' ? interval * 60_000 : interval * 1000
-  }
-  handle?.setAuto({ ms: autoRefreshMs, enabled: autoEnabled })
+  pageRefreshStore.apply('requestsAutoRefresh', task)
 }
 
 function ensureColumns(): void {
@@ -342,6 +310,7 @@ function emptyText(data: PanelData): string {
 }
 
 function RequestsPage() {
+  const namesHidden = React.useSyncExternalStore(subscribeAccounts, () => getAccountsStore().namesHidden)
   const [data, setData] = React.useState<PanelData>(EMPTY_DATA)
   const [filters, setFilters] = React.useState<Filters>(() => readSavedFilters())
   const [range, setRange] = React.useState<string>(() => current.range)
@@ -349,7 +318,7 @@ function RequestsPage() {
   const [offset, setOffset] = React.useState(0)
 
   const [pageSize, setPageSize] = React.useState<number>(() => current.size)
-  const [auto, setAuto] = React.useState(() => ({ ms: autoRefreshMs, enabled: autoEnabled }))
+  const auto = usePageAutoRefresh('requestsAutoRefresh')
   const [providerOptions, setProviderOptions] = React.useState<ProviderOption[]>([])
   const [modelOptions, setModelOptions] = React.useState<string[]>([])
   const [clientOptions, setClientOptions] = React.useState<SourceOption[]>([])
@@ -363,6 +332,7 @@ function RequestsPage() {
   const pendingScrollRef = React.useRef<number | null>(null)
 
   const afterRedrawRef = React.useRef(false)
+  const loadingRef = React.useRef(0)
 
   const applyFilters = React.useCallback((patch: Partial<Filters>): Filters => {
     current.filters = { ...current.filters, ...patch }
@@ -398,10 +368,10 @@ function RequestsPage() {
   const loadPanel = React.useCallback(async (options: LoadOptions = {}): Promise<void> => {
     const { silent = false, resetPage = false } = options
     if (resetPage) applyOffset(0)
-    void syncAutoRefresh()
     restoreSavedFilters()
     if (!silent) void refreshFilterOptions()
     const token = ++seq
+    loadingRef.current += 1
     try {
       const api = shared().workbuddyDesktop
       if (!api) throw new Error(t('后端桥不可用'))
@@ -423,17 +393,19 @@ function RequestsPage() {
       if (resetPage) pendingScrollRef.current = 0
       paint(next, next.entries)
     } catch (error) {
+      if (token !== seq) return
       if (!silent) {
         console.warn('读取请求日志失败:', errorMessage(error))
         paintError(t('读取请求日志失败，详见控制台'))
       }
+    } finally {
+      loadingRef.current -= 1
     }
   }, [applyOffset, paint, paintError, restoreSavedFilters])
 
   React.useEffect(() => {
     handle = {
       load: loadPanel,
-      setAuto: next => setAuto(next),
       setFilterOptions: (providers, models, clients, apiKeys) => {
         setProviderOptions(providers); setModelOptions(models); setClientOptions(clients); setApiKeyOptions(apiKeys)
       },
@@ -487,12 +459,12 @@ function RequestsPage() {
     if (!auto.enabled || auto.ms <= 0) return
     const timer = window.setInterval(() => {
       if (document.hidden || shared().wbApp?.currentPage !== 'requests') return
-      if (polling) return
+      if (polling || loadingRef.current > 0) return
       polling = true
       void loadPanel({ silent: true }).finally(() => { polling = false })
     }, auto.ms)
     return () => { window.clearInterval(timer) }
-  }, [auto, loadPanel])
+  }, [auto.enabled, auto.ms, loadPanel])
 
   React.useLayoutEffect(() => {
     if (afterRedrawRef.current) {
@@ -585,12 +557,13 @@ function RequestsPage() {
   const rowKeys = uniqueRowKeys(data.entries)
   const rows = data.entries.map((entry, index) => (
     <div key={rowKeys[index]} className={`req-row${isRunning(entry) ? ' running' : isOk(entry) ? '' : ' failed'}`}>
-      {columns.map(column => <RequestCell key={column.key} entry={entry} column={column} />)}
+      {columns.map(column => <RequestCell key={column.key} entry={entry} column={column} namesHidden={namesHidden} />)}
     </div>
   ))
 
   return (
     <Card render={<section />} className='panel'>
+      <PageAutoRefresh id='requestsAutoRefresh' settings={auto} onRefresh={() => loadPanel()} />
       <CardHeader className='panel-head'>
         <h2>{t('请求日志列表')}</h2>
         {}
@@ -674,7 +647,7 @@ function RequestsPage() {
           {data.error
             ? <Empty className='log-empty'>{data.error}</Empty>
             : data.entries.length
-              ? [headRow(columns), ...rows]
+              ? [headRow(columns, namesHidden), ...rows]
               : <Empty className='log-empty'>{emptyText(data)}</Empty>}
         </div>
       </CardContent>
@@ -725,8 +698,7 @@ function mount(): void {
   createRoot(section).render(<RequestsPage />)
 }
 
-if (document.querySelector(PAGE_SELECTOR)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+mountOnPage('requests', PAGE_SELECTOR, mount)
 
 declare global {
   interface Window {
