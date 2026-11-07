@@ -201,6 +201,55 @@ Variáveis de ambiente (todas opcionais):
 
 Compilar a partir do código: clone o repositório e rode `docker compose up -d --build` (a imagem contém apenas o gateway e o painel, sem toolchain Rust).
 
+### Arch / Omarchy: implantação local a partir do código (Docker)
+
+`scripts/` traz um conjunto de implantação local para sistemas baseados em Arch (Omarchy / EndeavourOS / Manjaro, entre outros), que publica a porta apenas na interface de loopback:
+
+- `scripts/omarchy-compose.yml` — um compose reforçado, independente do `docker-compose.yml` da raiz: a porta é publicada somente em `127.0.0.1`; porta do host / nome do contêiner / imagem / uid/gid do contêiner podem ser parametrizados via `.env`; pré-configuração do administrador e da primeira chave de gateway é suportada; o build usa a rede do host;
+- `scripts/omarchy-agent2api.sh` — utilitário do dia a dia: `up` / `build` / `down` / `restart` / `status` / `logs` / `health` / `backup` / `restore` / `doctor` / `config`.
+
+Pré-requisitos (Arch / Omarchy):
+
+```bash
+sudo pacman -S --needed git docker docker-compose curl jq sqlite
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # após entrar no grupo, faça login novamente
+```
+
+Para trocar a porta do host, abrir a rede local ou pré-configurar chaves, crie um `.env` na raiz do repositório (não o versione):
+
+```ini
+AGENT2API_BIND_ADDRESS=127.0.0.1   # só mude para 0.0.0.0 se precisar de acesso pela rede local, e configure o firewall por conta própria
+AGENT2API_HOST_PORT=3065           # porta publicada no host; escolha outra se estiver em uso
+AGENT2API_UID=1000                 # mantém ./data sob o seu usuário; para não root, combine com AGENT2API_SELF_UPDATE=0
+AGENT2API_GID=1000
+# AGENT2API_CONTAINER_NAME=agent2api
+# AGENT2API_IMAGE=agent2api:local
+# AGENT2API_ADMIN_USER=…            # AGENT2API_ADMIN_PASSWORD=… (somente para implantações não assistidas)
+# AGENT2API_PROXY_API_KEY=sk-…      # pré-configura a primeira chave de gateway (opcional)
+```
+
+Início e operação diária (o script já passa o arquivo de compose e o diretório de projeto):
+
+```bash
+scripts/omarchy-agent2api.sh up                  # compila e inicia, aguardando /health
+scripts/omarchy-agent2api.sh doctor              # dependências / daemon / conflito de portas / autodiagnóstico do diretório de dados
+scripts/omarchy-agent2api.sh status              # vínculo da porta, saúde, imagem e diretório de dados de relance
+scripts/omarchy-agent2api.sh backup              # para → arquiva ./data → reinicia (grava em ./backups)
+scripts/omarchy-agent2api.sh restore <arquivo>   # restaura; os dados antigos são renomeados e preservados
+```
+
+Sem o utilitário, o comando equivalente é `docker compose --project-directory . -f scripts/omarchy-compose.yml up -d --build` (`--project-directory` precisa apontar para a raiz do repositório, senão `.env` e `./data` caem dentro de `scripts/`).
+
+Duas armadilhas conhecidas no Arch:
+
+- **GitHub inacessível durante o build**: a construção da imagem baixa a dependência git `ProvidersPlugin/Agent2Providers` via Cargo, então máquinas cuja bridge do Docker não alcança o GitHub falham no build simples; rode antes `scripts/omarchy-agent2api.sh build` (compila na rede do host, `--network host`) e depois `up`. Em execução a rede continua sendo uma bridge comum.
+- **GitHub inacessível dentro do contêiner** (falha na instalação/atualização online de plugins): os plugins instalados carregam de `data/plugins`, então contas e modelos existentes continuam funcionando. Para instalar/atualizar um plugin online: baixe o pacote do plugin no host e use o painel "Plugins → enviar e instalar", ou inicie o contêiner temporariamente com `--network host`. Não publique a porta em `0.0.0.0` por causa disso.
+
+Todo o estado fica em `./data` (o banco SQLite e o `account.key` devem ser copiados em par; o `backup` para o serviço antes, por consistência, e o `restore` renomeia os dados antigos à parte). Quando o contêiner roda com uid/gid do `.env`, defina também `AGENT2API_SELF_UPDATE=0` (a autoratualização dentro do contêiner pressupõe root, veja "Atualização dentro do contêiner" abaixo).
+
+> O app desktop nativo e o servidor systemd também podem ser instalados no Arch / Omarchy (veja as seções acima); porém o serviço systemd roda como um usuário dedicado `agent2api` com `ProtectHome=true`, então contas que dependem de "importar estado de login do desktop" não funcionam nesse caminho — prefira o Docker ou cole as credenciais no painel.
+
 ### Uso de memória
 
 O gateway da imagem (alvos Linux) já vem com o alocador jemalloc embutido. Em execuções longas e com vários encaminhamentos de contas em paralelo ele fragmenta bem menos que o alocador do sistema, e o RSS deixa de subir aos poucos — que é justamente onde máquinas com pouca memória costumam travar ou ser mortas por OOM.
@@ -260,7 +309,7 @@ print(resp.choices[0].message.content)
 
 ## Acesso pela rede local
 
-Por padrão o gateway escuta apenas `127.0.0.1`. Ao ativar "Configurações → Geral → Acesso pela rede local" ele passa a escutar todos os adaptadores e os dispositivos da rede só precisam apontar o endereço da API para o IP desta máquina (a interface mostra o endereço completo). Por segurança, é obrigatório registrar um administrador do painel antes de ativar: a API de gerenciamento passa a exigir sessão de administrador ou uma Gateway Key e, sem chave ativa, a API de encaminhamento também recusa (o fluxo cria uma chave "padrão" automaticamente). O painel web pode ser exposto à rede local opcionalmente (fechado por padrão). As mudanças valem após reiniciar.
+Por padrão o gateway escuta apenas `127.0.0.1`. Ao ativar "Configurações → Geral → Acesso pela rede local" ele passa a escutar todos os adaptadores e os dispositivos da rede só precisam apontar o endereço da API para o IP desta máquina (a interface mostra o endereço completo). Por segurança, é obrigatório registrar um administrador do painel antes de ativar: a API de gerenciamento passa a exigir sessão de administrador ou uma Gateway Key e, sem chave ativa, a API de encaminhamento também recusa (o fluxo cria uma chave "padrão" automaticamente). O painel web pode ser exposto à rede local opcionalmente (fechado por padrão). As mudanças valem após reiniciar. Implantações que usam `scripts/omarchy-compose.yml` (veja a subseção Arch / Omarchy em [Docker](#docker)) publicam a porta apenas no loopback por padrão; para acesso pela rede local, defina `AGENT2API_BIND_ADDRESS=0.0.0.0` no `.env`.
 
 Os instaladores de desktop (Windows / macOS) já incluem a pasta `ui/` do painel web: ao ativar também a opção de expor o painel de gerenciamento à rede local, dispositivos da rede podem abrir o mesmo endereço no navegador e ver a interface de gerenciamento — a mesma interface da versão Docker. **A janela do desktop em si nunca passa pelo login web** (não existe página de login no app): ela se autentica com a primeira Gateway Key desta máquina, então ligar esse interruptor não pede login no app. A página de login web só aparece quando um navegador abre o painel.
 

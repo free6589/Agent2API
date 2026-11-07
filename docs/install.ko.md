@@ -201,6 +201,55 @@ services:
 
 소스에서 빌드하려면: 이 저장소를 클론한 뒤 `docker compose up -d --build`(이미지에는 게이트웨이와 패널만 들어가며 Rust 도구 체인은 포함되지 않습니다).
 
+### Arch / Omarchy: 로컬 소스 빌드 배포(Docker)
+
+`scripts/`에는 Arch 계열(Omarchy / EndeavourOS / Manjaro 등 공통)용 로컬 배포 구성이 들어 있으며, 포트는 기본적으로 루프백에만 공개됩니다:
+
+- `scripts/omarchy-compose.yml` — 루트 `docker-compose.yml`과 별개의 강화版 compose: 포트는 기본적으로 `127.0.0.1`에만 공개, 호스트 포트 / 컨테이너 이름 / 이미지 / 컨테이너 uid/gid를 `.env`로 매개변수화 가능, 관리자와 첫 번째 게이트웨이 키 사전 설정 지원, 빌드는 호스트 네트워크로 진행;
+- `scripts/omarchy-agent2api.sh` — 일상 운영 스크립트: `up` / `build` / `down` / `restart` / `status` / `logs` / `health` / `backup` / `restore` / `doctor` / `config`.
+
+사전 준비(Arch / Omarchy):
+
+```bash
+sudo pacman -S --needed git docker docker-compose curl jq sqlite
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # 그룹 추가 후에는 재로그인 필요
+```
+
+호스트 포트 변경, LAN 개방, 키 사전 설정이 필요하면 저장소 루트에 `.env`를 만듭니다(커밋하지 말 것):
+
+```ini
+AGENT2API_BIND_ADDRESS=127.0.0.1   # LAN 접근이 필요할 때만 0.0.0.0으로 바꾸고 방화벽은 직접 구성
+AGENT2API_HOST_PORT=3065           # 공개할 호스트 포트. 사용 중이면 다른 번호로
+AGENT2API_UID=1000                 # ./data를 현재 사용자 소유로. 비 root 실행 시 AGENT2API_SELF_UPDATE=0 병용 권장
+AGENT2API_GID=1000
+# AGENT2API_CONTAINER_NAME=agent2api
+# AGENT2API_IMAGE=agent2api:local
+# AGENT2API_ADMIN_USER=…            # AGENT2API_ADMIN_PASSWORD=…(무인 배포에서만 사전 설정)
+# AGENT2API_PROXY_API_KEY=sk-…      # 첫 번째 게이트웨이 키 사전 설정(선택)
+```
+
+시작과 일상 운영(스크립트가 compose 파일과 프로젝트 디렉터리 인자를 자동으로 붙입니다):
+
+```bash
+scripts/omarchy-agent2api.sh up               # 빌드 후 시작, /health 대기
+scripts/omarchy-agent2api.sh doctor           # 의존성 / 데몬 / 포트 충돌 / 데이터 디렉터리 자가 점검
+scripts/omarchy-agent2api.sh status           # 포트 바인딩, 상태, 이미지와 데이터 디렉터리 요약
+scripts/omarchy-agent2api.sh backup           # 정지 → ./data 압축 → 시작(./backups에 저장)
+scripts/omarchy-agent2api.sh restore <아카이브>   # 복원. 기존 데이터는 이름을 바꿔 보존
+```
+
+스크립트를 쓰지 않을 때의 동등 명령은 `docker compose --project-directory . -f scripts/omarchy-compose.yml up -d --build`입니다(`--project-directory`는 저장소 루트를 가리켜야 합니다. 그렇지 않으면 `.env`와 `./data`가 `scripts/` 아래로 떨어집니다).
+
+Arch에서 알려진 함정 두 가지:
+
+- **빌드 시 GitHub에 접근 불가**: 이미지 빌드는 Cargo를 통해 `ProvidersPlugin/Agent2Providers` git 의존성을 가져오므로, Docker bridge가 GitHub에 닿지 않는 머신에서는 일반 빌드가 실패합니다. 먼저 `scripts/omarchy-agent2api.sh build`(호스트 네트워크 `--network host`로 빌드)를 실행한 뒤 `up`으로 시작하면 됩니다. 실행 시에는 여전히 일반 bridge 네트워크입니다.
+- **컨테이너 안에서 GitHub에 접근 불가**(플러그인 온라인 설치 / 갱신 실패): 설치된 플러그인은 `data/plugins`에서 로드되므로 기존 계정과 모델에는 영향이 없습니다. 온라인으로 플러그인을 설치 / 갱신하려면: 호스트에서 플러그인 패키지를 내려받아 패널의 "플러그인 → 업로드 후 설치"로 넣거나, 임시로 `--network host`로 컨테이너를 띄워 설치를 마칩니다. 이를 위해 포트를 `0.0.0.0`으로 공개하지 마세요.
+
+상태는 모두 `./data`에 있습니다(SQLite DB와 `account.key`는 반드시 쌍으로 백업. `backup`은 일관성을 위해 먼저 서비스를 정지하고, `restore`는 기존 데이터를 이름을 바꿔 보존합니다). 컨테이너를 `.env`의 uid/gid로 실행할 때는 `AGENT2API_SELF_UPDATE=0`도 함께 설정 권장(컨테이너 내 자가 업데이트는 root 실행이 전제. 아래 "컨테이너 내 업데이트" 참조).
+
+> 네이티브 데스크톱과 systemd 서버도 Arch / Omarchy에 설치할 수 있습니다(위의 해당 절 참조). 다만 systemd 서비스는 전용 `agent2api` 사용자로 `ProtectHome=true`와 함께 실행되므로 "데스크톱 로그인 상태 가져오기"에 의존하는 계정은 이 경로에서 사용할 수 없습니다 — 이런 계정이 필요하면 Docker를 우선하거나 패널에서 자격 증명을 붙여넣으세요.
+
 ### 메모리 사용량
 
 이미지 안의 게이트웨이(Linux 대상)에는 jemalloc 할당자가 내장되어 있습니다. 장시간 실행과 다계정 동시 포워딩에서 시스템 기본 할당자보다 메모리 단편화가 덜 생기고 RSS도 천천히 늘어나는 일이 줄어듭니다 —— 소형 메모리 머신이 가장 자주 눌리거나 OOM 으로 죽는 지점이 바로 여기입니다.
@@ -260,7 +309,7 @@ print(resp.choices[0].message.content)
 
 ## LAN 접근
 
-기본적으로 `127.0.0.1`만 수신합니다. "설정 → 일반 → LAN 접근"을 켜면 모든 네트워크 어댑터에서 수신하고, LAN 기기는 API 주소를 이 PC의 IP로 지정하기만 하면 됩니다(화면에 전체 주소 표시). 보안을 위해 켜기 전에 패널 관리자 등록이 필요합니다. 관리 API는 관리자 세션 또는 게이트웨이 키를 요구하며, 활성화된 키가 없으면 전달 API도 거부합니다(켜는 과정에서 "기본" 키가 자동 추가됩니다). 웹 패널의 LAN 공개도 선택할 수 있습니다(기본 비공개). 변경은 재시작 후 적용됩니다.
+기본적으로 `127.0.0.1`만 수신합니다. "설정 → 일반 → LAN 접근"을 켜면 모든 네트워크 어댑터에서 수신하고, LAN 기기는 API 주소를 이 PC의 IP로 지정하기만 하면 됩니다(화면에 전체 주소 표시). 보안을 위해 켜기 전에 패널 관리자 등록이 필요합니다. 관리 API는 관리자 세션 또는 게이트웨이 키를 요구하며, 활성화된 키가 없으면 전달 API도 거부합니다(켜는 과정에서 "기본" 키가 자동 추가됩니다). 웹 패널의 LAN 공개도 선택할 수 있습니다(기본 비공개). 변경은 재시작 후 적용됩니다. `scripts/omarchy-compose.yml`을 사용하는 배포([Docker](#docker)의 Arch / Omarchy 절 참조)는 포트가 기본적으로 루프백에만 공개되므로, LAN 접근을 위해서는 `.env`의 `AGENT2API_BIND_ADDRESS`를 `0.0.0.0`으로 설정해야 합니다.
 
 데스크톱 설치 프로그램(Windows / macOS)에는 웹 패널의 `ui/`가 이미 함께 들어 있습니다. "웹 관리 패널도 공개"를 켜면 LAN 기기에서 브라우저로 같은 주소를 열면 관리 화면이 나옵니다 —— Docker 버전과 동일한 화면입니다. **데스크톱 창 자체는 웹 로그인을 거치지 않습니다**(앱에 로그인 페이지가 없습니다). 이 PC의 첫 번째 게이트웨이 키를 자격 증명으로 사용하므로, 이 스위치를 켜는 데 데스크톱에서 추가 로그인이 필요하지 않습니다. 웹 로그인 페이지는 브라우저로 패널을 열 때만 나타납니다.
 

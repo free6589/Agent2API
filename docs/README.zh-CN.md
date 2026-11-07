@@ -83,6 +83,8 @@ cd C:\agent2api-pkg; .\install-service.ps1
 docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/data aimodcc/agent2api:latest
 ```
 
+> Arch / Omarchy：`scripts/` 里带了面向本机源码构建的加固部署套件（默认只绑回环），见[安装与部署 → Docker](./install.md#docker)。
+
 三种形态装完后都打开面板（`http://127.0.0.1:3065/`，服务端与 Docker 换成主机 IP）注册管理员账号，再在「网关 Key」页建一把 Key。连通性自测：`curl http://127.0.0.1:3065/health`
 
 **手机端**：浏览器打开 `http://<网关IP>:3065/m` 即可（可「添加到主屏幕」变成全屏 PWA）；想要独立图标就装 Release 里的 `Agent2API-<版本>.apk`（Android）或 `Agent2API-<版本>.ipa`（iOS，未签名，需自行重签）。细节见[安装与部署 → 手机端](./install.md#手机端)。

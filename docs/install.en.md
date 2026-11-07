@@ -201,6 +201,55 @@ Environment variables (all optional):
 
 Build from source: clone the repo and run `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
 
+### Arch / Omarchy: local source deployment (Docker)
+
+`scripts/` ships a local deployment setup for Arch-based systems (Omarchy / EndeavourOS / Manjaro alike) that publishes the port to the loopback interface only:
+
+- `scripts/omarchy-compose.yml` — a hardened compose file, independent of the root `docker-compose.yml`: the port is published to `127.0.0.1` only; host port / container name / image / container uid/gid can be parameterized via `.env`; pre-provisioning the admin and the first gateway key is supported; builds run on the host network;
+- `scripts/omarchy-agent2api.sh` — the day-to-day helper: `up` / `build` / `down` / `restart` / `status` / `logs` / `health` / `backup` / `restore` / `doctor` / `config`.
+
+Prerequisites (Arch / Omarchy):
+
+```bash
+sudo pacman -S --needed git docker docker-compose curl jq sqlite
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # log out and back in after joining the group
+```
+
+To change the host port, open the LAN or pre-provision keys, create a `.env` at the repo root (do not commit it):
+
+```ini
+AGENT2API_BIND_ADDRESS=127.0.0.1   # set to 0.0.0.0 only for LAN access, and configure your firewall yourself
+AGENT2API_HOST_PORT=3065           # published host port; pick another one if taken
+AGENT2API_UID=1000                 # keeps ./data owned by your user; pair with AGENT2API_SELF_UPDATE=0 for non-root
+AGENT2API_GID=1000
+# AGENT2API_CONTAINER_NAME=agent2api
+# AGENT2API_IMAGE=agent2api:local
+# AGENT2API_ADMIN_USER=…            # AGENT2API_ADMIN_PASSWORD=… (unattended deployments only)
+# AGENT2API_PROXY_API_KEY=sk-…      # pre-provision the first gateway key (optional)
+```
+
+Start and manage (the script already passes the compose file and project directory):
+
+```bash
+scripts/omarchy-agent2api.sh up                  # build and start, wait for /health
+scripts/omarchy-agent2api.sh doctor              # dependencies / daemon / port conflicts / data dir checks
+scripts/omarchy-agent2api.sh status              # port binding, health, image and data dir at a glance
+scripts/omarchy-agent2api.sh backup              # stop → archive ./data → start (into ./backups)
+scripts/omarchy-agent2api.sh restore <archive>   # restore; the old data is renamed aside
+```
+
+Without the helper the equivalent command is `docker compose --project-directory . -f scripts/omarchy-compose.yml up -d --build` (`--project-directory` must point at the repo root, otherwise `.env` and `./data` land under `scripts/`).
+
+Two known pitfalls on Arch:
+
+- **GitHub unreachable during the build**: the image build pulls the `ProvidersPlugin/Agent2Providers` git dependency via Cargo, so machines whose Docker bridge cannot reach GitHub fail on a plain build; run `scripts/omarchy-agent2api.sh build` first (it builds on the host network, `--network host`), then `up`. Runtime still uses a regular bridge network.
+- **GitHub unreachable inside the container** (online plugin install/update fails): installed plugins load from `data/plugins`, so existing accounts and models keep working. To install or update a plugin online: download the plugin package on the host and use the panel's "Plugins → upload & install", or start the container with `--network host` temporarily. Do not publish the port to `0.0.0.0` for this.
+
+All state lives in `./data` (the SQLite database and `account.key` must be backed up as a pair; `backup` stops the service first for consistency, `restore` renames the old data aside). When the container runs with a uid/gid from `.env`, set `AGENT2API_SELF_UPDATE=0` as well (in-container self-update assumes root, see "In-container updates" below).
+
+> The native desktop app and the systemd server can be installed on Arch / Omarchy as well (see the sections above); however the systemd service runs as a dedicated `agent2api` user with `ProtectHome=true`, so accounts that rely on "import desktop login state" do not work on that path — prefer Docker, or paste credentials in the panel.
+
 ### Memory usage
 
 The gateway in the image (Linux targets) ships with the jemalloc allocator built in. Over long uptimes and under concurrent multi-account forwarding it fragments far less than the system allocator, so RSS no longer creeps upward — the single most common way a small machine gets dragged down or OOM-killed.
@@ -260,7 +309,7 @@ print(resp.choices[0].message.content)
 
 ## LAN access
 
-By default the gateway only listens on `127.0.0.1`. After turning on "Settings → General → LAN access" it listens on all adapters, and devices on the LAN just point their API base URL at this machine's IP (the UI shows the full address) to share the accounts. For safety, enabling it requires registering a panel administrator first: the management API then demands an admin session or a gateway key, and with no key enabled the forwarding API refuses service too (the enable flow adds a "default" key automatically). The web panel can optionally be exposed to the LAN as well (off by default). Changes take effect after a restart.
+By default the gateway only listens on `127.0.0.1`. After turning on "Settings → General → LAN access" it listens on all adapters, and devices on the LAN just point their API base URL at this machine's IP (the UI shows the full address) to share the accounts. For safety, enabling it requires registering a panel administrator first: the management API then demands an admin session or a gateway key, and with no key enabled the forwarding API refuses service too (the enable flow adds a "default" key automatically). The web panel can optionally be exposed to the LAN as well (off by default). Changes take effect after a restart. Deployments using `scripts/omarchy-compose.yml` (see the Arch / Omarchy subsection under [Docker](#docker)) additionally publish the port to loopback only; for LAN access set `AGENT2API_BIND_ADDRESS=0.0.0.0` in `.env`.
 
 The desktop installers (Windows / macOS) already ship the web panel's `ui/` folder: once you turn on "expose the web management panel to the LAN" as well, devices on the LAN can open the same address in a browser to get the management UI — the same interface as the Docker form. **The desktop window itself never goes through web login** (there is no login page in the app): it authenticates with this machine's first gateway key, so flipping that switch never asks you to sign in from the desktop app. The web login page only appears when a browser opens the panel.
 

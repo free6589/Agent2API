@@ -201,6 +201,55 @@ services:
 
 ソースからビルドする場合: 本リポジトリをクローンして `docker compose up -d --build`（イメージにはゲートウェイとパネルのみが入り、Rust ツールチェーンは含まれません）。
 
+### Arch / Omarchy：ローカルでのソースビルド運用（Docker）
+
+`scripts/` には Arch 系（Omarchy / EndeavourOS / Manjaro 等で共通）向けのローカル運用セットが同梱されており、ポートは既定でループバックにだけ公開されます:
+
+- `scripts/omarchy-compose.yml` —— ルートの `docker-compose.yml` とは独立した強化版 compose: ポートは既定で `127.0.0.1` にのみ公開。ホストポート / コンテナ名 / イメージ / コンテナの uid/gid は `.env` でパラメータ化でき、管理者と最初のゲートウェイキーの事前設定、ビルド時のホストネットワーク使用に対応;
+- `scripts/omarchy-agent2api.sh` —— 日々の操作用スクリプト: `up` / `build` / `down` / `restart` / `status` / `logs` / `health` / `backup` / `restore` / `doctor` / `config`。
+
+事前準備（Arch / Omarchy）:
+
+```bash
+sudo pacman -S --needed git docker docker-compose curl jq sqlite
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # グループ追加後は再ログインが必要
+```
+
+ホストポートの変更、LAN の開放、キーの事前設定をするには、リポジトリのルートに `.env` を作成します（コミットしないこと）:
+
+```ini
+AGENT2API_BIND_ADDRESS=127.0.0.1   # LAN アクセスが必要なときだけ 0.0.0.0 に変更し、ファイアウォールは自己設定
+AGENT2API_HOST_PORT=3065           # 公開するホストポート。使用中なら別の番号に
+AGENT2API_UID=1000                 # ./data を現在のユーザー所有に。非 root 実行では AGENT2API_SELF_UPDATE=0 と併用推奨
+AGENT2API_GID=1000
+# AGENT2API_CONTAINER_NAME=agent2api
+# AGENT2API_IMAGE=agent2api:local
+# AGENT2API_ADMIN_USER=…            # AGENT2API_ADMIN_PASSWORD=…（無人運用でのみ事前設定）
+# AGENT2API_PROXY_API_KEY=sk-…      # 最初のゲートウェイキーを事前設定（任意）
+```
+
+起動と日々の操作（スクリプトは compose ファイルとプロジェクトディレクトリの引数を自動で付けます）:
+
+```bash
+scripts/omarchy-agent2api.sh up               # ビルドして起動、/health を待つ
+scripts/omarchy-agent2api.sh doctor           # 依存関係 / デーモン / ポート競合 / データディレクトリの自己診断
+scripts/omarchy-agent2api.sh status           # ポートバインド、健康状態、イメージとデータディレクトリの一覧
+scripts/omarchy-agent2api.sh backup           # 停止 → ./data をアーカイブ → 起動（./backups へ）
+scripts/omarchy-agent2api.sh restore <書庫>   # 復元。旧データはリネームして残す
+```
+
+スクリプトを使わない場合の等価コマンドは `docker compose --project-directory . -f scripts/omarchy-compose.yml up -d --build` です（`--project-directory` はリポジトリのルートを指すこと。そうしないと `.env` と `./data` が `scripts/` の下に落ちます）。
+
+Arch で既知の落とし穴は 2 つ:
+
+- **ビルド時に GitHub へ到達できない**: イメージのビルドは Cargo 経由で `ProvidersPlugin/Agent2Providers` の git 依存を取得するため、Docker bridge から GitHub に到達できないマシンではそのままのビルドが失敗します。先に `scripts/omarchy-agent2api.sh build`（ホストネットワーク `--network host` でビルド）を実行してから `up` で起動すれば大丈夫です。実行時は通常の bridge ネットワークのままです。
+- **コンテナ内から GitHub に到達できない**（プラグインのオンラインインストール / 更新に失敗）: インストール済みプラグインは `data/plugins` から読み込まれるため、既存のアカウントとモデルには影響しません。オンラインでプラグインを入れる / 更新するには: ホストでプラグインパッケージをダウンロードしてパネルの「プラグイン → アップロードしてインストール」から入れるか、一時的に `--network host` でコンテナを起動してインストールします。このためにポートを `0.0.0.0` に公開しないこと。
+
+状態はすべて `./data` に置かれます（SQLite データベースと `account.key` は必ずペアでバックアップ。`backup` は整合性のため先にサービスを停止し、`restore` は旧データをリネームして残します）。コンテナを `.env` の uid/gid で実行するときは `AGENT2API_SELF_UPDATE=0` も併せて設定を推奨（コンテナ内セルフアップデートは root 実行が前提。下記「コンテナ内での更新」を参照）。
+
+> ネイティブデスクトップ版と systemd サーバーも Arch / Omarchy に導入できます（上記の各節を参照）。ただし systemd サービスは専用の `agent2api` ユーザーで `ProtectHome=true` 付きで動くため、「デスクトップのログイン状態を取り込む」系のアカウントはこの経路では使えません —— その種のアカウントが必要なら Docker を優先するか、パネルで認証情報を貼り付けてください。
+
 ### メモリ使用量
 
 イメージ内のゲートウェイ（Linux ターゲット）には jemalloc アロケーターを組み込んでいます。長時間の稼働やマルチアカウントの並行転送では、システム標準のアロケーターよりメモリ断片化が起きにくく、RSS がじわじわ増えにくくなります —— 小メモリのマシンが最もよく押し潰されたり OOM になったりする箇所です。
@@ -260,7 +309,7 @@ print(resp.choices[0].message.content)
 
 ## LAN アクセス
 
-既定では `127.0.0.1` のみをリッスンします。「設定 → 一般 → LAN アクセス」を有効にするとすべてのネットワークアダプターで待ち受け、LAN 内の機器は API アドレスを本機の IP に向けるだけで（画面に完全なアドレスが表示されます）アカウント群を共有できます。セキュリティのため、有効化の前にパネル管理者の登録が必要です。管理 API は管理者セッションまたはゲートウェイキーを要求し、有効なキーが無い場合は転送 API も拒否します（有効化の流れで「既定」キーが自動追加されます）。Web パネルの LAN 公開も任意で選べます（既定は非公開）。変更は再起動後に有効です。
+既定では `127.0.0.1` のみをリッスンします。「設定 → 一般 → LAN アクセス」を有効にするとすべてのネットワークアダプターで待ち受け、LAN 内の機器は API アドレスを本機の IP に向けるだけで（画面に完全なアドレスが表示されます）アカウント群を共有できます。セキュリティのため、有効化の前にパネル管理者の登録が必要です。管理 API は管理者セッションまたはゲートウェイキーを要求し、有効なキーが無い場合は転送 API も拒否します（有効化の流れで「既定」キーが自動追加されます）。Web パネルの LAN 公開も任意で選べます（既定は非公開）。変更は再起動後に有効です。`scripts/omarchy-compose.yml` を使った運用（[Docker](#docker) の Arch / Omarchy の節を参照）では、さらにポートが既定でループバックに公開されます。LAN アクセスには `.env` の `AGENT2API_BIND_ADDRESS` を `0.0.0.0` に設定してください。
 
 デスクトップ版（Windows / macOS）のインストーラーには Web パネルの `ui/` も同梱されています。「Web 管理パネルも公開する」を有効にすると、LAN 内の機器がブラウザーで同じアドレスを開くだけで管理画面になります —— Docker 版と同一の画面です。**デスクトップウィンドウ自体は Web ログインを通りません**（ログインページが無いため）。本機の最初のゲートウェイキーを資格情報として使うので、このスイッチを入れるのにデスクトップ側で追加のログインは不要です。Web ログインページは、ブラウザーからパネルを開いたときにだけ表示されます。
 

@@ -83,6 +83,8 @@ cd C:\agent2api-pkg; .\install-service.ps1
 docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/data aimodcc/agent2api:latest
 ```
 
+> Arch / Omarchy: `scripts/` にローカルのソースビルド運用向けの強化セット（既定でループバックのみ）が同梱されています。詳細: [インストールとデプロイ → Docker](install.ja.md#docker)。
+
 どの形態でも、導入後にパネル（`http://127.0.0.1:3065/`。サーバーと Docker はホストの IP に読み替え）を開いて管理者アカウントを登録し、「ゲートウェイキー」ページでキーを作成してください。疎通確認: `curl http://127.0.0.1:3065/health`
 
 **モバイル**: ブラウザーで `http://<ゲートウェイIP>:3065/m` を開けば使えます（「ホーム画面に追加」で全画面 PWA に）。独立したアイコンが欲しい場合は、Release の `Agent2API-<バージョン>.apk`（Android）または `Agent2API-<バージョン>.ipa`（iOS、未署名・自己再署名が必要）をインストールしてください。詳細: [インストールとデプロイ → モバイル](install.ja.md#モバイル)。
