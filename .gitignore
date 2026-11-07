@@ -42,6 +42,9 @@ dist/
 .env
 data/
 
+# omarchy-agent2api.sh backup 的归档目录（停服 → 打包 ./data → 起服）
+backups/
+
 # ── 手机 APK（Capacitor）──────────────────────────────────────
 # android/ 是 `npx cap add android` 生成的原生工程，需要入库：
 # 图标、Manifest、网络安全策略都是手改过的，重新生成会丢。
