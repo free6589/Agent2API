@@ -524,6 +524,9 @@ where
                     json!(crate::server::core::plugin_host::provider_category(detail.id))
                 } else { json!("agent") },
                 "source": if plugin { "plugin" } else { "builtin" },
+                // 握手时申报的静态登录方式：动态 `auth.methods` 回 501 时界面用它
+                // 渲染旧版表单（见 `plugin_host::login_methods_of` 的说明）。
+                "loginMethods": crate::server::core::plugin_host::login_methods_of(detail.id),
             })
         })
         .collect();
@@ -545,6 +548,7 @@ where
             "count": count(&id),
             "category": crate::server::core::plugin_host::provider_category(&id),
             "source": "plugin",
+            "loginMethods": crate::server::core::plugin_host::login_methods_of(&id),
         }));
     }
     // 缺插件的残留账号仍不列，记录留在账号库里等待执行体恢复。
