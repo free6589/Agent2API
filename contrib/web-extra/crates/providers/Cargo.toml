@@ -1,0 +1,25 @@
+[package]
+name = "agent2api-web-extra"
+description = "Agent2API 网页提供商扩展包（通义千问网页）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[[bin]]
+name = "agent2api-web-extra"
+path = "src/main.rs"
+
+[features]
+default = ["qwen"]
+qwen = []
+
+[dependencies]
+agent2api-provider-protocol = { git = "https://github.com/ProvidersPlugin/Agent2Providers", tag = "v3.4.0" }
+agent2api-provider-sdk = { git = "https://github.com/ProvidersPlugin/Agent2Providers", tag = "v3.4.0" }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+md-5 = "0.10"
+getrandom = "0.2"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
