@@ -1,0 +1,47 @@
+# Agent2API 本机部署（Arch / Omarchy 适用，独立于根目录 docker-compose.yml 的加固版）。
+#
+# 与根目录 docker-compose.yml 的差异：
+#   1. 端口默认只发布到 127.0.0.1，不把面板和网关暴露到局域网 / 公网；
+#      需要局域网访问时在 .env 里显式设 AGENT2API_BIND_ADDRESS=0.0.0.0 并自行配防火墙。
+#   2. 宿主端口 / 容器名 / 镜像 / 容器 uid/gid 都可用 .env 参数化（见下）。
+#   3. 支持预置管理员与第一把网关 Key（AGENT2API_PROXY_API_KEY，无人值守用）。
+#
+# 构建遇「Docker bridge 访问 GitHub 超时」（Cargo 拉 ProvidersPlugin/Agent2Providers
+# 依赖需要 GitHub）：不要在这里写 build.network: host —— compose 的 buildx 路径会要求
+# --allow=network.host 权限，兼容性差；用 scripts/omarchy-agent2api.sh build 先建镜像
+# （走宿主网络），再用 up 启动。
+#
+# 用法（--project-directory 必须指向仓库根，否则 .env 与 ./data 会落到 scripts/ 下）：
+#   docker compose --project-directory . -f scripts/omarchy-compose.yml up -d --build
+# 日常操作建议直接用 scripts/omarchy-agent2api.sh（已代为带上这两个参数）。
+# .env 按需写上面列的键（不存在的键用默认值），不要提交。
+services:
+  agent2api:
+    build: .
+    image: ${AGENT2API_IMAGE:-agent2api:local}
+    container_name: ${AGENT2API_CONTAINER_NAME:-agent2api}
+    restart: unless-stopped
+    # 默认 root（兼容容器内自更新）；本机部署建议在 .env 设自己的 UID/GID，
+    # 例如 AGENT2API_UID=1000、AGENT2API_GID=1000，让 ./data 保持用户可读；
+    # 非 root 运行时同时设 AGENT2API_SELF_UPDATE=0（容器内自更新以 root 为前提）。
+    user: "${AGENT2API_UID:-0}:${AGENT2API_GID:-0}"
+    # 小内存机器可加 mem_limit: 1g（口径见根 docker-compose.yml 注释）。
+    ports:
+      - "${AGENT2API_BIND_ADDRESS:-127.0.0.1}:${AGENT2API_HOST_PORT:-3065}:3065"
+    environment:
+      # 面板管理员：可选。不设时走登录页注册（首次打开面板即提示）；
+      # 无人值守 / IaC 部署才需要在这里预置（密码明文填，启动时自动转 bcrypt 哈希）。
+      AGENT2API_ADMIN_USER: ${AGENT2API_ADMIN_USER:-}
+      AGENT2API_ADMIN_PASSWORD: ${AGENT2API_ADMIN_PASSWORD:-}
+      # 可选：预置第一把网关 API Key（无人值守部署用）；不设则先在面板
+      # 「网关 Key」页创建，创建前 /v1/* 为 fail-closed。
+      AGENT2API_PROXY_API_KEY: ${AGENT2API_PROXY_API_KEY:-}
+      # 可选：面板分端口（见根 docker-compose.yml 头部说明）。不设则面板与网关同在 3065。
+      AGENT2API_PANEL_PORT: ${AGENT2API_PANEL_PORT:-}
+      AGENT2API_CAPTCHA_ENABLED: ${AGENT2API_CAPTCHA_ENABLED:-1}
+      AGENT2API_SELF_UPDATE: ${AGENT2API_SELF_UPDATE:-1}
+      # 进阶：AGENT2API_VERBOSE / AGENT2API_ALLOW_NO_KEY / AGENT2API_HOST 等
+      # 需要时在此自行追加（变量口径见 docs/install.md 的 Docker 一节）。
+    volumes:
+      # 全部状态（SQLite 库、account.key、插件、日志）都在这一个卷里
+      - ./data:/data
