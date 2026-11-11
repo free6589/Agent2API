@@ -1,0 +1,7 @@
+{
+  "_comment": "文心旧版（wenxinworkshop）AK/SK 模式的账号 secret 示例。accessToken/expiresAt 由插件换取后回写，不要手填。",
+  "mode": "ak_sk",
+  "apiKey": "${QIANFAN_APP_API_KEY}",
+  "secretKey": "${QIANFAN_APP_SECRET_KEY}",
+  "baseUrl": "https://aip.baidubce.com"
+}

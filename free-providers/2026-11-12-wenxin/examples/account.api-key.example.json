@@ -1,0 +1,6 @@
+{
+  "_comment": "文心（千帆）API Key 模式的账号 secret 示例。凭证只在网关账号库（accounts.data.secret）里，本文件只允许占位符。",
+  "mode": "api_key",
+  "apiKey": "${QIANFAN_API_KEY}",
+  "baseUrl": "https://qianfan.baidubce.com/v2"
+}

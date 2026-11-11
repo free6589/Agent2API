@@ -1,0 +1,16 @@
+{
+  "id": "free-wenxin",
+  "name": "Free · 文心",
+  "description": "免费/自备凭证提供商：百度文心（千帆 API）。API Key 走官方 OpenAI 兼容端点（qianfan.baidubce.com/v2），AK/SK 走旧版 wenxinworkshop 端点（access_token 自动续期）。能力以 README 申报为准。",
+  "license": "AGPL-3.0",
+  "version": "2026.11.12",
+  "protocol": 1,
+  "provider_category": "agent",
+  "icons": "assets",
+  "providers": [
+    { "id": "wenxin", "label": "文心（千帆）", "order": 0, "default_enabled": true }
+  ],
+  "entry": {
+    "x86_64-unknown-linux-gnu": "bin/free-wenxin"
+  }
+}

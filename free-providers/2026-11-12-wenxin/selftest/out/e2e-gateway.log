@@ -1,0 +1,37 @@
+# 生成时间：2026-11-12T04:27:35+08:00
+# 前置：隔离网关实例（AGENT2API_PROXY_HOME=.scratch-tmp/wx-gw，端口 3066），插件包按官方布局装在
+#       $AGENT2API_PROXY_HOME/plugins/free-wenxin/2026.11.12/{pack.json,bin/free-wenxin}
+# 命令：python3 free-providers/2026-11-12-wenxin/selftest/e2e_gateway.py
+
+mock 上游：http://127.0.0.1:39871
+  PASS  面板注册成功（取得会话）
+  PASS  /api/session 可读
+    （/api/session 的家清单：['wenxin']）
+  PASS  应用发现插件家 wenxin（/api/session 的家清单里有它）
+  PASS  标签来自插件（文心（千帆））
+  PASS  provider 来源标为 plugin
+  PASS  添加账号表单由插件申报驱动（loginMethods 含 token 表单）
+  PASS  账号行渲染参数来自插件（identifier=authMode，usage=false）
+  PASS  创建只允许 wenxin 的网关 Key
+  PASS  添加账号成功（走插件的 account.normalize）
+  PASS  账号出现在列表里
+  PASS  账号列表不含凭证本体
+  PASS  账号行带 tokenTail（尾 4 字符）
+  PASS  账号行由插件的 account_view 产出（authMode=API Key）
+  PASS  网关已 spawn 插件入口二进制（free-wenxin 进程在跑）
+  PASS  /v1/models 出现 wenxin 的模型
+  PASS  /v1/models 含 ernie-5.1
+  PASS  非流式对话 200 且正文为「你好」
+  PASS  非流式响应的 usage 非零（total_tokens=11）
+  PASS  流式对话逐块下发且拼出「你好」
+  PASS  流式对话以 [DONE] 结束
+  PASS  被上游拒绝的 Key 不会被落库（插件 normalize 拦下）
+
+结果：21 项通过，0 项失败
+
+--- 网关侧日志（插件加载与会话式转发，原文） ---
+[20:27:27.334] Plugin 插件包「free-wenxin」v2026.11.12 已加载，1 家提供商可用
+[20:27:35.574] [Upstream] 会话式转发 model=ernie-5.1 stream=false account=wenxin-account-78a890ad9ad7ebfa9fc116af1d2b8386d9a7ab33cb723e3a9295b0018637eb0d priority=100 出口=直连 provider=wenxin
+[20:27:35.576] [Upstream] 会话式转发完成（2ms）
+[20:27:35.579] [Upstream] 会话式转发 model=ernie-5.1 stream=true account=wenxin-account-78a890ad9ad7ebfa9fc116af1d2b8386d9a7ab33cb723e3a9295b0018637eb0d priority=100 出口=直连 provider=wenxin
+[20:27:35.580] [Upstream] 会话式转发完成（1ms）

@@ -1,0 +1,59 @@
+# 生成时间：2026-11-12T04:19:25+08:00
+# 命令：cargo build --release --offline && python3 selftest/selftest.py
+# 二进制：target/release/free-wenxin
+
+mock 上游：http://127.0.0.1:38267
+  PASS  init 返回 wenxin ProviderInfo
+  PASS  能力位 chat/stateful/refresh/model_refresh 均为 true
+  PASS  能力位 usage/checkin 为 false（上游没有，见模块头排除过程）
+  PASS  内置兜底清单非空（API Key 模式静态表）
+  PASS  申报了 Token 登录方式
+  PASS  models.list 非空且含 ernie-5.1
+  PASS  models.list 首刷前是静态兜底（meta.remote = false）
+  PASS  models.refresh 从 /v2/models 拉到清单
+  PASS  远程清单只保留对话模型（过滤 embeddings/offline/非 chat 端点）
+  PASS  远程清单 meta.remote = true
+  PASS  features 含 function_call 才给 supportsToolCall
+  PASS  远程条目的 maxInputTokens/maxOutputTokens 有值
+  PASS  conversation 先发 head 且状态 200
+  PASS  head 声明 OpenAI chat SSE（upstream=chat）
+  PASS  流式帧可逐块消费且拼出正文「你好」
+  PASS  流以 data: [DONE] 正常结束
+  PASS  末帧带非零 usage（include_usage 生效）
+  PASS  有 finish_reason = stop 的收尾帧
+  PASS  插件恒按流式推帧（网关据此聚合非流式）
+  PASS  非 SSE 整包被翻成「正文 + 收尾 + usage」帧流
+  PASS  整包路径也带 usage
+  PASS  上游 401 时 head.status = 401
+  PASS  401 的错误体原样交给网关（含 invalid_iam_token）
+  PASS  classify invalid_iam_token → token_expired
+  PASS  classify rpm_rate_limit_exceeded → quota_limited
+  PASS  classify system_unsafe → content_blocked
+  PASS  classify account_overdue → quota_limited
+  PASS  classify invalid_model(无权限) → fatal
+  PASS  classify model_offline → fatal
+  PASS  classify malformed_json → fatal
+  PASS  classify internal_error → fatal
+  PASS  classify v1 error_code 110 → token_expired
+  PASS  classify v1 error_code 17(日限额) → quota_limited
+  PASS  classify v1 error_code 100(参数) → fatal
+  PASS  token.ensure 从 oauth 换到 access_token
+  PASS  换到的 token 被比较-再写回账号记录
+  PASS  token.expiring 在 30 天有效期内返回 false
+  PASS  token.expiring 在临期窗口内返回 true
+  PASS  token.refresh 能强制重取（忽略缓存）
+  PASS  API Key 模式 token.ensure 直接给 Key
+  PASS  API Key 模式 token.expiring 恒 false（无续期接口）
+  PASS  V1 对话 result 帧被翻成 OpenAI 帧（正文「你好」）
+  PASS  V1 流式也以 [DONE] 收尾（上游本来没有）
+  PASS  V1 流式带 usage 帧
+  PASS  V1 head 200
+  PASS  account.normalize 落库 secret 含 apiKey
+  PASS  公开形态不含凭证本体（无 apiKey/secretKey/accessToken）
+  PASS  公开形态只给 tokenTail（尾 4 字符）
+  PASS  identity 由模式 + 凭证指纹生成（wenxin- 前缀）
+  PASS  API Key 被上游 401 时拒绝落库
+  PASS  AK/SK 模式规范化时预热 access_token
+  PASS  AK/SK 公开形态标明认证方式
+
+结果：52 项通过，0 项失败
