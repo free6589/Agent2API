@@ -32,8 +32,16 @@ use crate::server::core::proxies::describe_account_proxy;
 /// 本体与真实插件有执行体就显示；旧身份缺插件仍隐藏，数据留在库里。
 /// 自定义提供商独立直连，不经插件；其它账号只认真实执行体，缺插件的
 /// 存量记录继续隐藏而不删除。
+///
+/// free-pi 是唯一的例外：它的**账号层在内置**（粘贴 JWT 落库，
+/// 见 `freepi_accounts` 模块头），添加入口此刻就能用 —— 添加成功后把账号
+/// 藏起来等于「看得见添加成功、列表里却没有」，比等插件更让人糊涂。
+/// 转发执行体确实还在路上，但公开形态的 `chatSupported`（统一注入层按
+/// 适配器如实给 false）已经把「启用了也不会被转发」说出来 —— 那正是
+/// 统一注入注释里预留的「能用账号管理、但转发还没接上」过渡期形状。
 pub(crate) fn account_visible(provider: &str) -> bool {
     provider.starts_with(custom_providers::ID_PREFIX)
+        || super::is_freepi_family(provider)
         || crate::server::core::providers::is_executable_provider(provider)
 }
 
@@ -469,6 +477,13 @@ impl AccountStore {
             // （refreshToken / uuid / 两个 keyfrom）。它们都是「能续期」的条件，
             // 一起下发等于把账号的续期能力送出去；界面要的只是 canRefresh 布尔。
             self.to_lobsterai_public_account(record)
+        } else if super::is_freepi_family(&record.provider()) {
+            // free-pi（免费 pi 编码代理）：单一入口（粘贴 90 天登录 JWT，账号 =
+            // 令牌本身，上游没有续期接口）。公开形态逐字段白名单：JWT 本体不下发，
+            // 只留尾 4 位与 hasToken 存在标记（见 `freepi_accounts.rs`）。漏这一支
+            // 时它会掉进下面的 workbuddy 兜底形状：界面多出一批 uid/edition 空字段，
+            // 兜底虽也不透 token，但「哪枚令牌、要不要重贴」就从界面上消失了。
+            self.to_freepi_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

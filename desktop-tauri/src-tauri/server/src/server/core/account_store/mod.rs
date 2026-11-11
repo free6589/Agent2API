@@ -87,6 +87,9 @@
 //!                session 添加（session + imageId + userId）、公开形态（含 edition）
 //!   commandcode_accounts.rs Command Code 账号（单一 provider）：粘贴 `user_`
 //!                开头的 API Key 添加、公开形态（只给尾号）
+//!   freepi_accounts.rs   free-pi 账号（单一 provider）：粘贴 90 天登录 JWT
+//!                添加（账号 = 令牌本身，无续期）、公开形态（只给尾号 +
+//!                hasToken；supports_refresh=false 的依据见该模块头）
 //!   antigravity_accounts.rs Antigravity 账号（单一 provider）：粘贴 Google
 //!                refresh token 添加、刷新回写（比较-再写）、公开形态（只给尾号）
 
@@ -102,6 +105,7 @@ pub mod codearts_accounts;
 pub mod atomcode_accounts;
 pub mod commandcode_accounts;
 pub mod custom_accounts;
+pub mod freepi_accounts;
 mod hidden_accounts;
 pub mod kuku_accounts;
 pub mod lobsterai_accounts;
@@ -254,6 +258,13 @@ pub(crate) const LOBSTERAI_PROVIDER_ID: &str = crate::server::core::providers::k
     crate::server::core::providers::ProviderKind::LobsterAi,
 );
 
+/// free-pi（免费 pi 编码代理）provider id（**从注册表推导**，同
+/// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `freepi_accounts.rs`
+/// （单一 provider、没有地区之分）。
+pub(crate) const FREEPI_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::FreePi,
+);
+
 /// 智谱清言（`chatglm.cn`）provider id（**从注册表推导**，同
 /// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `chatglm_accounts.rs`。
 ///
@@ -330,6 +341,16 @@ pub(crate) fn is_zcode_family(provider_id: &str) -> bool {
 pub(crate) fn is_qoder_family(provider_id: &str) -> bool {
     crate::server::core::providers::qoder::endpoints::Region::from_provider_id(provider_id)
         .is_some()
+}
+
+/// 这个 provider 是不是 **free-pi**（单一 provider，没有地区之分）。
+///
+/// 与 [`is_cline_family`] / [`is_autoclaw_family`] 同一形态：账号层的添加
+/// 分派（`api::accounts::add_account`）与公开形态分派
+/// （`store_view::public_account`）都走本函数，将来改名或拆分时只改这里，
+/// 而不是散在各文件里的 `id == "freepi"`。
+pub(crate) fn is_freepi_family(provider_id: &str) -> bool {
+    provider_id == FREEPI_PROVIDER_ID
 }
 
 /// 小浣熊 provider id（账号存储内部多处要用）。

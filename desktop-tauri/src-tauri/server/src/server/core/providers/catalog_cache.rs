@@ -93,6 +93,35 @@ pub const SCOPE_ATOMCODE: &str = "atomcode";
 /// LobsterAI（网易有道「有道龙虾」）的模型目录缓存槽
 pub const SCOPE_LOBSTERAI: &str = "lobsterai";
 
+/// Free Pi（`api.freepi.ai`，`GET /client-version` 目录）的模型目录缓存槽。
+/// 目录数据由 `providers::free_pi::models` 写入（静态兜底 + 远程清单，见该模块头）。
+pub const SCOPE_FREE_PI: &str = "free-pi";
+
+/// 全部缓存槽的清单（与上面的 `SCOPE_*` 一一对应）。
+///
+/// ── 为什么要有这张表 ────────────────────────────────────────
+/// 写缓存不需要它（`save(scope, …)` 按传入的 scope 落键），但**漏登记一个
+/// scope 不会有任何编译期或运行期报错**：清单能写进内存、能落盘，重启后却
+/// 没人读它 —— 症状只是「重启后又变回内置兜底清单」，与「缓存没生效」无法
+/// 区分（provider-adaptation SKILL §2.3 点名的最易漏处）。这张表是唯一的
+/// 显式登记点：新加 `SCOPE_*` 常量时同步加进来，模块尾的测试逐条核对
+/// 常量与表的一致性，漏一处测试红。
+pub const ALL_SCOPES: &[&str] = &[
+    SCOPE_WORKBUDDY,
+    SCOPE_WORKBUDDY_INTL,
+    SCOPE_CATPAW,
+    SCOPE_AUTOCLAW_CN,
+    SCOPE_AUTOCLAW_INTL,
+    SCOPE_CODEARTS,
+    SCOPE_LOOMY,
+    SCOPE_MONKEYCODE_CN,
+    SCOPE_MONKEYCODE_INTL,
+    SCOPE_ANTIGRAVITY,
+    SCOPE_ATOMCODE,
+    SCOPE_LOBSTERAI,
+    SCOPE_FREE_PI,
+];
+
 /// 一份清单缓存
 pub struct CachedCatalog {
     /// 落地后的清单（各家内存状态的形态）
@@ -249,4 +278,93 @@ fn write_all(conn: &Connection, all: &Map<String, Value>) -> bool {
         params![KV_KEY, text],
     )
     .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ALL_SCOPES` 与 `SCOPE_*` 常量一一对应：漏登记的 scope（清单重启后
+    /// 读不回来、又不报错的那类）在这里被拦下。去重断言顺带挡「同一个槽
+    /// 写了两遍」—— 第二遍永远是手误。
+    #[test]
+    fn all_scopes_covers_every_constant() {
+        let expected = [
+            SCOPE_WORKBUDDY,
+            SCOPE_WORKBUDDY_INTL,
+            SCOPE_CATPAW,
+            SCOPE_AUTOCLAW_CN,
+            SCOPE_AUTOCLAW_INTL,
+            SCOPE_CODEARTS,
+            SCOPE_LOOMY,
+            SCOPE_MONKEYCODE_CN,
+            SCOPE_MONKEYCODE_INTL,
+            SCOPE_ANTIGRAVITY,
+            SCOPE_ATOMCODE,
+            SCOPE_LOBSTERAI,
+            SCOPE_FREE_PI,
+        ];
+        assert_eq!(ALL_SCOPES.len(), expected.len(), "槽清单条数与常量数不一致");
+        for scope in expected {
+            assert!(
+                ALL_SCOPES.contains(&scope),
+                "scope「{scope}」有常量但没进 ALL_SCOPES：重启后该家清单读不回来"
+            );
+        }
+        let mut unique = ALL_SCOPES.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ALL_SCOPES.len(), "ALL_SCOPES 有重复条目");
+        assert!(
+            ALL_SCOPES.iter().all(|scope| !scope.trim().is_empty()),
+            "ALL_SCOPES 不允许空槽名"
+        );
+    }
+
+    /// 重启存活机制：`save` 落盘后，**新开一条连接**（等价新进程 `Db::open`
+    /// 同一个文件）能从 `kv` 表原样读回 —— 生产路径的重启恢复就是
+    /// 「启动 → `install(db)` → 首次访问时 `load(scope)`」读同一行。
+    #[test]
+    fn free_pi_scope_survives_restart() {
+        let (db, _guard) = crate::server::db::test_temp::TempDb::open("free-pi-catalog");
+        let path = _guard.path().to_path_buf();
+        install(Some(db));
+        let models = vec![serde_json::json!({
+            "id": "deepseek/deepseek-v4-flash",
+            "name": "DeepSeek V4 Flash",
+        })];
+        save(SCOPE_FREE_PI, &models, 1_760_000_000_000);
+
+        // 同进程读回（首访恢复路径）
+        let cached = load(SCOPE_FREE_PI).expect("写入后应能读回");
+        assert_eq!(cached.fetched_at, 1_760_000_000_000);
+        assert_eq!(cached.models, models);
+
+        // 模拟重启：新开一条连接直读 kv 表（load 的 read_all 用同一条 SQL）
+        let fresh = Db::open(&path).expect("重启后应能打开同一份数据库");
+        let text: Option<String> = fresh
+            .with(|conn| {
+                conn.query_row(
+                    "SELECT value FROM kv WHERE key = ?1",
+                    params![KV_KEY],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+            .flatten();
+        let restored: Value =
+            serde_json::from_str(text.as_deref().unwrap_or("")).expect("落盘值应是合法 JSON");
+        let entry = restored.get(SCOPE_FREE_PI).expect("free-pi 槽应已落盘");
+        assert_eq!(
+            entry.get("fetchedAt").and_then(Value::as_i64),
+            Some(1_760_000_000_000)
+        );
+        assert_eq!(
+            entry
+                .get("models")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice),
+            Some(models.as_slice())
+        );
+    }
 }

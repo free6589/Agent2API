@@ -168,6 +168,7 @@ pub fn placeholder(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::ModelscopeIntl,
         ProviderKind::Atomcode,
         ProviderKind::LobsterAi,
+        ProviderKind::FreePi,
     ];
 
     static SLOTS: OnceLock<Vec<MissingPluginAdapter>> = OnceLock::new();

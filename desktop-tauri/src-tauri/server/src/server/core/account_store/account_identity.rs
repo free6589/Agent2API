@@ -96,6 +96,11 @@ pub(crate) fn stable(provider: &str, fields: &Map<String, Value>) -> Option<Stri
         }
         Some(ProviderKind::Atomcode) => text(fields, &["userId", "user_id", "uid", "username", "userName"]),
         Some(ProviderKind::Accio | ProviderKind::AccioCn) => text(fields, USER_KEYS),
+        // Free Pi：账号形态见 `account_store::freepi_accounts`（`uid` 取 JWT
+        // `sub`）。身份键仍按宽名单取（首位命中即用），与未知 provider 同口径：
+        // 内置执行体只写 `uid`，而将来插件接管转发后写入的键名未必同形，宽名单
+        // 让两边都对得上，不会因一家改键名而丢身份。
+        Some(ProviderKind::FreePi) => text(fields, &["userId", "user_id", "userid", "uid", "loginName", "login_name", "account", "email", "phone", "username"]),
         None => text(fields, &["userId", "user_id", "userid", "uid", "loginName", "login_name", "account", "email", "phone", "username"]),
     }
 }

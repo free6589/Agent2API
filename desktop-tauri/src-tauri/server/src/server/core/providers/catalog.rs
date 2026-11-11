@@ -68,9 +68,14 @@ pub(crate) fn manifest_for(kind: ProviderKind) -> Vec<Value> {
     manifest_for_provider(kind_id(kind))
 }
 
-/// 旧内置目录已迁入插件，网关不再持有按 kind 划分的刷新元数据。
-pub(crate) fn refresh_meta(_kind: ProviderKind) -> (bool, i64) {
-    (false, 0)
+/// 旧内置目录已迁入插件，网关不再持有按 kind 划分的刷新元数据；
+/// 唯一例外是 Free Pi（拆家后新增的内置执行体），它的目录元数据由
+/// `free_pi` 自己持有（远程清单拉到过没有、什么时候拉到的）。
+pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
+    match kind {
+        ProviderKind::FreePi => super::free_pi::catalog_meta(),
+        _ => (false, 0),
+    }
 }
 
 pub(crate) fn refresh_meta_for_provider(provider: &str) -> (bool, i64) {

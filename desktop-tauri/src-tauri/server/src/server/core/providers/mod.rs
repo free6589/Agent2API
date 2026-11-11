@@ -77,6 +77,10 @@ pub mod content_block;
 /// 网关对它的转发是通用 OpenAI 兼容路径 —— 这条路**不针对任何特定上游**，
 /// 用户填什么就打什么，没有内置的伪装知识。
 pub mod custom;
+/// Free Pi（`api.freepi.ai`）：内置执行体（OpenAI 兼容直通转发 +
+/// `/client-version` 目录 + 四档错误分类）。它是拆家**之后**新增的内置家，
+/// 与「实现搬进插件」的分流理由见本目录 `free_pi/mod.rs` 的模块头。
+pub mod free_pi;
 pub mod images;
 pub mod loomy;
 /// MonkeyCode 的两个站点：`monkeycode/` 里只剩**地区身份**
@@ -203,6 +207,13 @@ pub enum ProviderKind {
     Atomcode,
     /// LobsterAI（网易有道「有道龙虾」）；`lobsterai`
     LobsterAi,
+    /// Free Pi（`free-pi`）
+    ///
+    /// **签到归属 = 排除**：它有每日免费额度，但额度由服务端按 UTC 零点自己滚，
+    /// 没有任何客户端调用能让它变多 —— 所以不在
+    /// `auto_checkin::CHECKIN_PROVIDERS` 里（逐端点探测与响应码见
+    /// `core::auto_checkin` 模块头「本清单不收谁」那一节）。
+    FreePi,
 }
 
 /// 一个提供商的静态元数据。
@@ -261,6 +272,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "modelscope-intl", label: "ModelScope 国际版" },
     ProviderMeta { id: "atomcode", label: "AtomCode" },
     ProviderMeta { id: "lobsterai", label: "LobsterAI" },
+    ProviderMeta { id: "free-pi", label: "Free Pi" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -350,6 +362,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "modelscope-intl" => Some(ProviderKind::ModelscopeIntl),
         "atomcode" => Some(ProviderKind::Atomcode),
         "lobsterai" => Some(ProviderKind::LobsterAi),
+        "free-pi" => Some(ProviderKind::FreePi),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -397,6 +410,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::ModelscopeIntl => "modelscope-intl",
         ProviderKind::Atomcode => "atomcode",
         ProviderKind::LobsterAi => "lobsterai",
+        ProviderKind::FreePi => "free-pi",
     }
 }
 
@@ -497,7 +511,25 @@ where
     F: Fn(&str) -> usize,
 {
     let _ = count;
-    is_executable_provider(id)
+    is_executable_provider(id) || has_builtin_implementation(id)
+}
+
+/// 这一家是否有**内置**执行体（不装插件也能用）。
+///
+/// ── 为什么门禁里必须带上这一支 ────────────────────────────────
+/// [`is_executable_provider`] 只认插件注册表（`plugin_host::serves_provider`）。
+/// 「实现搬进插件」之后这条判据对所有家都够用 —— 那时内置实现一家不剩。拆家
+/// 之后新增的 **Free Pi** 打破了那个前提：它以内置身份接线
+/// （`adapter::implemented_kinds()`：转发是 `free_pi::FREE_PI_ADAPTER`，账号层是
+/// `accounts.rs` 的 FreePi 分支），插件包此刻并不接管它。只看插件会让这一家的
+/// **添加账号卡片整张不出现**，于是内置的表单、账号库与转发全成了点不到的代码
+/// —— 症状是「功能做完了，界面上找不到入口」，而且没有任何报错。
+///
+/// 判据刻意与 [`adapter::implemented_kinds`] 同源（而不是再写一份 id 清单）：
+/// 那张表就是「哪些内置 kind 真的接了执行体」的唯一事实；插件将来接管 Free Pi
+/// 之后这里自然仍为真（内置那一份退为兜底），不必再多维护一处。
+pub fn has_builtin_implementation(id: &str) -> bool {
+    kind_from_id(id).is_some_and(|kind| adapter::implemented_kinds().contains(&kind))
 }
 
 /// 注册表摘要：旧身份保持展示顺序，再追加插件 runtime ID。
@@ -554,4 +586,28 @@ where
     // 缺插件的残留账号仍不列，记录留在账号库里等待执行体恢复。
     let _ = account_providers;
     list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adapter::{adapter_for, implemented_kinds};
+
+    /// free-pi 的身份注册契约：注册表条目、id 互查、适配器入口与目录刷新调度。
+    #[test]
+    fn free_pi_identity_resolves() {
+        assert_eq!(super::kind_id(super::ProviderKind::FreePi), "free-pi");
+        assert_eq!(
+            super::kind_from_id("free-pi"),
+            Some(super::ProviderKind::FreePi)
+        );
+        let meta = super::meta(super::ProviderKind::FreePi);
+        assert_eq!(meta.id, "free-pi");
+        assert_eq!(meta.label, "Free Pi");
+        assert!(super::PROVIDERS.iter().any(|entry| entry.id == "free-pi"));
+        assert!(implemented_kinds().contains(&super::ProviderKind::FreePi));
+        assert_eq!(
+            adapter_for(super::ProviderKind::FreePi).kind(),
+            super::ProviderKind::FreePi
+        );
+    }
 }

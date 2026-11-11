@@ -112,10 +112,14 @@
 //!      收窄不能扩张（见 `upstream::sse::FramePolicy::assembled`）。
 //!
 //! ── 现在谁实现这些方法 ──────────────────────────────────────
-//! 一家都没有：29 个 `ProviderKind` 的实现**全部**搬到了提供商插件
-//! （`agent2api-workers` 形态的独立子进程，不随本仓库发布）。[`adapter_for`]
-//! 因此对任何 kind 都返回 `missing_plugin::placeholder` —— 如实报「需安装
-//! 插件」，而不是在网关里留一份会随时间漂移的旁路实现。
+//! 29 个旧 `ProviderKind` 的实现**全部**搬到了提供商插件
+//! （`agent2api-workers` 形态的独立子进程，不随本仓库发布），[`adapter_for`]
+//! 对它们返回 `missing_plugin::placeholder` —— 如实报「需安装插件」，
+//! 而不是在网关里留一份会随时间漂移的旁路实现。
+//!
+//! 唯一例外是拆家后新增的 **Free Pi**（`free_pi`）：上游是标准 OpenAI 兼容
+//! 端点 + 静态 Bearer，内置执行体只有「拼 URL / 头 / 体 + 目录刷新」这类
+//! 纯计算，理由与证据见 `free_pi/mod.rs` 的模块头。
 //!
 //! 本 trait 仍然存在的理由：它是**插件宿主的转发接口形状**（`plugin_host` 的
 //! `PluginAdapter` 逐方法实现它），编排层因此不需要知道「这次是插件还是内置」。
@@ -1608,20 +1612,24 @@ pub fn usage_not_configured(provider_label: &str, field_hint: &str) -> GatewayEr
 
 /// 注册表：provider → 适配器实现。
 ///
-/// ── 这里现在只有一件事：返回占位 ──────────────────────────────
-/// 29 个 `ProviderKind` 的实现**全部**搬到了提供商插件（`agent2api-providers`，
-/// 不随本仓库发布）。网关没有任何内置转发 / 账号解析实现可返回，所以本函数
-/// 对任何 kind 都返回 [`missing_plugin::placeholder`] —— 它如实报「需安装
-/// 插件」，而不是在网关里留一份会随时间漂移的旁路实现。
+/// ── 这里现在有两个分支 ──────────────────────────────────────
+/// 29 个旧 `ProviderKind` 的实现**全部**搬到了提供商插件（`agent2api-providers`，
+/// 不随本仓库发布），网关对它们没有内置转发 / 账号解析实现可返回 —— 这些家
+/// 统统落 [`missing_plugin::placeholder`]，如实报「需安装插件」。
+///
+/// 唯一的例外是 **Free Pi**（拆家之后新增的内置家）：上游是标准 OpenAI 兼容
+/// 端点 + 静态 Bearer（没有桌面登录态、没有续期、没有签名），内置执行体只有
+/// 「拼 URL / 头 / 体 + 目录刷新」这类纯计算，理由与能力位证据见
+/// `free_pi` 的模块头。插件将来若接管它，[`adapter_by_id`] 的插件优先级
+/// 自然生效，这里的内置实现退为「卸载插件后的兜底」。
 ///
 /// 保留这个函数（而不是让调用点直接拿占位）是因为它是适配器层的**唯一入口**：
-/// 将来若真要接回某个内置实现，改动只在这里；反过来，任何人想往网关里塞
-/// 「怎么打某个上游」的代码，都必须先改这里 —— review 时一眼能看见。
-///
-/// 硬约束：**不要**在这里加任何真实现。插件缺失时如实报错是产品语义的一部分
-/// （见 `missing_plugin` 的模块头），不是待补的坑。
+/// 接内置实现 / 塞上游知识都必须先改这里 —— review 时一眼能看见。
 pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
-    crate::server::core::providers::missing_plugin::placeholder(kind)
+    match kind {
+        ProviderKind::FreePi => &super::free_pi::FREE_PI_ADAPTER,
+        _ => crate::server::core::providers::missing_plugin::placeholder(kind),
+    }
 }
 
 /// 运行时注册表：provider id → 适配器（插件架构新增）。
@@ -2123,22 +2131,28 @@ impl ProviderAdapter for BuiltinAdapter {
     }
 }
 
-/// 已**完整实现**的适配器对应的 kind 列表（顺序 = 注册表顺序）。
+/// 已**接线**进内置目录刷新排期的 kind 列表（顺序 = 注册表顺序）。
 ///
-/// ── 现在恒为空，且这是**终点状态** ────────────────────────────
-/// 这个函数回答的问题是「网关编译进去的执行体还剩哪几家」。全部提供商的转发与
-/// 账号实现都已搬到独立的提供商插件（`agent2api-providers`，不随本仓库发布），
-/// 所以答案就是「一家都不剩」。
+/// ── 这张表现在回答什么 ──────────────────────────────────────
+/// 这个函数回答的问题是「哪些内置 kind 要进 `catalog_refresh` 的逐家排期循环」。
+/// 插件化之后，全部提供商的转发与账号实现都在提供商插件里
+/// （`agent2api-providers`，不随本仓库发布）—— 循环里没有插件接管的家，由
+/// missing-plugin 占位如实报「需安装插件」；一旦插件接管
+/// （`is_executable_provider`），这层循环把该家让给
+/// `plugin_host::installed_ids()` 的第二段循环，同一 provider 不会刷两次。
 ///
-/// 保留空实现而不是删掉函数：它的两个消费方（`catalog_refresh` 的逐家刷新与
-/// `reschedule`）都是「遍历内置家」的形状，删掉函数会让那两处改写成
-/// `if false` 之类的形状，反而不如一张空表读得明白。**不要往这张表里加东西**
-/// —— 往里加一家，等于把该家的实现重新带回网关，正是拆家要消除的东西。
+/// 目前在表上的只有 Free Pi：它以内置身份注册（`PROVIDERS`），目录刷新与
+/// 转发都是内置执行体（`adapter_for` → `free_pi::FREE_PI_ADAPTER`）—— 登记在
+/// 此，排期契约与账号循环才能覆盖到它；将来插件接管时，循环里的
+/// `is_executable_provider` 分支会把该家让给插件（同一 provider 不刷两次）。
+///
+/// **不要往这张表里加没有排期需求的 kind**：表上每一项都会出现在逐家刷新
+/// 结果里；纯历史身份（已停用、只剩存量账号）不进循环。
 ///
 /// 插件家不走这里：`catalog_refresh` 另有基于 `plugin_host::installed_ids()` 的
 /// 第二段循环，与内置家共用同一套「支持才刷」的判据。
 pub fn implemented_kinds() -> Vec<ProviderKind> {
-    Vec::new()
+    vec![ProviderKind::FreePi]
 }
 
 /// 一次模型目录刷新的结果（模块头扩展 9）。

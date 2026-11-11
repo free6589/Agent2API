@@ -4,6 +4,76 @@
 //! 排程按北京时间计算并持久化；轮询从墙上时钟重新判断，重启或休眠后补跑已到时、
 //! 尚未执行的账号，不提前执行未来安排。执行前落账号尝试标记，避免中途退出后重复主轮。
 //! 各提供商的专属窗口、补签点与活动重试分别计算，配置与 CRUD 在 `core::checkin_schedules`。
+//!
+//! ── 本清单**不收**谁：一条能复述排查过程的排除记录 ──────────────
+//! 「上游没有签到」是**结论**，不是默认值（见 `.agents/skills/provider-adaptation`
+//! 第 1.3 节：CatPaw 与 AutoClaw 都曾把「没有某接口」写进注释、后来被证伪）。
+//! CatPaw、Accio 属于这一档，**免费 pi（`free-pi`）** 也是：2026-11-12 复核后
+//! 的结论是**排除** —— 它不在 [`CHECKIN_PROVIDERS`]、也不进 `PROVIDERS_ADDED_IN`
+//! （清单没加家，[`PROVIDERS_VERSION`] 不动），账号在批量签到里算 `skipped`。
+//!
+//! 探测对象是 free-pi 的上游 `https://api.freepi.ai`（base URL 取自
+//! `free-pi-cli/src/env.ts` 的 `DEFAULT_BASE_URL`）。先跑两组对照，证明
+//! 「404 = 路由不存在」这个判读在本上游成立：
+//!
+//! | 请求 | 响应 |
+//! |---|---|
+//! | `GET /me` / `GET /me/stats`（对照：**存在**，需鉴权） | `401 {"code":"unauthorized","message":"missing bearer token",…}` |
+//! | `GET /client-version`（对照：**存在**，公开） | `200 {"min":"0.6.19","latest":"0.6.19","models":[…]}` |
+//! | `GET /definitely-not-a-route-xyz123`（对照：**不存在**） | `404 Not Found`（无 body） |
+//! | `GET /checkin`、`/check-in`、`/api/checkin`、`/me/checkin`、`/auth/checkin`、`/checkin/status`、`/me/checkin/status`、`/v1/checkin` | 全部 `404 Not Found` |
+//! | `POST /checkin`、`POST /me/checkin` | 全部 `404 Not Found` |
+//! | `GET /daily`、`/me/daily`、`/daily/claim`（领取类候选） | 全部 `404 Not Found` |
+//! | `GET /rewards`、`/me/rewards`、`/me/claim`、`/bonus`、`/me/bonus` | 全部 `404 Not Found` |
+//! | `POST /daily/claim` | `404 Not Found` |
+//! | `GET /claim`、`POST /claim` | `400` + HTML「This claim link is invalid.」—— 那是**购买页**的领取链接落地页（`/me` 的 `buy_url` 那条链，CLI 只在浏览器里打开它），不是积分领取 |
+//!
+//! 源码侧复核更硬：`free-pi-cli/src` 全量 `grep -i checkin` **零命中**（0 行）；
+//! 客户端用到的上游路由穷举下来只有这些 —— `/auth/github/device`、`/auth/consent`、
+//! `/auth/token`、`/me`、`/me/consent`、`/me/stats`、`/session/reset`、
+//! `/client-version`、`/ads/next`、`/ads/impression`、`/bug-reports`、
+//! `/tools/image`、`/tools/web-search`、`/tools/docs`、`/telemetry/tool-guard`、
+//! `/v1/chat/completions`。一家客户端的完整源码里没有签到 / 领取调用，比任何单个
+//! 端点的 404 都更能说明问题（与 Accio 的排除取证同一手法）。
+//!
+//! 探测面的边界，别把它说成穷举：404 只覆盖「**我用的那个方法**」—— 实测
+//! `GET /tools/web-search` 也是 404，而它真实存在（POST-only）。所以穷举性来自
+//! 上面那次**源码全量**，端点探测只用来抽样确认「这个上游确实会对不存在的路径
+//! 回 404」，而不是「我穷举了所有路径」。
+//!
+//! 「等价动作」这一档也逐个排除了（Loomy 的每日首次登录、ModelScope 的登录信息
+//! 接口都是靠这一档进清单的，所以不能只看有没有 `/checkin`）：
+//!
+//!   - **每日免费额度不是「领」出来的**：服务端每天 UTC 零点自己滚
+//!     `usage_daily.date`，`/me/stats` 的 `refill_at` 只用来给界面显示倒计时
+//!     （`free-pi-cli/src/vendor/shared/credits.ts` 的 `nextUtcMidnight`、
+//!     `remaining_credits_today`）。**没有任何一次客户端调用能让额度变多**，
+//!     所以它没有「替账号打一次接口把额度续上」这件事可做。
+//!   - `/support`（打开今日广告主）在 CLI 自己的变更日志里明写 `grants nothing`
+//!     （`free-pi-cli/src/changelog.ts`），实现也注明 `no reward, no server call
+//!     of its own`（`src/commands.ts` 的 `openAdvertiser`）。
+//!   - `/ads/impression` 只上报曝光（`src/vendor/pi-ads/api.ts`），响应被丢弃，
+//!     不发奖励。
+//!
+//! 所以这一档是「**额度会自己回来，但没有任何可执行的动作**」—— 与 CatPaw
+//! （有积分查询、没有签到）同类，不进本清单。将来若插件给 free-pi 申报了签到
+//! 能力（`plugin_host::checkin_of`），那是**插件申报**的路径，不要回来改常量表
+//! （清单与 `PROVIDERS_VERSION` 只记账内置家）。
+//!
+//! ── 为什么**没有**顺手在 `supports_checkin` 里按 id 排除它 ──────
+//! 那处最后一条判据是 `!is_accio_family(provider)`，看起来「再加一个 id」最省事，
+//! 但那一层是**按记录形态**写的内置特判，而「这家能不能签」现在首先看插件申报
+//! （`plugin_host::checkin_of` / `plugin_checkin_capability`，顺序说明见
+//! `billing::checkin` 模块头）。写死一个 id 会在 free-pi 插件将来申报签到能力时把
+//! 它挡掉，而且症状是静默的（申报了也不生效）。CatPaw 就是同一档：不在本清单，
+//! `supports_checkin` 也不为它开分支。**清单缺席本身就是排除**：批量签到的范围来自
+//! 本清单（范围外计入 `skipped`，见 `resolve_checkin_targets`），签到中心的分组来自
+//! `available_checkin_providers`，两处都不含 free-pi；单账号路由问到 `checkin_for`
+//! 的兜底会给一句「Free Pi 的签到链路尚未接入」，不是脏成功。
+//!
+//! 判读的边界，别夸大：本节是**未带凭证**的探测（本仓库不持有 free-pi 令牌）。
+//! 它的效力来自「401 与 404 在本上游可区分」这组对照 + 客户端源码全量复核，
+//! 而不是「我登录后逐个点过」。
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -101,6 +171,14 @@ pub fn default_time() -> String {
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分
 /// 查询但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
+///
+/// **免费 pi（Free Pi / `free-pi`）同样在排除之列**（2026-11-12 取证）：它有每日
+/// 免费额度，但额度由服务端按 UTC 零点自己滚（`refill_at` 只是显示用的倒计时），
+/// 逐端点探测（`/checkin`、`/me/checkin`、`/daily/claim` 等一律 404）与客户端源码
+/// 全量复核都没有签到 / 领取动作 —— 完整记录（含对照组与响应码）在本文件的模块头
+/// 「本清单不收谁」那一节。它的账号在批量签到里同样算 `skipped`，签到中心走
+/// 「范围外」分组说明原因；**不进本清单也不进 `PROVIDERS_ADDED_IN`**（没加家，
+/// 版本号不动 —— 版本账只记真的进过清单的家）。
 pub const CHECKIN_PROVIDERS: [&str; 19] = [
     "workbuddy",
     "workbuddy-intl",
@@ -709,5 +787,74 @@ pub fn init_global(service: AutoCheckin) -> AutoCheckin {
 pub fn stop_global() {
     if let Some(service) = GLOBAL.get() {
         service.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 清单 / 版本账 / 当前版本号三者必须同步。
+    ///
+    /// 加一家最容易漏的恰恰是这两处，而且**都不会报错**：
+    ///   - 只往 `CHECKIN_PROVIDERS` 加 id、不升版本号 → 存量用户的签到清单里
+    ///     不会出现它（`extend_providers_once` 认为这一家早就提供过）；
+    ///   - 升了版本号却漏了账本条目 → 它被记成「已提供」，之后永远不会补进去。
+    #[test]
+    fn checkin_registry_matches_version_ledger() {
+        // 账本里的每一家必须在清单里，否则 `providers_added_after` 永远筛不到它
+        for (id, added) in PROVIDERS_ADDED_IN {
+            assert!(
+                CHECKIN_PROVIDERS.contains(&id),
+                "版本账里的 {id} 不在 CHECKIN_PROVIDERS 里：加账本就要加清单"
+            );
+            assert!(
+                added >= 2 && added <= PROVIDERS_VERSION,
+                "{id} 的加入版本 {added} 越界（基线 1 = 多条目改造时的 9 家，当前 {PROVIDERS_VERSION}）"
+            );
+        }
+        // 账本不能有重复条目（重复会让「补哪些家」取决于遍历顺序）
+        let mut ledger: Vec<&str> = PROVIDERS_ADDED_IN.iter().map(|(id, _)| *id).collect();
+        let ledger_len = ledger.len();
+        ledger.sort_unstable();
+        ledger.dedup();
+        assert_eq!(
+            ledger_len,
+            ledger.len(),
+            "PROVIDERS_ADDED_IN 里有重复的 provider id"
+        );
+        // 当前版本号 = 账本里最大的那一版：版本号不能跑到账本前面去
+        let latest = PROVIDERS_ADDED_IN
+            .iter()
+            .map(|(_, at)| *at)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            PROVIDERS_VERSION, latest,
+            "PROVIDERS_VERSION 与 PROVIDERS_ADDED_IN 不同步：加了一家就两边一起加"
+        );
+        // 清单自身不能有重复 id（重复会在签到中心出现两行同名分组）
+        let mut listed: Vec<&str> = CHECKIN_PROVIDERS.to_vec();
+        let listed_len = listed.len();
+        listed.sort_unstable();
+        listed.dedup();
+        assert_eq!(
+            listed_len,
+            listed.len(),
+            "CHECKIN_PROVIDERS 里有重复的 provider id"
+        );
+    }
+
+    /// free-pi 的归属是**排除**（取证与响应码见模块头「本清单不收谁」那一节）：
+    /// 每日额度由服务端按 UTC 零点自己滚，没有任何一次客户端调用能让它变多，
+    /// 所以它既不该出现在签到清单里，也不该有「哪一版加入」的记账。
+    ///
+    /// 这条是给「顺手把这家补上」的人留的最后一道提示：真要加，先拿到「调用即
+    /// 触发」的实测证据（Loomy / ModelScope 那一档），再同时升版本号。
+    #[test]
+    fn free_pi_stays_out_of_the_checkin_registry() {
+        assert!(!CHECKIN_PROVIDERS.contains(&"free-pi"));
+        assert!(PROVIDERS_ADDED_IN.iter().all(|(id, _)| *id != "free-pi"));
+        assert!(providers_added_after(0).iter().all(|id| id != "free-pi"));
     }
 }

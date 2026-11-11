@@ -880,6 +880,26 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 "LobsterAI 只能通过「网页登录」添加：它的续期需要换码时下发的 uuid 与 keyfrom，粘贴给不出这三项",
             );
         }
+        // Free Pi：**单一入口 = 粘贴 90 天登录 JWT**（账号 = 令牌本身，uid 取
+        // JWT `sub`）。设备授权登录必须开浏览器，面板走粘贴表单，所以账号层
+        // 留在内置（不像其他家是「实现搬走后的残留」）：落库形态与插件将来
+        // 接管转发时读的完全同形（顶层 `accessToken`，`plugin_account` 的
+        // 摊平路径原样可读，插件到达后无需迁移）。上游没有令牌续期接口，
+        // supports_refresh=false 的依据见 `account_store::freepi_accounts`
+        // 模块头；刷新分派已在 `refresh_account` 显式报 400 指路重贴。
+        Some(crate::server::core::providers::ProviderKind::FreePi) => {
+            let result = store.add_freepi_account(&payload, import_name);
+            return match result {
+                Ok(upsert) => ok_json(json!({
+                    "account": upsert.account,
+                    // 同 uid 重贴合并进既有记录时为 false：前端据此把提示说成
+                    // 「已更新」而不是「已添加」（与 custom 分支同一契约）
+                    "created": upsert.created,
+                    "list": store.list_visible_accounts(),
+                })),
+                Err(error) => store_error(error),
+            };
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：实现已整体搬到插件
         // （会话凭证解析 / 桌面端登录态读取 / 续期 / 转发），这里只留拒绝路径。
         //
@@ -1020,6 +1040,26 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
         return management_error(
             400,
             "自定义提供商账号的凭证由用户直接提供，无需刷新（更换凭证请重新添加或直接编辑）",
+        );
+    }
+    // free-pi：登录令牌**没有刷新机制**（supports_refresh=false）。上游没有
+    // 令牌续期接口 —— CLI 的鉴权面只有设备授权三步（/auth/github/device、
+    // /auth/consent、/auth/token）与 /me 探活，没有任何 refresh 路由；JWT 本身
+    // 是 90 天有效凭证（free-pi-cli/src/provider.ts 的 R19 注释）。到期后唯一
+    // 的续命方式是重跑一次浏览器设备授权拿到新 JWT，再到本页重新粘贴
+    // （「90 天重贴」流；依据全文见 `account_store::freepi_accounts` 模块头）。
+    // 插在插件分派之前是刻意的（与 CatPaw 同款取舍）：插件接管后它的
+    // `refresh` 能力位同样是 false（上游没有那个接口），这里先拦下能省一次
+    // RPC，且文案具体到「重贴」这个唯一可行动作。不拦的话会落到下面的
+    // 兜底链路，用户收到一条「需要安装提供商插件」的无关错误 —— 与
+    // CatPaw / MonkeyCode 漏登记时同一性质（见本函数文档的「漏登记的实际代价」）。
+    if state.store().account_provider_of(&id).as_deref()
+        == Some(crate::server::core::account_store::FREEPI_PROVIDER_ID)
+    {
+        return management_error(
+            400,
+            "free-pi 的登录令牌没有刷新机制（上游没有续期接口，令牌 90 天有效）：\
+             请在 free-pi 重新完成浏览器登录，然后在本页重新粘贴新令牌",
         );
     }
     // 标准账号按顶层 provider 选择真实 adapter，不探测 secret 或占位 kind。
