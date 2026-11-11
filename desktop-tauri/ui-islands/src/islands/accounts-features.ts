@@ -375,6 +375,22 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 没有登记 `creditDetail`：`query_usage` 只给 `available` 与 subscription，
   // 不出逐份 `credits[]`，挂入口会点开一个空框。
   orcaterm: { usage: true, edition: false, identifier: ['uid'], expiry: ['tokenExpireAt'] },
+  // Free Pi（`api.freepi.ai`）：账号 = 粘贴的 90 天登录 JWT（见后端
+  //   `account_store::freepi_accounts` 的模块头），所以：
+  //   · `identifier: ['uid']` —— 身份取 JWT 载荷的 `sub`，公开形态就落在 `uid`；
+  //   · `expiry: ['expiresAt']` —— JWT 的 `exp` 由公开层派生成 `expiresAt`
+  //     （秒 → 毫秒），这一列读的就是它；
+  //   · **不登记 `longLived`** —— 这枚凭证有固定 90 天寿命，只是到期救不回来
+  //     （上游没有 refresh 路由，只能重跑授权重贴）。正是上面 `longLived` 注释
+  //     点名的那一类（Loomy 14 天 / MonkeyCode 30 天同款），别按「无续期」
+  //     误记成长效 —— 记错了会显示「长期有效」，用户就不会提前重登；
+  //   · `usage: false` —— 上游没有独立的余额查询接口被本仓库使用，额度只在
+  //     错误信封的 `remaining_credits_today` 里旁路透出（后端 `providers::free_pi`
+  //     模块头的「能力位口径」原文：supports_usage = false，余额属后续步骤）。
+  //     没有余额概念就不能挂余额按钮，否则点开是空框。
+  //     ⚠️ 后端一旦把 `free_pi::usage` 接进 `supports_usage` / `query_usage`
+  //     （那一步的余额出自 `GET /me/stats`），这里要同步改成 true。
+  'free-pi': { usage: false, edition: false, identifier: ['uid'], expiry: ['expiresAt'] },
 }
 
 /**

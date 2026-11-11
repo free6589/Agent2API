@@ -1095,6 +1095,50 @@ const LOBSTERAI: ProviderConfig = {
   fields: [],
 }
 
+/**
+ * Free Pi（`api.freepi.ai`，免费 pi 编码代理）：**唯一入口 = 粘贴一枚 90 天登录 JWT**。
+ *
+ * ── 依据（与后端同源）───────────────────────────────────────
+ * 上游鉴权就是静态 `Authorization: Bearer <jwt>`（`free-pi-cli/src/provider.ts`
+ * 的 `apiKey: jwt`）；而拿到 JWT 只有一条路 —— GitHub 设备授权（`/auth/github/device`
+ * → 浏览器里点授权 → 轮询 `/auth/token`）。那一步**必须在浏览器里由用户自己点**，
+ * 网关代登录做不了，所以面板只给粘贴表单：账号就是用户粘进来的那枚令牌，身份取
+ * JWT 载荷的 `sub`（后端 `account_store::freepi_accounts` 的模块头同款依据）。
+ *
+ * ── 没有「网页登录」这一条（不是界面漏做）──────────────────────
+ * 设备授权的授权页要用户当场点「Authorize」，结果也不是回打本机地址 —— 上游是
+ * **轮询** `/auth/token` 取回。网关既拼不出可托管的回跳地址，也无法替用户点授权页，
+ * 所以这里不提供 `webLogin`（与 LobsterAI 那条「粘贴给不出凭证」的拒绝同一种如实
+ * 处理：能不能做到取决于上游，不取决于界面勤快不勤快）。
+ *
+ * ── 没有「导入桌面端登录态」──────────────────────────────────
+ * 官方 CLI（本仓库 `free-pi-cli/`）把 JWT 落在自己的凭证库里
+ * （`~/.free-pi/agent/credentials.json`，`{"token": "…"}`，0600 明文），没有
+ * Electron safeStorage / data.bin 那种壳侧登录态形态 —— 那是**一个普通文本文件**，
+ * 用户自己复制粘贴就行，不必为此多开一条只有本机能用的入口。所以显式
+ * `desktop: false`（与 Accio / ZCode / LobsterAI 同一处境）。
+ *
+ * ── 90 天到期、**没有续期接口**（说明里必须写清）───────────────
+ * 上游鉴权面只有设备授权三步与 `/me` 探活，没有任何 refresh 路由（`auth-flow.ts`
+ * 全文可查）；JWT 本身是 90 天凭证（`provider.ts` R19 注释）。到期后唯一出路是
+ * 重跑一次授权、把新 JWT 贴回来 —— 后端刷新分派对这家显式报 400 指路重贴
+ * （`api::accounts::refresh_account` 的 free-pi 分支）。不写这句，用户会以为
+ * 「刷新按钮坏了」；同一个人重贴是**更新**既有记录（后端按 `sub` 合并），所以
+ * 说明里也要交代「不会多出一条」。
+ */
+const FREEPI: ProviderConfig = {
+  provider: 'free-pi',
+  label: 'Free Pi',
+  desktop: false,
+  manualTitle: t('粘贴登录 JWT'),
+  // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行
+  manualNoteHtml: t('粘贴 Free Pi 的<b>登录 JWT</b>（三段点分、以 <code>eyJ</code> 开头）。取法：在本机跑一次 <code>free-pi-cli</code>，完成 GitHub 设备授权后令牌会存进 <code>~/.free-pi/agent/credentials.json</code> 的 <code>token</code> 字段，把它的值整段贴进来即可；直接贴带 <code>Bearer </code> 前缀的一整行也行（网关会自己剥掉）。账号标识取 JWT 里的 <code>sub</code>。<br><br><b>注意</b>：这是一枚 <b>90 天</b>凭证，上游<b>没有续期接口</b> —— 到期后只能重跑一次授权、把新 JWT 贴回来（同一个人重贴会更新原记录，不会多出一条）。'),
+  fields: [
+    { key: 'token', rows: 3, label: 'JWT', placeholder: t('粘贴登录 JWT（三段点分；也可直接粘贴 Bearer 整行）') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则用账号标识（JWT 的 sub）') },
+  ],
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -1159,6 +1203,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // Tabbit 浏览器（国内站 / 国际站）：两站账号不通用，成对相邻排列。
   TABBIT,
   TABBIT_INTL,
+  // Free Pi（`api.freepi.ai`）：唯一入口是粘贴 90 天登录 JWT，排在表尾 ——
+  // 与后端注册表 PROVIDERS 的排列一致（新增的一家加在表尾，2026-11 接入）
+  FREEPI,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

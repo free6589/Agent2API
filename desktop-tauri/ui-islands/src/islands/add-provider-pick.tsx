@@ -160,6 +160,13 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // 也就是系统里显示的客户端图标）。⚠️ 早前用的是 sibling 仓库
   // cpa-jethub-plugins 里那枚 24×24 通用小怪物 SVG，与产品实际形象不符，已换掉。
   lobsterai: 'assets/providers/lobsterai.png',
+  // Free Pi（`api.freepi.ai`）：取自官网 `<link rel="apple-touch-icon">`
+  // （`https://freepi.ai/apple-icon.png`，180×180 RGBA，归一成 256×256 入库 ——
+  // 与站点标签页 / 官网页头显示的是同一形象：蓝底折线 π + 终端光标）。
+  // ⚠️ 官方 CLI（`free-pi-cli/`）的检出里没有任何图标资源，所以图取自官网
+  // 而不是「客户端安装包的图标」—— 与 Command Code / Antigravity 同一处置
+  // （那两家没有可解的本地安装包）。
+  'free-pi': 'assets/providers/free-pi.png',
   doubaowork: 'assets/providers/doubaowork.png',
   cursor: 'assets/providers/cursor.svg',
   kiro: 'assets/providers/kiro.svg',

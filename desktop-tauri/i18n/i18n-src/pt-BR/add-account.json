@@ -667,5 +667,9 @@
   "（有效期 {window}）": "(validade {window})",
   "（订阅池，模型名带 cline-pass/ 前缀，需要账号有对应订阅）。": " (pool de assinatura; nomes de modelo com o prefixo cline-pass/, e a conta precisa da assinatura correspondente).",
   "，下一次最快 {minutes} 分钟后": ", próxima tentativa em pelo menos {minutes} min",
-  "，并从 {n} 把 Key 的可用提供商里移除": ", e removido dos provedores permitidos de {n} keys"
+  "，并从 {n} 把 Key 的可用提供商里移除": ", e removido dos provedores permitidos de {n} keys",
+  "粘贴登录 JWT": "Colar o JWT de login",
+  "粘贴登录 JWT（三段点分；也可直接粘贴 Bearer 整行）": "Cole o JWT de login (três partes separadas por ponto; a linha inteira com Bearer também funciona)",
+  "可选，留空则用账号标识（JWT 的 sub）": "Opcional; se ficar em branco, usa o identificador da conta (o sub do JWT)",
+  "粘贴 Free Pi 的<b>登录 JWT</b>（三段点分、以 <code>eyJ</code> 开头）。取法：在本机跑一次 <code>free-pi-cli</code>，完成 GitHub 设备授权后令牌会存进 <code>~/.free-pi/agent/credentials.json</code> 的 <code>token</code> 字段，把它的值整段贴进来即可；直接贴带 <code>Bearer </code> 前缀的一整行也行（网关会自己剥掉）。账号标识取 JWT 里的 <code>sub</code>。<br><br><b>注意</b>：这是一枚 <b>90 天</b>凭证，上游<b>没有续期接口</b> —— 到期后只能重跑一次授权、把新 JWT 贴回来（同一个人重贴会更新原记录，不会多出一条）。": "Cole o <b>JWT de login</b> do Free Pi (três partes separadas por ponto, começando com <code>eyJ</code>). Como obter: execute <code>free-pi-cli</code> uma vez nesta máquina; ao concluir a autorização de dispositivo do GitHub, o token é salvo no campo <code>token</code> de <code>~/.free-pi/agent/credentials.json</code> — cole esse valor inteiro. Também funciona colar a linha inteira com o prefixo <code>Bearer </code> (o gateway o remove). O identificador da conta é o <code>sub</code> do JWT.<br><br><b>Atenção</b>: esta é uma credencial de <b>90 dias</b> e o upstream <b>não tem API de renovação</b> — quando expirar, faça a autorização de novo e cole o novo JWT (colar novamente para a mesma pessoa atualiza o registro existente em vez de criar outro)."
 }
