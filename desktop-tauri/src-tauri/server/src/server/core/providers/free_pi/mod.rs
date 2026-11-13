@@ -87,13 +87,14 @@ pub const CLIENT_VERSION_PATH: &str = "/client-version";
 /// CLI 的发布版本，而不是编一个更新的号。
 ///
 /// ── 取值的来源是「上游自己说的」，不是本仓库检出的 CLI 版本 ────────
-/// 2026-11-12 实测：`GET https://api.freepi.ai/client-version` 回
-/// `{"min":"0.6.19","latest":"0.6.19", …}`，与 npm `free-pi-cli@latest`
-/// （0.6.19）一致。本仓库 `free-pi-cli/` 的检出是 **v0.4.10**（`package.json`
-/// 的 `version`），已经低于上游 `min` —— 照抄它会稳定撞 426，所以取值改成
-/// 上游报的 `latest`。**上游 `min` 涨上来时要同步改这里**（`/client-version`
-/// 就是那个权威读数，不需要猜）。
-pub const CLIENT_VERSION: &str = "0.6.19";
+/// 2026-11-13 实测：`GET https://api.freepi.ai/client-version` 回
+/// `{"min":"0.6.19","latest":"0.6.20", …}`。本仓库 `free-pi-cli/` 的检出是
+/// **v0.4.10**（`package.json` 的 `version`），它连请求都发不出来：
+/// `src/update-check.ts:42` 在 `cliVersion < min` 时直接 `block`。也就是说
+/// 线上不存在发 0.4.10 的客户端，真实客户端发的是自己**自动更新后**的版本
+/// = 上游 `latest`。所以取 `latest`，**上游 `latest` 涨上来时同步改这里**
+/// （`/client-version` 就是那个权威读数，不需要猜）。
+pub const CLIENT_VERSION: &str = "0.6.20";
 
 /// 静态实例（`adapter_for` 要 `&'static dyn`；本适配器无状态）。
 pub static FREE_PI_ADAPTER: FreePiAdapter = FreePiAdapter;

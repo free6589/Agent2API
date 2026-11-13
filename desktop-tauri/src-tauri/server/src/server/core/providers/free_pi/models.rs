@@ -64,9 +64,25 @@ pub const FALLBACK_MODEL_ID: &str = "deepseek/deepseek-v4-flash";
 /// 进程内目录状态：**只装远程清单**（空 = 还没拉到过，对外用静态兜底）。
 /// 条目是**归一后的 `(id, name)` 对**——对外形态在 [`list`] 时统一由
 /// [`to_manifest_value`] 套上，刷新路径与重启恢复路径因此不会分叉。
+/// 归一后的目录条目：上游的 `{id, name}` + 计费倍率 `usage_x`.
+///
+/// `usage_x` 是上游模型计费倍率的唯一来源：free 档为 null（不限倍率，
+/// 对外不写 `credits`，管理页显示 `—`），付费档为 `"18"` / `"60"` /
+/// `"0.6"` 这类数字字符串（2026-11-13 实测），直接对应官方 CLI `/model`
+/// 切换器里显示的 `~18x usage`。对外归一成 `credits: "x18 credits"`（与
+/// 别家上游下发的 `x0.06 credits` 同一文本口径，管理页 `formatCredits` /
+/// `rateOf` 直接解析）。非法值（空串 / 非数字）按缺失处理，不编造倍率。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CatalogEntry {
+    id: String,
+    name: String,
+    /// 归一后的倍率数字串（如 `"18"`）；None = 上游没给（free 档 / 非法值）.
+    rate: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct CatalogState {
-    entries: Vec<(String, String)>,
+    entries: Vec<CatalogEntry>,
     fetched_at: i64,
 }
 
@@ -85,7 +101,7 @@ fn with_state<R>(f: impl FnOnce(&mut Option<CatalogState>) -> R) -> R {
     };
     if guard.is_none() {
         if let Some(cached) = catalog_cache::load(SCOPE) {
-            let entries: Vec<(String, String)> = cached
+            let entries: Vec<CatalogEntry> = cached
                 .models
                 .iter()
                 .filter_map(entry_from_cached)
@@ -102,7 +118,7 @@ fn with_state<R>(f: impl FnOnce(&mut Option<CatalogState>) -> R) -> R {
 }
 
 /// 从落盘缓存条目还原（缓存里存的就是 [`to_cached_value`] 写下的形态）。
-fn entry_from_cached(value: &Value) -> Option<(String, String)> {
+fn entry_from_cached(value: &Value) -> Option<CatalogEntry> {
     let id = value.get("id").and_then(Value::as_str)?.trim().to_string();
     if id.is_empty() {
         return None;
@@ -114,7 +130,18 @@ fn entry_from_cached(value: &Value) -> Option<(String, String)> {
         .filter(|name| !name.is_empty())
         .unwrap_or(&id)
         .to_string();
-    Some((id, name))
+    Some(CatalogEntry {
+        rate: normalize_rate(value.get("usage_x").and_then(Value::as_str)),
+        id,
+        name,
+    })
+}
+
+/// `usage_x` 归一：数字字符串保留原样（`"18"` / `"0.6"`），null / 缺失 /
+/// 空白 / 非数字一律按缺失处理 —— 不编造倍率（见模块头能力口径）。
+fn normalize_rate(raw: Option<&str>) -> Option<String> {
+    let text = raw.map(str::trim).filter(|text| !text.is_empty())?;
+    text.parse::<f64>().ok().filter(|number| number.is_finite()).map(|_| text.to_string())
 }
 
 /// 静态兜底目录：**单条**，字段逐项对照 CLI 的 provider 配置
@@ -148,23 +175,37 @@ fn fallback_models() -> Vec<Value> {
 }
 
 /// 远程条目 → 对外目录条目（键名对照本仓目录聚合层的惯例，见
-/// LobsterAI `to_manifest_value` 同款键集）。
-fn to_manifest_value(id: &str, name: &str) -> Value {
-    json!({
-        "id": id,
-        "name": name,
+/// LobsterAI `to_manifest_value` 同款键集；`credits` 口径见 [`CatalogEntry`]）。
+///
+/// ── 为什么 `maxInputTokens` 固定 1_048_576 ─────────────────────
+/// 上游 `/client-version` 只下发 `{id, name, usage_x, …}`，没有上下文窗口
+/// 字段（2026-11-13 实测全文 3734 字节，逐键核对过）；官方 CLI 的
+/// `buildProviderConfig` 给全家统一配 `contextWindow: 1_048_576` +
+/// `maxTokens: 8192`（`free-pi-cli/src/provider.ts:79-80`）。网关照抄这组
+/// 展示值（models.dev 在清单成型处会按模型补真实值，上游声明优先）。
+fn to_manifest_value(entry: &CatalogEntry) -> Value {
+    let mut item = json!({
+        "id": entry.id,
+        "name": entry.name,
         "maxInputTokens": 1_048_576,
         "maxOutputTokens": 8192,
         "supportsImages": false,
         "supportsVideo": false,
         "supportsReasoning": false,
-    })
+    });
+    if let Some(rate) = entry.rate.as_deref() {
+        item["credits"] = Value::String(format!("x{rate} credits"));
+    }
+    item
 }
 
-/// 落盘缓存里的条目形态（只存上游给的 `{id, name}`，不掺展示字段 ——
-/// 恢复时 [`to_manifest_value`] 会重新套上展示字段，两处不会分叉）。
-fn to_cached_value(id: &str, name: &str) -> Value {
-    json!({ "id": id, "name": name })
+/// 落盘缓存里的条目形态（只存上游给的 `{id, name, usage_x}`，不掺展示字段
+/// —— 恢复时 [`to_manifest_value`] 会重新套上展示字段，两处不会分叉）。
+fn to_cached_value(entry: &CatalogEntry) -> Value {
+    match entry.rate.as_deref() {
+        Some(rate) => json!({ "id": entry.id, "name": entry.name, "usage_x": rate }),
+        None => json!({ "id": entry.id, "name": entry.name }),
+    }
 }
 
 /// 当前对外目录：**远程优先，没有则静态兜底**（对外形态在这里统一组装，
@@ -174,7 +215,7 @@ pub fn list() -> Vec<Value> {
         Some(state) if !state.entries.is_empty() => state
             .entries
             .iter()
-            .map(|(id, name)| to_manifest_value(id, name))
+            .map(to_manifest_value)
             .collect(),
         _ => fallback_models(),
     })
@@ -187,9 +228,9 @@ pub fn last_refreshed_at() -> i64 {
 
 /// 解析 `/client-version` 响应里的目录：`models[]` → 单值 `model` → None
 /// （CLI `update-check.ts` 的回退链，两级都没有才算失败）。
-pub fn parse_models(payload: &Value) -> Option<Vec<(String, String)>> {
+pub fn parse_models(payload: &Value) -> Option<Vec<CatalogEntry>> {
     if let Some(list) = payload.get("models").and_then(Value::as_array) {
-        let parsed: Vec<(String, String)> = list
+        let parsed: Vec<CatalogEntry> = list
             .iter()
             .filter_map(|item| {
                 let id = item.get("id").and_then(Value::as_str)?.trim().to_string();
@@ -203,7 +244,11 @@ pub fn parse_models(payload: &Value) -> Option<Vec<(String, String)>> {
                     .filter(|name| !name.is_empty())
                     .unwrap_or(&id)
                     .to_string();
-                Some((id, name))
+                Some(CatalogEntry {
+                    rate: normalize_rate(item.get("usage_x").and_then(Value::as_str)),
+                    id,
+                    name,
+                })
             })
             .collect();
         if !parsed.is_empty() {
@@ -216,7 +261,13 @@ pub fn parse_models(payload: &Value) -> Option<Vec<(String, String)>> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(|id| vec![(id.to_string(), id.to_string())])
+        .map(|id| {
+            vec![CatalogEntry {
+                id: id.to_string(),
+                name: id.to_string(),
+                rate: None,
+            }]
+        })
 }
 
 /// 刷新用的账号会话：空 `account_id` = 该家队首可用账号；点名了就按 id
@@ -233,7 +284,7 @@ pub fn account_session(store: &AccountStore, account_id: &str) -> Option<Current
 }
 
 /// 拉一次目录（`GET {BASE_URL}/client-version`，JWT + 伪装头与对话同源）。
-async fn fetch_catalog(jwt: &str) -> Result<Vec<(String, String)>, GatewayError> {
+async fn fetch_catalog(jwt: &str) -> Result<Vec<CatalogEntry>, GatewayError> {
     let url = format!("{BASE_URL}{CLIENT_VERSION_PATH}");
     let headers = vec![
         (
@@ -298,10 +349,7 @@ pub async fn refresh(store: &AccountStore, account_id: &str, force: bool) -> Mod
     match fetch_catalog(&jwt).await {
         Ok(entries) if !entries.is_empty() => {
             let fetched_at = logging::now_ms();
-            let cached: Vec<Value> = entries
-                .iter()
-                .map(|(id, name)| to_cached_value(id, name))
-                .collect();
+            let cached: Vec<Value> = entries.iter().map(to_cached_value).collect();
             catalog_cache::save(SCOPE, &cached, fetched_at);
             let count = entries.len();
             with_state(|guard| {
@@ -365,17 +413,45 @@ mod tests {
             ]
         });
         let parsed = parse_models(&full).expect("models[] 应当解析得出");
+        let pairs: Vec<(String, String, Option<String>)> = parsed
+            .into_iter()
+            .map(|entry| (entry.id, entry.name, entry.rate))
+            .collect();
         assert_eq!(
-            parsed,
+            pairs,
             vec![
-                ("deepseek/deepseek-v4-flash".to_string(), "DeepSeek V4 Flash".to_string()),
-                ("kimi-k3".to_string(), "kimi-k3".to_string()),
+                ("deepseek/deepseek-v4-flash".to_string(), "DeepSeek V4 Flash".to_string(), None),
+                ("kimi-k3".to_string(), "kimi-k3".to_string(), None),
+            ]
+        );
+
+        // usage_x 归一：数字串保留原样，非法值按缺失（见 CatalogEntry）。
+        let rated = json!({
+            "models": [
+                { "id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro", "usage_x": "18" },
+                { "id": "solar-pro-4", "name": "Solar Pro 4", "usage_x": "0.6" },
+                { "id": "bad-rate", "name": "坏倍率按缺失", "usage_x": "not-a-number" },
+                { "id": "free-model", "name": "免费档无倍率", "usage_x": null }
+            ]
+        });
+        let rates: Vec<(String, Option<String>)> = parse_models(&rated)
+            .expect("usage_x 应当解析得出")
+            .into_iter()
+            .map(|entry| (entry.id, entry.rate))
+            .collect();
+        assert_eq!(
+            rates,
+            vec![
+                ("deepseek-v4-pro".to_string(), Some("18".to_string())),
+                ("solar-pro-4".to_string(), Some("0.6".to_string())),
+                ("bad-rate".to_string(), None),
+                ("free-model".to_string(), None),
             ]
         );
 
         let legacy = json!({ "min": "0.1.0", "latest": "0.1.2", "model": "deepseek/deepseek-v4-flash" });
         assert_eq!(
-            parse_models(&legacy).map(|list| list.into_iter().map(|(id, _)| id).collect::<Vec<_>>()),
+            parse_models(&legacy).map(|list| list.into_iter().map(|entry| entry.id).collect::<Vec<_>>()),
             Some(vec!["deepseek/deepseek-v4-flash".to_string()]),
             "旧服务端只有单值 model 字段时按 CLI 的回退链取它"
         );
