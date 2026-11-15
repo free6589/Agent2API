@@ -358,3 +358,74 @@ fn a_deterministic_404_skips_the_in_place_resend() {
         "404 的豁免不许顺手把 400 也豁免了"
     );
 }
+
+/// 工具不支持：补救后仍失败不再原地重发（同一份字节空转三次没有意义）。
+#[test]
+fn tool_unsupported_skips_the_in_place_resend() {
+    let unsupported = UpstreamErrorClass::Fatal {
+        status: 400,
+        upstream_code: None,
+        message: "上游返回 400: tools not supported".to_string(),
+    };
+    assert!(
+        fallback_retry_advice(&unsupported, 3, 400).is_none(),
+        "工具类 400 不该再原地重发"
+    );
+}
+
+/// 结构化判定：字段级优先，消息小写含 tool+support 为辅；没带工具不补救。
+#[test]
+fn structured_tools_unsupported_hits_fields_first() {
+    let body = serde_json::json!({
+        "model": "ocr-model",
+        "tools": [{"type": "function", "function": {"name": "x"}}],
+        "tool_choice": "auto",
+    });
+    let error = GatewayError::with_status(400, "whatever");
+    // 字段命中：error_body.code == tools
+    let field_hit = serde_json::json!({"code": "tools", "message": "bad"});
+    assert!(
+        structured_tools_unsupported(&error, &field_hit, &body),
+        "code 字段等于 tools 应当命中"
+    );
+    // 消息命中：小写含 tool + support
+    let msg_hit = serde_json::json!({"message": "Tools are not supported"});
+    let msg_error = GatewayError::with_status(400, "Tools are not supported");
+    assert!(
+        structured_tools_unsupported(&msg_error, &msg_hit, &body),
+        "消息含 tool+support 应当命中"
+    );
+    // 没带工具：不补救
+    let bare = serde_json::json!({"model": "m"});
+    assert!(
+        !structured_tools_unsupported(&msg_error, &msg_hit, &bare),
+        "没带 tools/tool_choice 的 400 不该进补救"
+    );
+}
+
+/// 全剥 wrapper：tools 整份剥，tool_choice 只降 auto；点名的一并撤。
+#[test]
+fn strip_all_tools_drops_everything_but_keeps_auto() {
+    use crate::server::core::protocol::native_tool::strip_all_tools;
+    let body = serde_json::json!({
+        "model": "m",
+        "tools": [{"type": "function", "function": {"name": "x"}}],
+        "tool_choice": "auto",
+    });
+    let (next, _) = strip_all_tools(&body).expect("应当剥离");
+    assert!(next.get("tools").is_none(), "tools 应整份剥离");
+    assert_eq!(
+        next.get("tool_choice").and_then(serde_json::Value::as_str),
+        Some("auto"),
+        "auto 应降级保留"
+    );
+    // 点名具体工具：撤掉
+    let named = serde_json::json!({
+        "model": "m",
+        "tools": [{"type": "function", "function": {"name": "x"}}],
+        "tool_choice": {"type": "function", "function": {"name": "x"}},
+    });
+    let (next, _) = strip_all_tools(&named).expect("应当剥离");
+    assert!(next.get("tools").is_none());
+    assert!(next.get("tool_choice").is_none(), "点名工具已无，应撤掉");
+}

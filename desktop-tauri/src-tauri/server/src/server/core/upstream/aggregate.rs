@@ -336,7 +336,7 @@ impl CompletionAccumulator {
     }
 
     /// 组装最终 body（对应 Node 的 handleChunk 结束后的返回对象）
-    fn into_completion(self) -> AggregatedCompletion {
+    fn into_completion(mut self) -> AggregatedCompletion {
         // ── 诊断：上游只回了思考、正文为空 ──────────────────────────
         // 这是**允许发生**的一种结局（始终思考的模型在小输出额度下会把额度
         // 全花在思考上，上游仍回 200，见 `providers::zcode::reasoning` 的模块头）。
@@ -364,7 +364,15 @@ impl CompletionAccumulator {
         if !self.reasoning.is_empty() {
             message.insert("reasoning_content".to_string(), Value::String(self.reasoning));
         }
-        if !self.tool_calls.is_empty() {
+        let dropped = super::tool_delta::filter_completed_tool_calls(&mut self.tool_calls);
+        let named_kept = !self.tool_calls.is_empty();
+        if super::tool_delta::fix_completion_finish_reason(&mut self.finish, named_kept, dropped) {
+            crate::server::logging::verbose(
+                "[Upstream]",
+                &format!("幽灵工具调用已丢（{dropped}个）且无具名调用：finish tool_calls->stop"),
+            );
+        }
+        if named_kept {
             message.insert(
                 "tool_calls".to_string(),
                 Value::Array(self.tool_calls.into_values().collect()),
@@ -605,6 +613,47 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// 幽灵分片（空名空参，同 index 无命名）在非流式聚合下发前被丢，终帧
+    /// `tool_calls` 改写为 `stop`——对照 shim `strip_phantom_nonstream`。
+    /// 不修改的话，客户端拿到空名调用 + `finish == "tool_calls"`
+    /// 会挂起等一个永远凑不齐的参数。
+    #[test]
+    fn phantom_tool_call_is_dropped_and_finish_fixed_to_stop() {
+        let mut acc = CompletionAccumulator::default();
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","type":"function","function":{"name":"","arguments":""}}]},"finish_reason":null}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        );
+        feed(&mut acc, "data: [DONE]");
+        let body = acc.into_completion().body;
+        assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// 具名调用不受影响：保留下发，终帧保持 `tool_calls` 。
+    #[test]
+    fn named_tool_call_survives_phantom_filter() {
+        let mut acc = CompletionAccumulator::default();
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"pwsh","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        );
+        feed(&mut acc, "data: [DONE]");
+        let body = acc.into_completion().body;
+        let calls = body["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "pwsh");
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[test]
