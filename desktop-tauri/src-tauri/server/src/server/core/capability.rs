@@ -49,6 +49,14 @@ pub fn is_token_key(key: &str) -> bool {
     key == "maxInputTokens" || key == "maxOutputTokens"
 }
 
+/// 条目的工具调用能力（发前预剥的读数）：`Some(false)` = 明确不支持；
+/// `Some(true)` = 明确支持；`None` = 没声明（缺失 / null / 非 bool）或条目缺失。
+///
+/// 调用方注意 `None ≠ Some(false)`：没声明的不当成不支持，只走模型名启发。
+pub fn tool_call_support(item: &Value) -> Option<bool> {
+    item.get("supportsToolCall").and_then(Value::as_bool)
+}
+
 /// 该键是不是布尔能力键。
 pub fn is_bool_key(key: &str) -> bool {
     key == "supportsToolCall"

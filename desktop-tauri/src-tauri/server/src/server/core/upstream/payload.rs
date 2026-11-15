@@ -198,6 +198,7 @@ pub(super) async fn send_body<'a>(
     provider_id: &str,
     account: Option<&Value>,
     degraded: bool,
+    tools_remedied: bool,
 ) -> SendBody<'a> {
     if ctx.images.is_some() {
         let requested = ctx.body.get("model").and_then(Value::as_str).unwrap_or("");
@@ -374,6 +375,41 @@ pub(super) async fn send_body<'a>(
     // 未注入时读取原有客户端参数；绑定成功时以覆盖后的等级为准。
     let upstream_reasoning = injected.or_else(|| outbound_reasoning_of(provider_id, &body));
     ctx.telemetry.note_upstream_reasoning(upstream_reasoning.clone());
+    // ── ⑤ 工具预剥（发前闸门：这家不支持工具就不带 tools 出门）────────
+    // shapes: `supportsToolCall == Some(false)` 整份剥 tools + tool_choice 复用
+    // strip_all_tools 降级；`None`（没声明）只对 ocr/embedding/reranker 类名字
+    // 按不支持处理，`None ≠ false`。有明确 `Some(true)` 的不碰。
+    let mut body = body;
+    if tools_remedied {
+        // 动作 0b 的补救体：上游已明确 tools 不支持，整份剥离后重发。
+        match crate::server::core::protocol::native_tool::strip_all_tools(body.as_ref()) {
+            Some((next, dropped)) => {
+                logging::log(
+                    "[Upstream]",
+                    &dropped.describe(Some(provider_id), Some("工具不支持补救")),
+                );
+                body = Cow::Owned(next);
+            }
+            None => {}
+        }
+    }
+    if !crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
+        match crate::server::core::model_rules::tool_strip_for(provider_id, &wire.model) {
+            crate::server::core::model_rules::ToolStrip::Strip => {
+                match crate::server::core::protocol::native_tool::strip_all_tools(body.as_ref()) {
+                    Some((next, dropped)) => {
+                        logging::log(
+                            "[Upstream]",
+                            &dropped.describe(Some(provider_id), Some("该模型不支持工具调用")),
+                        );
+                        body = Cow::Owned(next);
+                    }
+                    None => {}
+                }
+            }
+            crate::server::core::model_rules::ToolStrip::Keep => {}
+        }
+    }
     SendBody { body, wire_model: wire.model, wire_reasoning: upstream_reasoning }
 }
 
