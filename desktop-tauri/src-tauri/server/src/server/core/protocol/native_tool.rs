@@ -259,6 +259,51 @@ pub fn strip_cross_protocol(body: &Value, target: &str) -> Option<(Value, Downgr
     })
 }
 
+/// 不支持工具的上游：整份 `tools` 全剥 + `tool_choice` 能降级就降。
+///
+/// 与 [`downgrade`] 的区别：那道闸门只剔原生声明、保留 `type:"function"`；
+/// 这里是「这家**什么工具都不接**」—— function 留着同样整轮 400。
+/// `tool_choice` 只降 `auto`（字符串 `"auto"` 或 `{type:"auto"}` 这类无点名形态），
+/// 点名具体工具的一律撤掉（工具都没了，点名必是「指定的工具不存在」）。
+pub fn strip_all_tools(body: &Value) -> Option<(Value, Downgrade)> {
+    let mut next = body.clone();
+    let mut dropped: Vec<Value> = Vec::new();
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        if !tools.is_empty() {
+            dropped = tools.clone();
+            if let Some(object) = next.as_object_mut() {
+                object.remove("tools");
+            }
+        }
+    }
+    let mut choice: Option<String> = None;
+    if let Some(current) = next.get("tool_choice").cloned() {
+        if super::string_field(&current, "type").eq_ignore_ascii_case("auto")
+            || current.as_str().is_some_and(|text| text.trim().eq_ignore_ascii_case("auto"))
+        {
+            if let Some(object) = next.as_object_mut() {
+                object.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+            }
+            choice = Some("不支持工具的上游，tool_choice 降为 auto".to_string());
+        } else if let Some(reason) = choice_conflict(&current, &dropped) {
+            if let Some(object) = next.as_object_mut() {
+                object.remove("tool_choice");
+            }
+            choice = Some(reason);
+        } else if next.get("tool_choice").is_some() {
+            // 非 auto 又没点中被剔工具：工具都没了，留着它同样整轮 400。
+            if let Some(object) = next.as_object_mut() {
+                object.remove("tool_choice");
+            }
+            choice = Some("tools 已整份剥离，tool_choice 一并撤掉".to_string());
+        }
+    }
+    if dropped.is_empty() && choice.is_none() {
+        return None;
+    }
+    Some((next, Downgrade { tools: dropped, choice }))
+}
+
 /// 剔除与 `tool_choice` 撤回的共同实现（两个口径只差 `should_drop` 判据）。
 fn strip_with<F: Fn(&Value) -> bool>(body: &Value, should_drop: F) -> Option<(Value, Downgrade)> {
     let mut next = body.clone();

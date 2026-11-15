@@ -650,6 +650,41 @@ pub(crate) fn save(rules: &ModelRules) -> bool {
 
 use bindings::set_membership;
 
+/// 一次工具降级的预剥判定（发前闸门用）：`Strip` = 现在就剥（不动上游）。
+///
+/// 只有 `supportsToolCall == Some(false)` 才给 `Strip`：那是目录里**明确声明**
+/// 不支持。`None`（没声明 / null / 非 bool）**不是**不支持，走模型名启发
+/// （`model_suggests_no_tools`）；`Some(true)` 不剥。
+pub(crate) enum ToolStrip {
+    Strip,
+    Keep,
+}
+
+pub(crate) fn tool_strip_for(provider: &str, wire_model: &str) -> ToolStrip {
+    let item = crate::server::core::providers::catalog::manifest_for_provider(provider)
+        .into_iter()
+        .find(|entry| {
+            crate::server::core::models::model_id(entry).eq_ignore_ascii_case(wire_model.trim())
+        });
+    match item.as_ref().map(crate::server::core::capability::tool_call_support) {
+        Some(Some(false)) => ToolStrip::Strip,
+        Some(Some(true)) => ToolStrip::Keep,
+        Some(None) | None => {
+            if model_suggests_no_tools(wire_model) { ToolStrip::Strip } else { ToolStrip::Keep }
+        }
+    }
+}
+
+/// 模型名启发：ocr / embedding / reranker 类名字按不支持工具处理。
+///
+/// 只在能力位**没声明**时用（`None ≠ false`，见 `tool_strip_for`）—— 有明确
+/// 声明的一律以声明为准。大小写不敏感；匹配子串而非整词（`text-embedding-3`
+/// 这类带前后缀的名字同样命中）。
+fn model_suggests_no_tools(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.contains("ocr") || lower.contains("embed") || lower.contains("rerank")
+}
+
 /// **上游模型 id / 自生成别名**的字符集口径：字母 / 数字 / `- _ . / :`。
 ///
 /// 只用在两处 —— 手动登记的上游模型 id（`api::model_manage` 的 `/api/models/custom`）
@@ -760,4 +795,34 @@ pub fn custom_models_for(provider: &str) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tool_strip_tests {
+    use super::model_suggests_no_tools;
+    use crate::server::core::capability::tool_call_support;
+
+    /// 模型名启发：ocr / embedding / reranker 命中，其余不命中。
+    #[test]
+    fn name_heuristic_hits_ocr_embedding_reranker() {
+        for name in ["ocr-pro", "text-embedding-3", "reranker-v2", "OCR"] {
+            assert!(model_suggests_no_tools(name), "{name} 应当启发为不支持工具");
+        }
+        for name in ["gpt-4o", "deepseek-v4", ""] {
+            assert!(!model_suggests_no_tools(name), "{name} 不该被启发");
+        }
+    }
+
+    /// 能力位读数：Some(false) 明确不支持；None（缺失/null/非 bool）不是不支持。
+    #[test]
+    fn tool_call_support_distinguishes_none_from_false() {
+        let no = serde_json::json!({"id": "x", "supportsToolCall": false});
+        assert_eq!(tool_call_support(&no), Some(false));
+        let missing = serde_json::json!({"id": "x"});
+        assert_eq!(tool_call_support(&missing), None);
+        let null = serde_json::json!({"id": "x", "supportsToolCall": null});
+        assert_eq!(tool_call_support(&null), None);
+        let yes = serde_json::json!({"id": "x", "supportsToolCall": true});
+        assert_eq!(tool_call_support(&yes), Some(true));
+    }
 }

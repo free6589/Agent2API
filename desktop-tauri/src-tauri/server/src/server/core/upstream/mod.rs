@@ -54,6 +54,8 @@ mod images;
 pub mod image_compress;
 mod multipart;
 mod native_tools;
+mod tool_delta;
+pub use tool_delta::{StreamToolCalls, filter_completed_tool_calls, fix_completion_finish_reason, rewrite_empty_finish_reason};
 mod http_dns;
 mod network_fallback;
 pub mod refusal;

@@ -121,6 +121,8 @@ struct OutboundFailure {
     /// 收的就是 `error.message`（`上游返回 429: {上游原文}`），
     /// accounts.json 里落的那段文案因此逐字不变。
     error: GatewayError,
+    /// 归一化后的上游错误体（`{code, message}`，供结构化判定读字段）。
+    error_body: Value,
     /// 插件明确终止本次请求；不再刷新凭证、降级提示词或换账号。
     stop: bool,
     policy: crate::server::core::providers::policy::ErrorPolicy,
@@ -283,6 +285,38 @@ const PAYLOAD_SIZE_REJECTION_STATUSES: &[u16] = &[413];
 /// 一个是「字节」，一个是「名字」，出处与措辞不同，将来各自的排除面也可能变。
 const DETERMINISTIC_NOT_FOUND_STATUSES: &[u16] = &[404];
 
+/// 工具不支持的结构化判定：上游明确说 tools/tool_choice 不支持。
+///
+/// 字段级优先：原始错误体的 code / type / param 等于 tools/tool_choice
+/// （大小写不敏感）即命中；否则消息小写含 tool + 不支持（support/unsupported/
+/// not support）为辅。只判结构，不碰英文文案匹配原文。
+fn structured_tools_unsupported(error: &GatewayError, error_body: &Value, body: &Value) -> bool {
+    for key in ["code", "type", "param", "error_code"] {
+        let hit = error_body
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|text| {
+                let lower = text.trim().to_ascii_lowercase();
+                lower == "tools" || lower == "tool_choice" || lower == "toolchoice"
+            })
+            .unwrap_or(false);
+        if hit {
+            return true;
+        }
+    }
+    // body 里 tools/tool_choice 的存在是补救的前提：没带工具的 400 不该进补救。
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || body.get("tool_choice").is_some();
+    if !has_tools {
+        return false;
+    }
+    let message = error.message.to_ascii_lowercase();
+    message.contains("tool") && message.contains("support")
+}
+
 /// 轮询出网档（`core::proxy_rotate`）在 429 时**原地换出口**的次数上限。
 ///
 /// 为什么是 3：OpenCode Zen 免费档的 429 按 IP 判（这个出口的额度用完），换出口
@@ -382,6 +416,14 @@ fn fallback_retry_advice(
         UpstreamErrorClass::Fatal { .. }
             if PAYLOAD_SIZE_REJECTION_STATUSES.contains(&status)
                 || DETERMINISTIC_NOT_FOUND_STATUSES.contains(&status) =>
+        {
+            None
+        }
+        // 工具不支持：动作 0b 会剥 tools 同账号补救一次；补救后仍失败说明剥完
+        // 也不行，原地重发同一份字节只会空转三次，不进退避。
+        UpstreamErrorClass::Fatal { message, .. }
+            if message.to_ascii_lowercase().contains("tool")
+                && message.to_ascii_lowercase().contains("support") =>
         {
             None
         }
@@ -657,6 +699,9 @@ async fn attempt_queue(
     // 不可降级时它照样返回自己的文本），下面「动作 0」的重试条件同理按**当次
     // 承载家**判定。
     let mut degraded = crate::server::core::degrade::active();
+    // ── 工具补救标记（与 degraded/refreshed 同级）：本轮是否已做过工具降级补救。
+    // 置位后不再重复触发，一次请求最多补救一次（不记新 attempt、不换号、不进退避）。
+    let mut tools_remedied = false;
     // 各家的发送体：某一家即将发送前按作用范围决定一次，换到**同一家同池**的
     // 另一个账号时复用（不重复处理、不重复统计）。键带账号的池（Cline 的账号
     // 记录有 `free`/`pass`）：发送名跟着实际承载的账号所在池走
@@ -667,10 +712,13 @@ async fn attempt_queue(
     // 那一份发送体是另一份副本，键不同就自然落进另一条缓存项 —— 不必手工失效
     // 缓存，也不会把「降级前那份」错发给后面的账号。
     //
+    // 键的第四维是**工具补救标记**：工具不支持 400 后本轮会剥 tools 重发（见
+    // 「动作 0b」），那一份同样是另一份副本，键不同自然落进另一条缓存项。
+    //
     // 值里同时带着**该家实际收到的上游模型名**（`SendBody::wire_model`）——
     // 它是限额冷却的键，与发出去的字节同源（见 `payload::SendBody`）。
     // 缓存因此不只省一次脱敏：429 记账与成功清理都从这里取真名，不必再解析一遍。
-    let mut send_cache: HashMap<(&'static str, String, String, bool), SendBody<'_>> = HashMap::new();
+    let mut send_cache: HashMap<(&'static str, String, String, bool, bool), SendBody<'_>> = HashMap::new();
 
     // 标签是必需的：下面「429 降级到下一个账号」发生在**内层发送循环**里，
     // 裸 `continue` 会回到内层（用同一个账号再发一次，正好是要避免的事）。
@@ -1126,9 +1174,9 @@ async fn attempt_queue(
             // `send_body` 现在是 async（要问插件家「这个思考档位怎么翻译」），
             // 而 `or_insert_with` 的闭包不能 await。改成「先查、miss 时 await
             // 生成、再插入」—— 语义等价，代价是 miss 那次多一次哈希查找。
-            let cache_key = (provider_id, account_pool.clone(), selected_model.clone(), degraded);
+            let cache_key = (provider_id, account_pool.clone(), selected_model.clone(), degraded, tools_remedied);
             if !send_cache.contains_key(&cache_key) {
-                let built = send_body(ctx, provider_id, target.account.as_ref(), degraded).await;
+                let built = send_body(ctx, provider_id, target.account.as_ref(), degraded, tools_remedied).await;
                 send_cache.insert(cache_key.clone(), built);
             }
             let send = match send_cache.get(&cache_key) {
@@ -1483,6 +1531,28 @@ async fn attempt_queue(
                         // 与「账号被标记限额」同档，进运行日志页；触发它的那一条
                         // 请求本身在请求日志的重试链里也能看到原因。
                         logging::log("[Upstream]", &format!("⚠️ {reason}"));
+                        continue;
+                    }
+                    // ── 动作 0b：工具不支持 → 剥 tools 同账号立即重试一次 ──
+                    // 上游明确说 tools/tool_choice 不支持（400 + 结构化判定），这是
+                    // **发送体问题**而不是账号问题：换号重发同一份 body 结论不变，
+                    // 先把 tools 剥掉再发一次才有意义。首次原样发送、补救最多一次、
+                    // 不记新 attempt、不换号、不进退避（与动作 0 同一记账形态）。
+                    if matches!(failure.class, UpstreamErrorClass::Fatal { .. })
+                        && failure.error.status_code == 400
+                        && !tools_remedied
+                        && !named_switch
+                        && structured_tools_unsupported(&failure.error, &failure.error_body, body)
+                    {
+                        tools_remedied = true;
+                        let reason =
+                            "上游不支持工具调用（400），剥离 tools 后同账号重试一次";
+                        ctx.telemetry.note_attempt_retry(
+                            reason,
+                            Some(i64::from(failure.error.status_code)),
+                            0,
+                        );
+                        logging::console_line("[Upstream]", &format!("⚠️ {reason}"));
                         continue;
                     }
                     // ── 动作 2：token 失效 → 刷新后同一账号重试一次 ──────
@@ -2340,7 +2410,7 @@ async fn attempt_custom(
     // **即将发送**。`send_body` 对自定义 id 是零改写（它的模型名改写只认
     // modelRules），处理结果就是「提示词/脱敏后的客户端请求体」—— 自定义
     // 语义的改写（映射 alias → 真名、思考等级）在 forward 里做。
-    let send = send_body(ctx, &provider_id, target.account.as_ref(), degraded).await;
+    let send = send_body(ctx, &provider_id, target.account.as_ref(), degraded, false).await;
     // 「上游模型」列以**真名**为准：send_body 对自定义 id 是零改写（它记的
     // 是请求名），真名的解析与改写发生在 forward 内部 —— 这里按同源解析
     // 覆盖一次（note_upstream_model 是覆盖式，最后一次为准；空串被内部过滤）。
@@ -2549,7 +2619,7 @@ async fn attempt_stateful(
     // `degraded` 由调用方（账号循环）给出：本路径**没有**就地补救（有状态
     // provider 一次转发就是一个会话轮次，没有「换提示词重发」这一步），
     // 但降级期内（状态机已生效）首发的提示词也要跟着换。
-    let send = send_body(ctx, provider_id, target.account.as_ref(), degraded).await;
+    let send = send_body(ctx, provider_id, target.account.as_ref(), degraded, false).await;
     // 内置家透传出口的内部字段剥离：与无状态路径同一理由（见那里的说明）
     let stripped = strip_internal_fields(&send.body);
     let body: &serde_json::Value = &stripped;
@@ -2816,6 +2886,7 @@ fn cancelled_failure() -> OutboundFailure {
             upstream_code: None,
         },
         error: cancellation::cancelled_error(),
+        error_body: Value::Null,
         stop: true,
         policy: Default::default(),
     }
@@ -2939,6 +3010,7 @@ async fn send_with_retry(
                             status: 502, message: gateway.message.clone(), upstream_code: None,
                         },
                         error: gateway,
+                        error_body: Value::Null,
                         stop: true,
                         policy: Default::default(),
                     });
@@ -2968,6 +3040,7 @@ async fn send_with_retry(
                         upstream_code: None,
                     },
                     error: gateway,
+                    error_body: Value::Null,
                     stop: false,
                     policy: Default::default(),
                 });
@@ -3002,6 +3075,7 @@ async fn send_with_retry(
                     return Err(OutboundFailure {
                         class,
                         error: if error.message.is_empty() { super::images::output_error(message) } else { error },
+                        error_body: failure.body.clone(),
                         stop,
                         policy: Default::default(),
                     });
@@ -3017,6 +3091,7 @@ async fn send_with_retry(
                 upstream_code: error.upstream_code,
             },
             error,
+            error_body: Value::Null,
             stop: true,
             policy: Default::default(),
         })?;
@@ -3135,7 +3210,7 @@ async fn send_with_retry(
             GatewayError::with_status(error.status_code, format!("{}；图片请求可能已消耗额度，未自动重试", error.message))
                 .with_optional_code(error.upstream_code)
         } else { error };
-        return Err(OutboundFailure { class, error, stop, policy });
+        return Err(OutboundFailure { class, error, error_body: body, stop, policy });
     }
 }
 

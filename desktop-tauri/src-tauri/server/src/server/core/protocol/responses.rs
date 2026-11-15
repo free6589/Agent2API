@@ -26,7 +26,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     content_parts, content_text, event_frame, freeform, is_truthy, json_text, native_tool,
-    random_id, responses_phase, string_field, string_value, tool_plan, SseLineBuffer, TOOL_IMAGE_PLACEHOLDER,
+    random_id, responses_phase, string_field, string_value, tool_args, tool_plan, SseLineBuffer, TOOL_IMAGE_PLACEHOLDER,
     FIELD_ENCRYPTED_CONTENT,
 };
 use crate::server::logging;
@@ -1046,12 +1046,19 @@ pub fn responses_from_chat(
         output.push(item);
     }
     if let Some(calls) = tool_calls {
+        // 引号数字归一化（`server-shim` v2.7 的干净版）：回程 arguments 原样
+        // 透传时，flash 级别模型发的 `{"limit":"10"}` 会在客户端侧严格反序列化
+        // 失败。映射表只认本次请求的 tools 声明（见 `tool_args` 模块头），
+        // 修不了的保持原样 —— 最坏只是不生效，永远不坏流。
+        let numerics = tool_args::NumericFields::build_numeric_map(request);
         for call in calls {
             let name = call.pointer("/function/name").map(string_value).unwrap_or_default();
             let arguments = call
                 .pointer("/function/arguments")
                 .map(json_text)
                 .unwrap_or_else(|| "{}".to_string());
+            let arguments = tool_args::fix_args_str(&numerics, &name, &arguments)
+                .unwrap_or(arguments);
             let call_id = {
                 let raw = string_field(call, "id");
                 if raw.is_empty() { random_id("call") } else { raw }
@@ -1554,6 +1561,14 @@ impl ResponsesStream {
 
         let is_custom = self.plan.is_custom(&name);
         if announced_now {
+            // 引号数字归一化（`server-shim` v2.7 的干净版）：宣告前攒下的
+            // 参数是完整 JSON（名字与参数同一帧到达时），单 call 可解析即修；
+            // 多 call / 不完整保持原样 —— 只丢修复不坏流（见 `tool_args`）。
+            let numerics = tool_args::NumericFields::build_numeric_map(&self.request);
+            let buffered = (!is_custom)
+                .then(|| tool_args::fix_args_str(&numerics, &name, &buffered))
+                .flatten()
+                .unwrap_or(buffered);
             // 自由文本工具的「参数」是裸文本 input，item 形态与 function 不同
             // —— 见官方 custom_tool_call 项的定义
             let item = if is_custom {
@@ -1820,6 +1835,18 @@ impl ResponsesStream {
             // 但也不能丢 —— 补一个占位名，否则客户端少一次工具调用
             let name = if tool.name.is_empty() { "unknown".to_string() } else { tool.name.clone() };
             let arguments = if tool.arguments.is_empty() { "{}".to_string() } else { tool.arguments.clone() };
+            // 流式收尾同一归一化：`close_tools` 拿到的是完整 arguments，
+            // 单 call 可解析即修，多 call / 残缺保持原样（见 `tool_args`）。
+            let arguments = (!self.plan.is_custom(&name))
+                .then(|| {
+                    tool_args::fix_args_str(
+                        &tool_args::NumericFields::build_numeric_map(&self.request),
+                        &name,
+                        &arguments,
+                    )
+                })
+                .flatten()
+                .unwrap_or(arguments);
             // 用统一口径构造 item：custom 命中时要输出 custom_tool_call 与
             // 裸文本 input，类型给错客户端就按 JSON 解析，工具照样跑不起来
             let item = {
@@ -2042,6 +2069,14 @@ impl ResponsesCollector {
             let name = if tool.name.is_empty() { "unknown".to_string() } else { tool.name };
             let call_id = if tool.call_id.is_empty() { random_id("call") } else { tool.call_id };
             let arguments = if tool.arguments.is_empty() { "{}".to_string() } else { tool.arguments };
+            // 聚合出口同一归一化：聚合的是完整 JSON，单 call 可解析即修，
+            // 修不了保持原样（见 `tool_args` 模块头）。
+            let arguments = tool_args::fix_args_str(
+                &tool_args::NumericFields::build_numeric_map(request),
+                &name,
+                &arguments,
+            )
+            .unwrap_or(arguments);
             // 与另外两个回程出口共用口径：custom 命中时输出 custom_tool_call
             // （item id 的前缀由 tool_call_item 内部按类型选，不必在这里管）
             output.push(tool_call_item(&name, &call_id, &arguments, &plan));
